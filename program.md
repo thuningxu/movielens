@@ -127,28 +127,21 @@ The idea is that you are a completely autonomous researcher trying things out. I
 
 Prioritized by expected impact and implementation difficulty. Reference: BARS/FuxiCTR MovielensLatest_x1 CTR leaderboard (AUC).
 
-### BARS benchmark context
+### Our results
 
-Top models on MovielensLatest_x1 (pointwise AUC):
+| Commit | Dataset | AUC | Setup |
+|--------|---------|-----|-------|
+| c65f884 | ml-100k | 0.686 | Explicit (rating>=4) + BCE, DLRM baseline |
+| 9e2d68c | ml-100k | 0.833 | Implicit feedback + BPR loss |
+| 9e2d68c | ml-1m | 0.841 | Implicit feedback + BPR loss |
 
-| Model | AUC | Key idea |
-|-------|-----|----------|
-| FinalNet (2B) | 0.9725 | Two-block MLP with field gating + distillation |
-| FinalMLP | 0.9720 | Two-stream MLP with bilinear fusion |
-| xDeepFM | 0.9697 | Compressed Interaction Network + DNN |
-| IPNN | 0.9699 | Product-based NN with inner product layer |
-| DCN-V2 | 0.9691 | Learned cross layers + DNN |
-| DLRM | 0.9691 | Our baseline. Dot-product interactions + MLP |
-| DeepFM | 0.9685 | FM + DNN |
-| FM | 0.9434 | Factorization Machine |
+Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k with implicit feedback.
 
-**Note**: These numbers are from the BARS benchmark with its specific data split, feature set (user_id, item_id, tag_id), and training procedure (BN, ReduceLROnPlateau, embedding regularization). Our DLRM currently achieves 0.61-0.69 AUC — the gap is mostly due to missing standard training practices (Tier 1 items below), not architecture.
+### Useful ideas from the literature
 
-**Key insight**: On BARS, DLRM is already competitive (0.9691 vs 0.9725 for FinalNet). Most gains come from training procedure and regularization, not architecture. Our priority should be closing the training procedure gap first.
-
-### BARS hyperparameter reference
-
-All top BARS models use: embed_dim=10, batch_size=4096, lr=1e-3, embedding_regularizer=0.01, BN in MLPs, ReduceLROnPlateau (patience=2), early_stop_patience=2.
+The BARS benchmark (Zhu et al., SIGIR 2022) and FuxiCTR library provide well-tuned implementations of many CTR models. While their benchmarks use different tasks/datasets, their training best practices are broadly applicable:
+- ReduceLROnPlateau, BN in MLPs, embedding-specific L2 regularization, early stopping with low patience.
+- Model architectures worth trying: FinalNet (field gating), DCN-V2 (learned crosses), DeepFM, AutoInt+ (self-attention over features).
 
 ### Tier 1 — Quick wins (easy, high impact)
 
