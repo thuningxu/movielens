@@ -1,0 +1,14 @@
+[project]
+name = "movielens-research"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "pandas",
+    "numpy",
+    "scikit-learn",
+]
+
+[[tool.uv.index]]
+url = "https://pypi.org/simple/"
+default = true
