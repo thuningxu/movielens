@@ -24,7 +24,7 @@ grep "^val_auc:\|^peak_memory_mb:" run.log
 
 ## Architecture
 
-- **`prepare.py`** — READ-ONLY. Data download/loading (all MovieLens sizes), time-based train/val/test splits, AUC evaluation, `print_summary()`. Do not modify.
+- **`prepare.py`** — Data download/loading (all MovieLens sizes), time-based train/val/test splits, AUC evaluation, `print_summary()`. May be modified when the model demands a different data setup (e.g. implicit feedback, negative sampling). Keep `evaluate()` and `print_summary()` stable.
 - **`train.py`** — The experimentation file. Feature engineering, DLRM model, training loop. All modifications go here.
 - **`program.md`** — The autoresearch protocol: setup, experiment loop, logging, research directions.
 - **`results.tsv`** — Experiment log (untracked). Tab-separated: commit, val_auc, memory_mb, status, description.

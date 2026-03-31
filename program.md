@@ -34,10 +34,10 @@ DATASET=ml-1m uv run train.py > run.log 2>&1
 Use `ml-100k` to quickly validate that code changes don't crash, then `ml-1m` for real metric comparison.
 
 **What you CAN do:**
-- Modify `train.py` — this is the only file you edit. Everything is fair game: feature engineering, feature transformations, model architecture, optimizer, hyperparameters, training loop, batch size, model size, sequence modeling, negative sampling, etc.
+- Modify `train.py` — this is the primary file you edit. Everything is fair game: feature engineering, feature transformations, model architecture, optimizer, hyperparameters, training loop, batch size, model size, sequence modeling, negative sampling, etc.
+- Modify `prepare.py` when the model demands a different training data setup (e.g. implicit feedback, negative sampling, different label definitions, new data splits). The evaluation function and summary printer should remain stable.
 
 **What you CANNOT do:**
-- Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, splits, and constants.
 - Install new packages or add dependencies beyond what's in `pyproject.toml`.
 - Modify the evaluation harness. The `evaluate()` function in `prepare.py` is the ground truth metric.
 
@@ -123,26 +123,64 @@ The idea is that you are a completely autonomous researcher trying things out. I
 
 **NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — try combining previous near-misses, try more radical architectural changes, try different feature engineering. The loop runs until the human interrupts you, period.
 
-## Research directions to explore
+## Research backlog
 
-Starting ideas (not exhaustive — use your judgment and creativity):
+Prioritized by expected impact and implementation difficulty. Reference: BARS/FuxiCTR MovielensLatest_x1 CTR leaderboard (AUC).
 
-**Feature engineering:**
-- Temporal features: hour of day, day of week, time since user's first/last rating
-- User-genre affinity: user's average rating per genre
-- Item popularity features: rating count, recency-weighted popularity
-- Negative sampling: add unrated items as negatives alongside explicit ratings
+### BARS benchmark context
 
-**Model architecture:**
-- Vary embedding dimensions, MLP widths/depths
-- Attention-based history aggregation instead of mean pooling
-- Multi-head self-attention over user history (transformer-style)
-- DCN (Deep & Cross Network) style feature crossing
-- Residual connections, layer normalization
+Top models on MovielensLatest_x1 (pointwise AUC):
 
-**Training:**
-- Learning rate schedules (warmup + cosine decay)
-- Different optimizers (AdamW, SGD with momentum)
-- Gradient clipping
-- Label smoothing
-- Focal loss for hard-example mining
+| Model | AUC | Key idea |
+|-------|-----|----------|
+| FinalNet (2B) | 0.9725 | Two-block MLP with field gating + distillation |
+| FinalMLP | 0.9720 | Two-stream MLP with bilinear fusion |
+| xDeepFM | 0.9697 | Compressed Interaction Network + DNN |
+| IPNN | 0.9699 | Product-based NN with inner product layer |
+| DCN-V2 | 0.9691 | Learned cross layers + DNN |
+| DLRM | 0.9691 | Our baseline. Dot-product interactions + MLP |
+| DeepFM | 0.9685 | FM + DNN |
+| FM | 0.9434 | Factorization Machine |
+
+**Note**: These numbers are from the BARS benchmark with its specific data split, feature set (user_id, item_id, tag_id), and training procedure (BN, ReduceLROnPlateau, embedding regularization). Our DLRM currently achieves 0.61-0.69 AUC — the gap is mostly due to missing standard training practices (Tier 1 items below), not architecture.
+
+**Key insight**: On BARS, DLRM is already competitive (0.9691 vs 0.9725 for FinalNet). Most gains come from training procedure and regularization, not architecture. Our priority should be closing the training procedure gap first.
+
+### BARS hyperparameter reference
+
+All top BARS models use: embed_dim=10, batch_size=4096, lr=1e-3, embedding_regularizer=0.01, BN in MLPs, ReduceLROnPlateau (patience=2), early_stop_patience=2.
+
+### Tier 1 — Quick wins (easy, high impact)
+
+1. **ReduceLROnPlateau** — BARS logs show DLRM jumping from ~0.957 to 0.969 AUC after a single LR reduction (1e-3 → 1e-4). Likely the single biggest easy win.
+2. **Batch Normalization in MLPs** — Add BN in bottom_mlp and top_mlp. Used by all BARS top models.
+3. **Embedding regularization** — L2 penalty (lambda=0.01) specifically on embedding weights, separate from weight_decay. Universal across BARS top models.
+4. **Gradient clipping** — `clip_grad_norm_(params, 1.0)`. One-line addition.
+5. **Reduce embed_dim to 10** — BARS standard. Our 16 may be overparameterized.
+6. **Reduce early stopping patience** — BARS uses patience=2 (after LR reduction). Our 20 is way too generous.
+7. **Label smoothing** — Soften binary labels by eps=0.05. Prevents overconfident predictions.
+8. **Focal loss** — Down-weight easy examples: FL = -alpha*(1-p)^gamma*log(p), gamma=2. One-line change.
+
+### Tier 2 — Architecture upgrades (medium difficulty, high impact)
+
+9. **FinalNet field gate** — Learned gate on embeddings: gate = sigmoid(W*field_stats+b), output = concat(emb, emb*gate). Single linear layer addition, biggest AUC model.
+10. **DIN-style attention for history** — Replace mean pooling with target-item-aware attention: weight_i = f(history_emb_i, target_emb). Direct upgrade to our history feature.
+11. **FinalNet two-block** — Two parallel MLP blocks (one gated, one plain), average outputs, distillation loss between blocks.
+12. **DCN-V2 cross layers** — Replace pairwise dot interactions with explicit cross layers: x_{l+1} = x_0 * (W_l*x_l + b_l) + x_l.
+13. **Deeper/wider top MLP** — Increase to [400, 400, 400] with dropout=0.3 + BN (matching BARS configs).
+14. **Implicit feedback + BPR loss** — Treat all ratings as positive, sample unrated as negatives, pairwise ranking loss. LightFM achieves 0.86-0.90 AUC this way.
+
+### Tier 3 — Feature engineering (easy-medium, moderate impact)
+
+15. **Temporal features** — Hour of day, day of week from timestamps.
+16. **User-genre affinity** — Per-user average rating for each genre.
+17. **Movie release year** — Extract from title string, use as categorical.
+18. **Mixed negative sampling** — Add unrated items as explicit negatives alongside ratings.
+19. **Popularity-biased negative sampling** — Sample negatives proportional to item_popularity^0.75.
+
+### Tier 4 — Advanced (hard, uncertain impact)
+
+20. **SASRec-style self-attention on history** — Transformer encoder over user sequence.
+21. **AutoInt+ attention over all features** — Multi-head self-attention treating each feature embedding as a token.
+22. **Contrastive/InfoNCE loss** — Treat recommendation as classification over sampled items.
+23. **LightGCN** — Graph-based collaborative filtering. Different paradigm, hard to integrate into DLRM.

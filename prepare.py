@@ -175,6 +175,83 @@ def load_data(dataset_name="ml-1m", val_frac=0.1, test_frac=0.1):
     }
 
 
+def load_data_implicit(dataset_name="ml-1m", val_frac=0.1, test_frac=0.1):
+    """
+    Load a MovieLens dataset for implicit feedback with BPR training.
+
+    ALL ratings are treated as positive interactions (label=1).
+    Negative sampling is left to the training loop.
+
+    Returns a dict with keys:
+        train, val, test : DataFrames — columns: userId, movieId, rating, timestamp, label
+        movies           : DataFrame — columns: movieId, title, genres (pipe-separated)
+        stats            : dict of dataset statistics
+        all_item_ids     : np.array of all contiguous item IDs (for negative sampling)
+        user_pos_items   : dict mapping userId -> set of movieIds the user interacted with in train
+    All user/movie IDs are remapped to contiguous 0-based integers.
+    """
+    path = _download_dataset(dataset_name)
+    ratings, movies = _LOADERS[dataset_name](path)
+
+    # ALL ratings are positive implicit feedback
+    ratings["label"] = np.int32(1)
+
+    # Time-based split (sort globally by timestamp)
+    ratings = ratings.sort_values("timestamp").reset_index(drop=True)
+    n = len(ratings)
+    train_end = int(n * (1 - val_frac - test_frac))
+    val_end = int(n * (1 - test_frac))
+
+    train = ratings.iloc[:train_end].copy()
+    val = ratings.iloc[train_end:val_end].copy()
+    test = ratings.iloc[val_end:].copy()
+
+    # Remap IDs to contiguous 0-based integers (using ALL ratings so every ID is covered)
+    all_users = ratings["userId"].unique()
+    all_movies = ratings["movieId"].unique()
+    user_map = {uid: i for i, uid in enumerate(all_users)}
+    movie_map = {mid: i for i, mid in enumerate(all_movies)}
+
+    for df in [train, val, test]:
+        df["userId"] = df["userId"].map(user_map)
+        df["movieId"] = df["movieId"].map(movie_map)
+
+    movies = movies.copy()
+    movies["movieId"] = movies["movieId"].map(movie_map)
+    movies = movies.dropna(subset=["movieId"])
+    movies["movieId"] = movies["movieId"].astype(int)
+
+    num_users_count = len(all_users)
+    num_items_count = len(all_movies)
+    all_item_ids = np.arange(num_items_count, dtype=np.int64)
+
+    # Build user -> set of positive items from train split
+    user_pos_items = {}
+    for uid, group in train.groupby("userId"):
+        user_pos_items[uid] = set(group["movieId"].values)
+
+    stats = {
+        "dataset": dataset_name,
+        "num_users": num_users_count,
+        "num_items": num_items_count,
+        "num_ratings": n,
+        "num_train": len(train),
+        "num_val": len(val),
+        "num_test": len(test),
+        "pos_rate": 1.0,  # all interactions are positive
+    }
+
+    return {
+        "train": train,
+        "val": val,
+        "test": test,
+        "movies": movies,
+        "stats": stats,
+        "all_item_ids": all_item_ids,
+        "user_pos_items": user_pos_items,
+    }
+
+
 # ─── Evaluation ─────────────────────────────────────────────────────
 
 def evaluate(labels, scores):
