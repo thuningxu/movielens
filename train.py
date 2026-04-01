@@ -248,6 +248,13 @@ class DLRM(nn.Module):
         self.item_embed = nn.Embedding(num_items, D)
         self.hist_embed = nn.Embedding(num_items + 1, D, padding_idx=PAD_IDX)
 
+        # DIN: target-item-aware attention over history
+        self.din_attn = nn.Sequential(
+            nn.Linear(3 * D, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+        )
+
         self.bottom_mlp = nn.Sequential(
             nn.Linear(NUM_DENSE, 64),
             nn.ReLU(),
@@ -288,9 +295,13 @@ class DLRM(nn.Module):
         user_e = self.user_embed(user_id)
         item_e = self.item_embed(movie_id)
 
-        hist_e = self.hist_embed(history)
-        mask = (history != PAD_IDX).unsqueeze(-1).float()
-        hist_e = (hist_e * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
+        hist_e_raw = self.hist_embed(history)                          # (B, L, D)
+        target_e = item_e.unsqueeze(1).expand_as(hist_e_raw)          # (B, L, D)
+        attn_in = torch.cat([hist_e_raw, target_e, hist_e_raw * target_e], dim=-1)
+        attn_w = self.din_attn(attn_in).squeeze(-1)                   # (B, L)
+        attn_w = attn_w.masked_fill(history == PAD_IDX, -1e9)
+        attn_w = torch.softmax(attn_w, dim=-1).unsqueeze(-1)          # (B, L, 1)
+        hist_e = (hist_e_raw * attn_w).sum(dim=1)                     # (B, D)
 
         dense_e = self.bottom_mlp(dense)
         genre_e = self.genre_proj(genres)
