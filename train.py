@@ -114,13 +114,33 @@ for arr in [user_stats, item_stats]:
         sigma = arr[:, col].std() + 1e-8
         arr[:, col] = (arr[:, col] - mu) / sigma
 
-# 3. User history sequences (last HISTORY_LEN rated items from training data)
+# 3. User history sequences (last HISTORY_LEN rated items + their ratings)
 PAD_IDX = num_items
+USER_PAD_IDX = num_users
+ITEM_HIST_LEN = 30  # recent raters per item
+
 user_histories = np.full((num_users, HISTORY_LEN), PAD_IDX, dtype=np.int64)
+user_hist_ratings = np.zeros((num_users, HISTORY_LEN), dtype=np.float32)
 for uid, group in real_train.groupby("userId"):
-    items = group.sort_values("timestamp")["movieId"].values
+    sorted_g = group.sort_values("timestamp")
+    items = sorted_g["movieId"].values
+    ratings = sorted_g["rating"].values.astype(np.float32) / 5.0  # normalize to [0, 1]
     seq = items[-HISTORY_LEN:]
+    rat = ratings[-HISTORY_LEN:]
     user_histories[uid, -len(seq):] = seq
+    user_hist_ratings[uid, -len(rat):] = rat
+
+# 3b. Item history sequences (last ITEM_HIST_LEN raters + their ratings)
+item_histories = np.full((num_items, ITEM_HIST_LEN), USER_PAD_IDX, dtype=np.int64)
+item_hist_ratings = np.zeros((num_items, ITEM_HIST_LEN), dtype=np.float32)
+for mid, group in real_train.groupby("movieId"):
+    sorted_g = group.sort_values("timestamp")
+    users = sorted_g["userId"].values
+    ratings = sorted_g["rating"].values.astype(np.float32) / 5.0
+    seq = users[-ITEM_HIST_LEN:]
+    rat = ratings[-ITEM_HIST_LEN:]
+    item_histories[mid, -len(seq):] = seq
+    item_hist_ratings[mid, -len(rat):] = rat
 
 # 4. User-genre affinity: average rating per genre for each user (vectorized)
 user_genre_affinity = np.zeros((num_users, num_genres), dtype=np.float32)
@@ -168,8 +188,11 @@ movie_genre_count = (movie_genre_count - movie_genre_count.mean()) / (movie_genr
 # ═══════════════════════════════════════════════════════════════════
 
 # Compact lookup tables on GPU (indexed by user/item ID, not per-sample)
-_user_histories_gpu = torch.from_numpy(user_histories).to(DEVICE)      # (num_users, L)
-_movie_genres_gpu = torch.from_numpy(movie_genres).to(DEVICE)          # (num_items, G)
+_user_histories_gpu = torch.from_numpy(user_histories).to(DEVICE)       # (num_users, L)
+_user_hist_ratings_gpu = torch.from_numpy(user_hist_ratings).to(DEVICE) # (num_users, L)
+_item_histories_gpu = torch.from_numpy(item_histories).to(DEVICE)       # (num_items, IL)
+_item_hist_ratings_gpu = torch.from_numpy(item_hist_ratings).to(DEVICE) # (num_items, IL)
+_movie_genres_gpu = torch.from_numpy(movie_genres).to(DEVICE)           # (num_items, G)
 
 def _build_gpu_tensors(df):
     """Precompute per-sample features on GPU. Histories/genres looked up at training time."""
@@ -267,7 +290,9 @@ def run_eval():
             m = _eval_mids_t[start:end]
             logits = model(
                 u, m, _eval_dense_t[start:end],
-                _user_histories_gpu[u], _movie_genres_gpu[m],
+                _user_histories_gpu[u], _user_hist_ratings_gpu[u],
+                _movie_genres_gpu[m],
+                _item_histories_gpu[m], _item_hist_ratings_gpu[m],
             )
             all_scores.append(torch.sigmoid(logits).cpu().numpy())
 
@@ -287,10 +312,21 @@ class DLRM(nn.Module):
         self.user_embed = nn.Embedding(num_users, D)
         self.item_embed = nn.Embedding(num_items, D)
         self.hist_embed = nn.Embedding(num_items + 1, D, padding_idx=PAD_IDX)
+        self.rater_embed = nn.Embedding(num_users + 1, D, padding_idx=USER_PAD_IDX)
 
-        # DIN: target-item-aware attention over history
+        # Rating projection: scalar rating → D-dim vector
+        self.rating_proj = nn.Linear(1, D)
+
+        # DIN: target-item-aware attention over user history (item + rating)
         self.din_attn = nn.Sequential(
-            nn.Linear(3 * D, 64),
+            nn.Linear(3 * 2 * D, 64),  # 2*D per position (item+rating), 3 groups
+            nn.ReLU(),
+            nn.Linear(64, 1),
+        )
+
+        # Item-side DIN: target-user-aware attention over recent raters
+        self.item_din_attn = nn.Sequential(
+            nn.Linear(3 * 2 * D, 64),
             nn.ReLU(),
             nn.Linear(64, 1),
         )
@@ -308,7 +344,7 @@ class DLRM(nn.Module):
         )
 
         # GDCN: gated cross layers (DCN-V2 + sigmoid gate)
-        cross_dim = 5 * D
+        cross_dim = 6 * D  # user, item, user_hist(DIN), item_hist(DIN), dense, genre
         self.cross_w1 = nn.Linear(cross_dim, cross_dim, bias=False)
         self.cross_b1 = nn.Parameter(torch.zeros(cross_dim))
         self.cross_g1 = nn.Linear(cross_dim, cross_dim)
@@ -342,23 +378,40 @@ class DLRM(nn.Module):
                 if m.padding_idx is not None:
                     nn.init.zeros_(m.weight[m.padding_idx])
 
-    def forward(self, user_id, movie_id, dense, history, genres):
+    def forward(self, user_id, movie_id, dense, history, hist_ratings,
+                genres, item_hist, item_hist_ratings):
         user_e = nn.functional.dropout(self.user_embed(user_id), 0.1, self.training)
         item_e = nn.functional.dropout(self.item_embed(movie_id), 0.1, self.training)
 
-        hist_e_raw = self.hist_embed(history)                          # (B, L, D)
-        target_e = item_e.unsqueeze(1).expand_as(hist_e_raw)          # (B, L, D)
-        attn_in = torch.cat([hist_e_raw, target_e, hist_e_raw * target_e], dim=-1)
+        # --- User-side DIN: attention over items user watched, with ratings ---
+        hist_item_e = self.hist_embed(history)                         # (B, L, D)
+        hist_rat_e = self.rating_proj(hist_ratings.unsqueeze(-1))      # (B, L, D)
+        hist_e_raw = torch.cat([hist_item_e, hist_rat_e], dim=-1)     # (B, L, 2D)
+        target_e = torch.cat([item_e, item_e], dim=-1)                # (B, 2D) — no rating for target
+        target_exp = target_e.unsqueeze(1).expand_as(hist_e_raw)      # (B, L, 2D)
+        attn_in = torch.cat([hist_e_raw, target_exp, hist_e_raw * target_exp], dim=-1)
         attn_w = self.din_attn(attn_in).squeeze(-1)                   # (B, L)
         attn_w = attn_w.masked_fill(history == PAD_IDX, -1e4)
         attn_w = torch.softmax(attn_w, dim=-1).unsqueeze(-1)          # (B, L, 1)
-        hist_e = (hist_e_raw * attn_w).sum(dim=1)                     # (B, D)
+        user_hist_e = (hist_item_e * attn_w).sum(dim=1)               # (B, D)
+
+        # --- Item-side DIN: attention over users who rated this item ---
+        rater_e = self.rater_embed(item_hist)                          # (B, IL, D)
+        rater_rat_e = self.rating_proj(item_hist_ratings.unsqueeze(-1)) # (B, IL, D)
+        rater_e_raw = torch.cat([rater_e, rater_rat_e], dim=-1)       # (B, IL, 2D)
+        query_e = torch.cat([user_e, user_e], dim=-1)                 # (B, 2D)
+        query_exp = query_e.unsqueeze(1).expand_as(rater_e_raw)       # (B, IL, 2D)
+        item_attn_in = torch.cat([rater_e_raw, query_exp, rater_e_raw * query_exp], dim=-1)
+        item_attn_w = self.item_din_attn(item_attn_in).squeeze(-1)    # (B, IL)
+        item_attn_w = item_attn_w.masked_fill(item_hist == USER_PAD_IDX, -1e4)
+        item_attn_w = torch.softmax(item_attn_w, dim=-1).unsqueeze(-1)
+        item_hist_e = (rater_e * item_attn_w).sum(dim=1)              # (B, D)
 
         dense_e = self.bottom_mlp(dense)
         genre_e = self.genre_proj(genres)
 
         # Concatenate all embeddings
-        x0 = torch.cat([user_e, item_e, hist_e, dense_e, genre_e], dim=-1)  # (B, 5*D)
+        x0 = torch.cat([user_e, item_e, user_hist_e, item_hist_e, dense_e, genre_e], dim=-1)  # (B, 6*D)
 
         # Gated cross layer 1
         cross1 = x0 * (self.cross_w1(x0) + self.cross_b1)
@@ -414,7 +467,9 @@ while True:
         with torch.amp.autocast("cuda", enabled=use_amp):
             logits = model(
                 u_batch, m_batch, train_dense[idx],
-                _user_histories_gpu[u_batch], _movie_genres_gpu[m_batch],
+                _user_histories_gpu[u_batch], _user_hist_ratings_gpu[u_batch],
+                _movie_genres_gpu[m_batch],
+                _item_histories_gpu[m_batch], _item_hist_ratings_gpu[m_batch],
             )
             loss = criterion(logits, train_labels[idx])
 
