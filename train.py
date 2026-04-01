@@ -40,7 +40,7 @@ LR = 1e-4
 WEIGHT_DECAY = 1e-5
 EMBED_DIM = 16
 HISTORY_LEN = 50
-NUM_DENSE = 7  # 1 timestamp + 3 user stats + 3 item stats
+NUM_DENSE = 8  # 1 timestamp + 3 user stats + 3 item stats + 1 user-genre affinity dot
 NEG_RATIO = 4  # random unrated negatives per positive in training data
 EVAL_EVERY = 1
 PATIENCE = 10
@@ -114,7 +114,25 @@ for uid, group in real_train.groupby("userId"):
     seq = items[-HISTORY_LEN:]
     user_histories[uid, -len(seq):] = seq
 
-# 4. Timestamp normalization (from real ratings)
+# 4. User-genre affinity: average rating per genre for each user
+user_genre_affinity = np.zeros((num_users, num_genres), dtype=np.float32)
+user_genre_count = np.zeros((num_users, num_genres), dtype=np.float32)
+for _, row in real_train.iterrows():
+    uid = int(row["userId"])
+    mid = int(row["movieId"])
+    rating = row["rating"]
+    for g_idx in range(num_genres):
+        if movie_genres[mid, g_idx] > 0:
+            user_genre_affinity[uid, g_idx] += rating
+            user_genre_count[uid, g_idx] += 1
+mask = user_genre_count > 0
+user_genre_affinity[mask] /= user_genre_count[mask]
+# Normalize
+mu = user_genre_affinity[mask].mean()
+sigma = user_genre_affinity[mask].std() + 1e-8
+user_genre_affinity[mask] = (user_genre_affinity[mask] - mu) / sigma
+
+# 5. Timestamp normalization (from real ratings)
 ts_min = float(real_train["timestamp"].min())
 ts_range = float(real_train["timestamp"].max() - ts_min) + 1.0
 
@@ -136,10 +154,13 @@ class RecDataset(Dataset):
     def __getitem__(self, idx):
         uid = self.user_ids[idx]
         mid = self.movie_ids[idx]
+        # User-genre affinity dot product with movie's genre vector
+        ug_dot = np.float32(np.dot(user_genre_affinity[uid], movie_genres[mid]))
         dense = np.concatenate([
             [self.ts_norm[idx]],
             user_stats[uid],
             item_stats[mid],
+            [ug_dot],
         ])
         return (
             uid,
@@ -206,7 +227,12 @@ _eval_labels = np.concatenate([
 ])
 
 _eval_dense = np.stack([
-    np.concatenate([[_eval_ts_norm[i]], user_stats[_eval_users[i]], item_stats[_eval_items[i]]])
+    np.concatenate([
+        [_eval_ts_norm[i]],
+        user_stats[_eval_users[i]],
+        item_stats[_eval_items[i]],
+        [np.dot(user_genre_affinity[_eval_users[i]], movie_genres[_eval_items[i]])],
+    ])
     for i in range(len(_eval_users))
 ]).astype(np.float32)
 _eval_histories = user_histories[_eval_users]
