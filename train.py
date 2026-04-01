@@ -137,44 +137,32 @@ ts_range = float(real_train["timestamp"].max() - ts_min) + 1.0
 
 
 # ═══════════════════════════════════════════════════════════════════
-# DATASET — pointwise BCE
+# DATASET — precompute all features as GPU tensors
 # ═══════════════════════════════════════════════════════════════════
 
-class RecDataset(Dataset):
-    def __init__(self, df):
-        self.user_ids = df["userId"].values.astype(np.int64)
-        self.movie_ids = df["movieId"].values.astype(np.int64)
-        self.labels = df["label"].values.astype(np.float32)
-        self.ts_norm = ((df["timestamp"].values - ts_min) / ts_range).astype(np.float32)
+def _build_gpu_tensors(df):
+    """Precompute all features and move to GPU once."""
+    uids = df["userId"].values.astype(np.int64)
+    mids = df["movieId"].values.astype(np.int64)
+    labels = df["label"].values.astype(np.float32)
+    ts_norm = ((df["timestamp"].values - ts_min) / ts_range).astype(np.float32)
+    ug_dot = np.sum(user_genre_affinity[uids] * movie_genres[mids], axis=1).astype(np.float32)
+    dense = np.column_stack([
+        ts_norm, user_stats[uids], item_stats[mids], ug_dot,
+    ]).astype(np.float32)
+    return (
+        torch.from_numpy(uids).to(DEVICE),
+        torch.from_numpy(mids).to(DEVICE),
+        torch.from_numpy(dense).to(DEVICE),
+        torch.from_numpy(user_histories[uids].copy()).to(DEVICE),
+        torch.from_numpy(movie_genres[mids].copy()).to(DEVICE),
+        torch.from_numpy(labels).to(DEVICE),
+    )
 
-    def __len__(self):
-        return len(self.labels)
-
-    def __getitem__(self, idx):
-        uid = self.user_ids[idx]
-        mid = self.movie_ids[idx]
-        # User-genre affinity dot product with movie's genre vector
-        ug_dot = np.float32(np.dot(user_genre_affinity[uid], movie_genres[mid]))
-        dense = np.concatenate([
-            [self.ts_norm[idx]],
-            user_stats[uid],
-            item_stats[mid],
-            [ug_dot],
-        ])
-        return (
-            uid,
-            mid,
-            dense,
-            user_histories[uid],
-            movie_genres[mid],
-            self.labels[idx],
-        )
-
-
-train_loader = DataLoader(
-    RecDataset(train_df), batch_size=BATCH_SIZE, shuffle=True,
-    num_workers=4, pin_memory=(DEVICE.type == "cuda"), drop_last=True,
-)
+log.info("Precomputing training tensors on GPU...")
+train_uids, train_mids, train_dense, train_hist, train_genres, train_labels = _build_gpu_tensors(train_df)
+n_train = len(train_labels)
+n_batches_per_epoch = n_train // BATCH_SIZE
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -225,17 +213,15 @@ _eval_labels = np.concatenate([
     np.ones(_n_val_pos), np.zeros(len(_val_hard_neg)), np.zeros(_n_val_pos)
 ])
 
-_eval_ug_dot = np.sum(user_genre_affinity[_eval_users] * movie_genres[_eval_items], axis=1)
-_eval_dense = np.column_stack([
-    _eval_ts_norm,
-    user_stats[_eval_users],
-    item_stats[_eval_items],
-    _eval_ug_dot,
-]).astype(np.float32)
-_eval_histories = user_histories[_eval_users]
-_eval_genres = movie_genres[_eval_items]
-
-log.info(f"Eval set: {_n_val_pos} pos + {len(_val_hard_neg)} hard neg + {_n_val_pos} easy neg = {len(_eval_users)} total")
+log.info("Precomputing eval tensors on GPU...")
+_eval_uids_t, _eval_mids_t, _eval_dense_t, _eval_hist_t, _eval_genres_t, _ = _build_gpu_tensors(
+    pd.DataFrame({
+        "userId": _eval_users, "movieId": _eval_items,
+        "timestamp": _eval_ts, "label": _eval_labels,
+    })
+)
+n_eval = len(_eval_users)
+log.info(f"Eval set: {_n_val_pos} pos + {len(_val_hard_neg)} hard neg + {_n_val_pos} easy neg = {n_eval} total")
 
 
 def run_eval():
@@ -244,14 +230,13 @@ def run_eval():
     eval_batch = BATCH_SIZE * 2
     all_scores = []
     with torch.no_grad():
-        for start in range(0, len(_eval_users), eval_batch):
-            end = min(start + eval_batch, len(_eval_users))
-            u = torch.from_numpy(_eval_users[start:end]).to(DEVICE)
-            m = torch.from_numpy(_eval_items[start:end]).to(DEVICE)
-            d = torch.from_numpy(_eval_dense[start:end]).to(DEVICE)
-            h = torch.from_numpy(_eval_histories[start:end]).to(DEVICE)
-            g = torch.from_numpy(_eval_genres[start:end]).to(DEVICE)
-            logits = model(u, m, d, h, g)
+        for start in range(0, n_eval, eval_batch):
+            end = min(start + eval_batch, n_eval)
+            logits = model(
+                _eval_uids_t[start:end], _eval_mids_t[start:end],
+                _eval_dense_t[start:end], _eval_hist_t[start:end],
+                _eval_genres_t[start:end],
+            )
             all_scores.append(torch.sigmoid(logits).cpu().numpy())
 
     scores = np.concatenate(all_scores)
@@ -331,7 +316,7 @@ class DLRM(nn.Module):
         target_e = item_e.unsqueeze(1).expand_as(hist_e_raw)          # (B, L, D)
         attn_in = torch.cat([hist_e_raw, target_e, hist_e_raw * target_e], dim=-1)
         attn_w = self.din_attn(attn_in).squeeze(-1)                   # (B, L)
-        attn_w = attn_w.masked_fill(history == PAD_IDX, -1e9)
+        attn_w = attn_w.masked_fill(history == PAD_IDX, -1e4)
         attn_w = torch.softmax(attn_w, dim=-1).unsqueeze(-1)          # (B, L, 1)
         hist_e = (hist_e_raw * attn_w).sum(dim=1)                     # (B, D)
 
@@ -353,6 +338,10 @@ model = DLRM().to(DEVICE)
 num_params = sum(p.numel() for p in model.parameters())
 log.info(f"Parameters: {num_params / 1e6:.1f}M | Genres: {num_genres}")
 
+# Compile model for CUDA graphs / kernel fusion
+if DEVICE.type == "cuda":
+    model = torch.compile(model)
+
 
 # ═══════════════════════════════════════════════════════════════════
 # TRAINING LOOP — BCE loss
@@ -360,6 +349,8 @@ log.info(f"Parameters: {num_params / 1e6:.1f}M | Genres: {num_genres}")
 
 optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 criterion = nn.BCEWithLogitsLoss()
+use_amp = DEVICE.type == "cuda"
+scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
 training_start = time.time()
 peak_memory_mb = 0.0
@@ -371,39 +362,29 @@ evals_without_improvement = 0
 while True:
     model.train()
     epoch_loss = 0.0
-    n_batches = 0
 
-    for uid, mid, dense, history, genres, label in train_loader:
+    # Shuffle training data each epoch via random permutation
+    perm = torch.randperm(n_train, device=DEVICE)
 
-        uid = uid.to(DEVICE)
-        mid = mid.to(DEVICE)
-        dense = dense.to(DEVICE)
-        history = history.to(DEVICE)
-        genres = genres.to(DEVICE)
-        label = label.to(DEVICE)
+    for i in range(n_batches_per_epoch):
+        idx = perm[i * BATCH_SIZE : (i + 1) * BATCH_SIZE]
 
-        logits = model(uid, mid, dense, history, genres)
-        loss = criterion(logits, label)
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            logits = model(
+                train_uids[idx], train_mids[idx], train_dense[idx],
+                train_hist[idx], train_genres[idx],
+            )
+            loss = criterion(logits, train_labels[idx])
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         epoch_loss += loss.item()
-        n_batches += 1
-
-        if DEVICE.type == "mps":
-            try:
-                mem = torch.mps.current_allocated_memory() / (1024 * 1024)
-                peak_memory_mb = max(peak_memory_mb, mem)
-            except Exception:
-                pass
-        elif DEVICE.type == "cuda":
-            mem = torch.cuda.max_memory_allocated(DEVICE) / (1024 * 1024)
-            peak_memory_mb = max(peak_memory_mb, mem)
 
     epoch += 1
-    avg_loss = epoch_loss / max(n_batches, 1)
+    avg_loss = epoch_loss / max(n_batches_per_epoch, 1)
     elapsed = time.time() - training_start
 
     if epoch % EVAL_EVERY == 0:
@@ -424,6 +405,10 @@ while True:
             break
     else:
         log.info(f"Epoch {epoch:4d} | Loss {avg_loss:.4f} | {elapsed:.0f}s")
+
+# Record peak CUDA memory after training
+if DEVICE.type == "cuda":
+    peak_memory_mb = torch.cuda.max_memory_allocated(DEVICE) / (1024 * 1024)
 
 training_seconds = time.time() - training_start
 
