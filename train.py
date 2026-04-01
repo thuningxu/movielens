@@ -293,9 +293,16 @@ class DLRM(nn.Module):
             nn.ReLU(),
         )
 
-        # Top MLP: 5 vectors -> C(5,2)=10 dots + 5*D features
+        # DCN-V2: cross layers instead of pairwise dot products
+        cross_dim = 5 * D
+        self.cross_w1 = nn.Linear(cross_dim, cross_dim, bias=False)
+        self.cross_b1 = nn.Parameter(torch.zeros(cross_dim))
+        self.cross_w2 = nn.Linear(cross_dim, cross_dim, bias=False)
+        self.cross_b2 = nn.Parameter(torch.zeros(cross_dim))
+
+        # Top MLP after cross layers
         self.top_mlp = nn.Sequential(
-            nn.Linear(10 + 5 * D, 256),
+            nn.Linear(cross_dim, 256),
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(256, 128),
@@ -332,14 +339,15 @@ class DLRM(nn.Module):
         dense_e = self.bottom_mlp(dense)
         genre_e = self.genre_proj(genres)
 
-        vecs = [user_e, item_e, hist_e, dense_e, genre_e]
-        dots = []
-        for i in range(len(vecs)):
-            for j in range(i + 1, len(vecs)):
-                dots.append((vecs[i] * vecs[j]).sum(dim=-1, keepdim=True))
+        # Concatenate all embeddings
+        x0 = torch.cat([user_e, item_e, hist_e, dense_e, genre_e], dim=-1)  # (B, 5*D)
 
-        out = torch.cat(dots + vecs, dim=-1)
-        return self.top_mlp(out).squeeze(-1)
+        # Cross layer 1: x1 = x0 * (W1 * x0 + b1) + x0
+        x1 = x0 * (self.cross_w1(x0) + self.cross_b1) + x0
+        # Cross layer 2: x2 = x0 * (W2 * x1 + b2) + x1
+        x2 = x0 * (self.cross_w2(x1) + self.cross_b2) + x1
+
+        return self.top_mlp(x2).squeeze(-1)
 
 
 model = DLRM().to(DEVICE)
