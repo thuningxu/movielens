@@ -307,12 +307,14 @@ class DLRM(nn.Module):
             nn.ReLU(),
         )
 
-        # DCN-V2: cross layers instead of pairwise dot products
+        # GDCN: gated cross layers (DCN-V2 + sigmoid gate)
         cross_dim = 5 * D
         self.cross_w1 = nn.Linear(cross_dim, cross_dim, bias=False)
         self.cross_b1 = nn.Parameter(torch.zeros(cross_dim))
+        self.cross_g1 = nn.Linear(cross_dim, cross_dim)
         self.cross_w2 = nn.Linear(cross_dim, cross_dim, bias=False)
         self.cross_b2 = nn.Parameter(torch.zeros(cross_dim))
+        self.cross_g2 = nn.Linear(cross_dim, cross_dim)
 
         # Top MLP after cross layers (3 hidden layers)
         self.top_mlp = nn.Sequential(
@@ -358,10 +360,14 @@ class DLRM(nn.Module):
         # Concatenate all embeddings
         x0 = torch.cat([user_e, item_e, hist_e, dense_e, genre_e], dim=-1)  # (B, 5*D)
 
-        # Cross layer 1: x1 = x0 * (W1 * x0 + b1) + x0
-        x1 = x0 * (self.cross_w1(x0) + self.cross_b1) + x0
-        # Cross layer 2: x2 = x0 * (W2 * x1 + b2) + x1
-        x2 = x0 * (self.cross_w2(x1) + self.cross_b2) + x1
+        # Gated cross layer 1
+        cross1 = x0 * (self.cross_w1(x0) + self.cross_b1)
+        gate1 = torch.sigmoid(self.cross_g1(x0))
+        x1 = gate1 * cross1 + (1 - gate1) * x0
+        # Gated cross layer 2
+        cross2 = x0 * (self.cross_w2(x1) + self.cross_b2)
+        gate2 = torch.sigmoid(self.cross_g2(x1))
+        x2 = gate2 * cross2 + (1 - gate2) * x1
 
         return self.top_mlp(x2).squeeze(-1)
 
