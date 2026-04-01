@@ -20,7 +20,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from prepare import load_data_hybrid, evaluate, print_summary, TIME_BUDGET
+from prepare import load_data_hybrid, evaluate, print_summary
 
 # ─── Logging ────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -114,17 +114,16 @@ for uid, group in real_train.groupby("userId"):
     seq = items[-HISTORY_LEN:]
     user_histories[uid, -len(seq):] = seq
 
-# 4. User-genre affinity: average rating per genre for each user
+# 4. User-genre affinity: average rating per genre for each user (vectorized)
 user_genre_affinity = np.zeros((num_users, num_genres), dtype=np.float32)
 user_genre_count = np.zeros((num_users, num_genres), dtype=np.float32)
-for _, row in real_train.iterrows():
-    uid = int(row["userId"])
-    mid = int(row["movieId"])
-    rating = row["rating"]
-    for g_idx in range(num_genres):
-        if movie_genres[mid, g_idx] > 0:
-            user_genre_affinity[uid, g_idx] += rating
-            user_genre_count[uid, g_idx] += 1
+_uids = real_train["userId"].values
+_mids = real_train["movieId"].values
+_ratings = real_train["rating"].values.astype(np.float32)
+_genres_of_items = movie_genres[_mids]  # (N, num_genres)
+np.add.at(user_genre_affinity, _uids, _ratings[:, None] * _genres_of_items)
+np.add.at(user_genre_count, _uids, _genres_of_items)
+del _uids, _mids, _ratings, _genres_of_items
 mask = user_genre_count > 0
 user_genre_affinity[mask] /= user_genre_count[mask]
 # Normalize
@@ -174,7 +173,7 @@ class RecDataset(Dataset):
 
 train_loader = DataLoader(
     RecDataset(train_df), batch_size=BATCH_SIZE, shuffle=True,
-    num_workers=0, pin_memory=False, drop_last=True,
+    num_workers=4, pin_memory=(DEVICE.type == "cuda"), drop_last=True,
 )
 
 
@@ -226,14 +225,12 @@ _eval_labels = np.concatenate([
     np.ones(_n_val_pos), np.zeros(len(_val_hard_neg)), np.zeros(_n_val_pos)
 ])
 
-_eval_dense = np.stack([
-    np.concatenate([
-        [_eval_ts_norm[i]],
-        user_stats[_eval_users[i]],
-        item_stats[_eval_items[i]],
-        [np.dot(user_genre_affinity[_eval_users[i]], movie_genres[_eval_items[i]])],
-    ])
-    for i in range(len(_eval_users))
+_eval_ug_dot = np.sum(user_genre_affinity[_eval_users] * movie_genres[_eval_items], axis=1)
+_eval_dense = np.column_stack([
+    _eval_ts_norm,
+    user_stats[_eval_users],
+    item_stats[_eval_items],
+    _eval_ug_dot,
 ]).astype(np.float32)
 _eval_histories = user_histories[_eval_users]
 _eval_genres = movie_genres[_eval_items]
@@ -372,17 +369,11 @@ best_state = None
 evals_without_improvement = 0
 
 while True:
-    elapsed = time.time() - training_start
-    if elapsed >= TIME_BUDGET:
-        break
-
     model.train()
     epoch_loss = 0.0
     n_batches = 0
 
     for uid, mid, dense, history, genres, label in train_loader:
-        if time.time() - training_start >= TIME_BUDGET:
-            break
 
         uid = uid.to(DEVICE)
         mid = mid.to(DEVICE)
@@ -407,6 +398,9 @@ while True:
                 peak_memory_mb = max(peak_memory_mb, mem)
             except Exception:
                 pass
+        elif DEVICE.type == "cuda":
+            mem = torch.cuda.max_memory_allocated(DEVICE) / (1024 * 1024)
+            peak_memory_mb = max(peak_memory_mb, mem)
 
     epoch += 1
     avg_loss = epoch_loss / max(n_batches, 1)
@@ -416,7 +410,7 @@ while True:
         val_metrics = run_eval()
         val_auc = val_metrics["auc"]
         improved = "***" if val_auc > best_auc else ""
-        log.info(f"Epoch {epoch:4d} | Loss {avg_loss:.4f} | Val AUC {val_auc:.4f} {improved} | {elapsed:.0f}s / {TIME_BUDGET}s")
+        log.info(f"Epoch {epoch:4d} | Loss {avg_loss:.4f} | Val AUC {val_auc:.4f} {improved} | {elapsed:.0f}s")
 
         if val_auc > best_auc:
             best_auc = val_auc
@@ -429,7 +423,7 @@ while True:
             log.info(f"Early stopping: no improvement for {PATIENCE} evals (best AUC: {best_auc:.4f})")
             break
     else:
-        log.info(f"Epoch {epoch:4d} | Loss {avg_loss:.4f} | {elapsed:.0f}s / {TIME_BUDGET}s")
+        log.info(f"Epoch {epoch:4d} | Loss {avg_loss:.4f} | {elapsed:.0f}s")
 
 training_seconds = time.time() - training_start
 

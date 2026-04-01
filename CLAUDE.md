@@ -13,13 +13,13 @@ Current AUC: ~0.77 on ml-1m (+/- 0.016 run-to-run variance). See `program.md` fo
 
 ```bash
 # Quick smoke test (ml-100k, ~seconds) — only for crash detection, NOT for AUC comparison
-DATASET=ml-100k uv run train.py
+DATASET=ml-100k python3 train.py
 
-# Standard experiment (ml-1m, ~5-10 minutes on MPS, faster on CUDA)
-DATASET=ml-1m uv run train.py
+# Standard experiment (ml-10m on NVIDIA L4, ~5-15 minutes)
+DATASET=ml-10m python3 train.py
 
 # Full experiment run (redirected, for autoresearch loop)
-DATASET=ml-1m uv run train.py > run.log 2>&1
+DATASET=ml-10m python3 train.py > run.log 2>&1
 
 # Check results
 grep "^val_auc:\|^peak_memory_mb:" run.log
@@ -36,9 +36,9 @@ grep "^val_auc:\|^peak_memory_mb:" run.log
 
 - **Metric**: val_auc (higher is better).
 - **Label**: rating >= 4 → positive (1), rating < 4 or random unrated → negative (0).
-- **Device**: auto-detects MPS/CUDA/CPU. Moving to NVIDIA GPU for faster iteration.
-- **Time budget**: 10 minutes training wall clock (constant `TIME_BUDGET` in `prepare.py`). May need adjustment for GPU speed.
-- **Datasets**: `ml-100k` (smoke test only), `ml-1m` (iteration), `ml-10m`, `ml-25m` (scale). Selected via `DATASET` env var.
+- **Device**: NVIDIA L4 GPU (CUDA). Auto-detects CUDA/CPU.
+- **Training termination**: Early stopping (patience=10 evals), no fixed time budget.
+- **Datasets**: `ml-100k` (smoke test only), `ml-1m` (fast iteration), `ml-10m` (default for experiments), `ml-25m` (full scale). Selected via `DATASET` env var.
 - **Variance**: Run-to-run variance is ~0.03 AUC on ml-1m. Improvements < 0.01 are noise. Consider fixing all random seeds or averaging 3+ runs.
 - Data is auto-downloaded to `data/` on first use. Not checked into git.
 
@@ -65,4 +65,4 @@ Early stopping: patience=10 evals
 1. **Architecture changes work, training procedure changes don't.** DIN, DCN-V2, features helped. LR schedules, regularization, focal loss all hurt.
 2. **Model overfits after 1-3 epochs consistently.** This is the main bottleneck. More data (ml-10m+) may help.
 3. **ml-100k is smoke test only.** Never compare AUC on ml-100k.
-4. **DIN attention is expensive.** Single-head: ~30s/epoch on MPS. Multi-head: ~16min/epoch (unusable on MPS, should be fine on GPU).
+4. **DIN attention is fast on L4.** Single-head: ~18s/epoch on CUDA (was ~30s on MPS). Multi-head DIN may now be feasible.

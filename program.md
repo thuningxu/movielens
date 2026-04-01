@@ -11,7 +11,7 @@ To set up a new experiment, work with the user to:
 3. **Read the in-scope files**: Read these files for full context:
    - `prepare.py` — fixed: data download/loading, train/val/test splits, AUC evaluation, constants. Do not modify.
    - `train.py` — the file you modify. Feature engineering, model architecture, optimizer, training loop.
-4. **Verify dependencies**: Run `uv run python -c "import torch; print(torch.backends.mps.is_available())"` to confirm MPS is available.
+4. **Verify dependencies**: Run `python3 -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"` to confirm CUDA is available.
 5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
 6. **Confirm and go**: Confirm setup looks good.
 
@@ -19,19 +19,19 @@ Once you get confirmation, kick off the experimentation.
 
 ## Experimentation
 
-Each experiment runs on MPS (Apple Silicon GPU). The training script runs for a **fixed time budget of 10 minutes** (wall clock training time, excluding startup and evaluation overhead). Launch it as:
+Each experiment runs on NVIDIA L4 GPU (CUDA). Training terminates via early stopping (patience=10 evals), not a fixed time budget. Launch it as:
 
 ```bash
-DATASET=ml-1m uv run train.py > run.log 2>&1
+DATASET=ml-10m python3 train.py > run.log 2>&1
 ```
 
 **Dataset selection** via the `DATASET` env var:
-- `ml-100k` — 100K ratings, for quick unit testing of code changes (~seconds)
-- `ml-1m` — 1M ratings, default for experimentation (~minutes)
-- `ml-10m` — 10M ratings, for larger-scale validation
-- `ml-25m` — 25M ratings, full scale (if 10-min budget is insufficient, we move to NVIDIA GPU)
+- `ml-100k` — 100K ratings, for quick smoke testing of code changes (~seconds)
+- `ml-1m` — 1M ratings, fast iteration (~minutes)
+- `ml-10m` — 10M ratings, **default for experimentation** (~5-15 minutes on L4)
+- `ml-25m` — 25M ratings, full scale
 
-Use `ml-100k` to quickly validate that code changes don't crash, then `ml-1m` for real metric comparison.
+Use `ml-100k` to quickly validate that code changes don't crash, then `ml-10m` for real metric comparison.
 
 **What you CAN do:**
 - Modify `train.py` — this is the primary file you edit. Everything is fair game: feature engineering, feature transformations, model architecture, optimizer, hyperparameters, training loop, batch size, model size, sequence modeling, negative sampling, etc.
@@ -41,9 +41,9 @@ Use `ml-100k` to quickly validate that code changes don't crash, then `ml-1m` fo
 - Install new packages or add dependencies beyond what's in `pyproject.toml`.
 - Modify the evaluation harness. The `evaluate()` function in `prepare.py` is the ground truth metric.
 
-**The goal is simple: get the highest val_auc.** Since the time budget is fixed, you don't need to worry about training time — it's always 10 minutes. Everything is fair game: change the feature engineering, the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
+**The goal is simple: get the highest val_auc.** Training terminates via early stopping, so you don't need to worry about time budgets. Everything is fair game: change the feature engineering, the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing.
 
-**Memory** is a soft constraint. M1 Max has 32–64 GB unified memory. Some increase is acceptable for meaningful AUC gains, but it should not OOM.
+**Memory** is a soft constraint. The NVIDIA L4 has 24 GB VRAM. Some increase is acceptable for meaningful AUC gains, but it should not OOM.
 
 **Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude.
 
@@ -105,21 +105,19 @@ The experiment runs on a dedicated branch (e.g. `autoresearch/mar31`).
 
 LOOP FOREVER:
 
-1. Look at the git state: the current branch/commit we're on
-2. Tune `train.py` with an experimental idea by directly hacking the code.
-3. git commit
-4. Run the experiment: first do a quick smoke test with `DATASET=ml-100k uv run train.py > run.log 2>&1`, check it doesn't crash, then do the real run with `DATASET=ml-1m uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^val_auc:\|^peak_memory_mb:" run.log`
-6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
-8. If val_auc improved (higher), you "advance" the branch, keeping the git commit
-9. If val_auc is equal or worse, you git reset back to where you started
+1. Pick **two** experiment ideas from the backlog (or invent new ones).
+2. Launch **two subagents in parallel** (using the Agent tool with `isolation: "worktree"`), each working in its own git worktree:
+   - Each subagent modifies `train.py` with its experimental idea.
+   - Each subagent commits, smoke tests with `DATASET=ml-100k python3 train.py`, then runs the real experiment with `DATASET=ml-10m python3 train.py > run.log 2>&1`.
+   - Each subagent reports back: val_auc, peak_memory_mb, and a short description.
+3. Collect results from both subagents.
+4. Record both results in `results.tsv` (NOTE: do not commit results.tsv, leave it untracked by git).
+5. If either experiment improved val_auc, cherry-pick or merge its commit into the main experiment branch.
+6. If neither improved, discard both and move on.
 
-The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate.
+The idea is that you are a completely autonomous researcher trying things out **two at a time**. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate.
 
-**Timeout**: Each experiment should take ~10 minutes of training (+ overhead for data loading and eval). If a run exceeds 15 minutes, kill it and treat it as a failure (discard and revert).
-
-**Crashes**: If a run crashes (OOM, MPS error, or a bug), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
+**Crashes**: If a run crashes (OOM, CUDA error, or a bug), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
 
 **NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — try combining previous near-misses, try more radical architectural changes, try different feature engineering. The loop runs until the human interrupts you, period.
 
@@ -196,7 +194,7 @@ Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedb
 
 3. **Run-to-run variance is ~0.03 AUC.** Same code gives 0.758–0.790 on different runs due to random negative sampling in prepare.py (fixed seed but training shuffle varies). Improvements < 0.01 are noise. Need to either average 3+ runs or fix all random seeds.
 
-4. **DIN attention is expensive on MPS.** Single-head DIN: ~30s/epoch. Multi-head: ~16min/epoch (unusable). The attention over HISTORY_LEN=50 items per sample is a bottleneck. On GPU this should be much faster.
+4. **DIN attention was expensive on MPS but is fast on CUDA.** Single-head DIN: ~18s/epoch on L4 (was ~30s on MPS). Multi-head DIN may now be feasible on GPU.
 
 5. **The neg_ratio=4 with fixed pre-generated negatives in prepare.py works fine.** Online sampling didn't help. The model memorizes quickly regardless.
 
@@ -206,8 +204,9 @@ Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedb
 
 #### Tier 0 — Infrastructure (do first)
 - **Fix random seeds** — `torch.manual_seed`, `np.random.seed`, `torch.cuda.manual_seed_all`, DataLoader worker seeds. Currently ~0.03 AUC variance between runs.
-- **Scale to ml-10m** — more data should reduce the 1-3 epoch overfitting problem
-- **Adjust TIME_BUDGET** — GPU is faster, may need longer budget or more epochs
+- ~~**Scale to ml-10m**~~ — DONE: ml-10m is now the default dataset, feature engineering vectorized for scale.
+- ~~**Adjust TIME_BUDGET**~~ — DONE: removed fixed time budget, training now terminates via early stopping only.
+- ~~**Move to NVIDIA GPU**~~ — DONE: running on NVIDIA L4 (CUDA), ~18s/epoch on ml-1m.
 
 #### Tier 1 — Quick wins (easy, try first)
 - **GDCN (Gated DCN)** — add sigmoid gate to each cross layer: `output = gate * cross + (1-gate) * input`. One-line change per cross layer.
