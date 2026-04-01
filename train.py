@@ -43,7 +43,7 @@ HISTORY_LEN = 50
 NUM_DENSE = 8  # 1 timestamp + 3 user stats + 3 item stats + 1 user-genre affinity dot
 NEG_RATIO = 4  # random unrated negatives per positive in training data
 EVAL_EVERY = 1
-PATIENCE = 10
+PATIENCE = 5
 
 # ─── Device ─────────────────────────────────────────────────────────
 if torch.backends.mps.is_available():
@@ -309,8 +309,8 @@ class DLRM(nn.Module):
                     nn.init.zeros_(m.weight[m.padding_idx])
 
     def forward(self, user_id, movie_id, dense, history, genres):
-        user_e = self.user_embed(user_id)
-        item_e = self.item_embed(movie_id)
+        user_e = nn.functional.dropout(self.user_embed(user_id), 0.1, self.training)
+        item_e = nn.functional.dropout(self.item_embed(movie_id), 0.1, self.training)
 
         hist_e_raw = self.hist_embed(history)                          # (B, L, D)
         target_e = item_e.unsqueeze(1).expand_as(hist_e_raw)          # (B, L, D)
