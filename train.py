@@ -282,9 +282,9 @@ class DLRM(nn.Module):
         )
 
         self.bottom_mlp = nn.Sequential(
-            nn.Linear(NUM_DENSE, 64),
+            nn.Linear(NUM_DENSE, 128),
             nn.ReLU(),
-            nn.Linear(64, D),
+            nn.Linear(128, D),
             nn.ReLU(),
         )
 
@@ -300,7 +300,7 @@ class DLRM(nn.Module):
         self.cross_w2 = nn.Linear(cross_dim, cross_dim, bias=False)
         self.cross_b2 = nn.Parameter(torch.zeros(cross_dim))
 
-        # Top MLP after cross layers
+        # Top MLP after cross layers (3 hidden layers)
         self.top_mlp = nn.Sequential(
             nn.Linear(cross_dim, 256),
             nn.ReLU(),
@@ -308,7 +308,9 @@ class DLRM(nn.Module):
             nn.Linear(256, 128),
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(128, 1),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
         )
 
         self._init_weights()
