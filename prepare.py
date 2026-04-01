@@ -235,16 +235,29 @@ def load_data_hybrid(dataset_name="ml-1m", val_frac=0.1, test_frac=0.1, neg_rati
     num_neg_to_add = num_pos * neg_ratio
     rng = np.random.RandomState(42)
 
-    neg_users, neg_items = [], []
+    # Build sparse indicator matrix for fast collision detection
+    from scipy.sparse import csr_matrix
+    _rows, _cols = [], []
+    for uid, items in user_all_items.items():
+        for mid in items:
+            _rows.append(uid)
+            _cols.append(mid)
+    rated_matrix = csr_matrix(
+        (np.ones(len(_rows), dtype=bool), (_rows, _cols)),
+        shape=(num_users_count, num_items_count),
+    )
+    del _rows, _cols
+
     train_users = train["userId"].unique()
-    for _ in range(num_neg_to_add):
-        uid = rng.choice(train_users)
-        rated = user_all_items.get(uid, set())
-        mid = rng.randint(0, num_items_count)
-        while mid in rated:
-            mid = rng.randint(0, num_items_count)
-        neg_users.append(uid)
-        neg_items.append(mid)
+    neg_users = rng.choice(train_users, size=num_neg_to_add)
+    neg_items = rng.randint(0, num_items_count, size=num_neg_to_add)
+    # Rejection-resample collisions using sparse matrix lookup
+    for attempt in range(10):
+        is_rated = np.array(rated_matrix[neg_users, neg_items]).flatten().astype(bool)
+        n_bad = is_rated.sum()
+        if n_bad == 0:
+            break
+        neg_items[is_rated] = rng.randint(0, num_items_count, size=n_bad)
 
     neg_df = pd.DataFrame({
         "userId": neg_users,
