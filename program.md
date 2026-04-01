@@ -112,7 +112,7 @@ LOOP FOREVER:
    - Each subagent reports back: val_auc, peak_memory_mb, and a short description.
 3. Collect results from both subagents.
 4. Record both results in `results.tsv` (NOTE: do not commit results.tsv, leave it untracked by git).
-5. If either experiment improved val_auc, cherry-pick or merge its commit into the main experiment branch.
+5. If either experiment improved val_auc, cherry-pick or merge its commit into the main experiment branch, then `git push` to upstream.
 6. If neither improved, discard both and move on.
 
 The idea is that you are a completely autonomous researcher trying things out **two at a time**. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate.
