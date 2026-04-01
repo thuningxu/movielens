@@ -127,58 +127,103 @@ The idea is that you are a completely autonomous researcher trying things out. I
 
 Prioritized by expected impact and implementation difficulty. Reference: BARS/FuxiCTR MovielensLatest_x1 CTR leaderboard (AUC).
 
-### Our results
+### Problem formulation history
 
-| Commit | Dataset | AUC | Logloss | Setup |
-|--------|---------|-----|---------|-------|
-| c65f884 | ml-100k | 0.686 | — | Explicit (rating>=4) + BCE, DLRM baseline |
-| 9e2d68c | ml-100k | 0.833 | — | Implicit feedback + BPR loss |
-| 9e2d68c | ml-1m | 0.836 | — | Implicit feedback + BPR loss |
-| pending | ml-100k | 0.755 | 0.621 | Hybrid (liked + hard neg + easy neg) + BCE |
-| pending | ml-1m | 0.789 | 0.579 | Hybrid (liked + hard neg + easy neg) + BCE |
+Three formulations were tried. AUC is NOT comparable across them — different tasks.
 
-Note: AUC is not comparable across formulations — each measures a different task.
-- Implicit: "will user interact?" (easiest)
-- Hybrid: "will user engage positively?" (hardest, but most useful for production)
-- Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedback.
+| Formulation | Positive | Negative | Loss | AUC range |
+|-------------|----------|----------|------|-----------|
+| Explicit | rating >= 4 | rating < 4 | BCE | ~0.69 (ml-100k) |
+| Implicit | any rating | random unrated | BPR | ~0.84 (ml-1m) |
+| **Hybrid (current)** | rating >= 4 | rated < 4 (hard) + random unrated (easy) | BCE | **~0.77** (ml-1m) |
 
-### Useful ideas from the literature
+The hybrid formulation is the current setup. It predicts "will user engage positively?" — suitable for front-page recommendation where you need calibrated probabilities and a threshold.
 
-The BARS benchmark (Zhu et al., SIGIR 2022) and FuxiCTR library provide well-tuned implementations of many CTR models. While their benchmarks use different tasks/datasets, their training best practices are broadly applicable:
-- ReduceLROnPlateau, BN in MLPs, embedding-specific L2 regularization, early stopping with low patience.
-- Model architectures worth trying: FinalNet (field gating), DCN-V2 (learned crosses), DeepFM, AutoInt+ (self-attention over features).
+Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedback.
 
-### Tier 1 — Quick wins (easy, high impact)
+### Experiment log (autoresearch/mar31)
 
-1. **ReduceLROnPlateau** — BARS logs show DLRM jumping from ~0.957 to 0.969 AUC after a single LR reduction (1e-3 → 1e-4). Likely the single biggest easy win.
-2. **Batch Normalization in MLPs** — Add BN in bottom_mlp and top_mlp. Used by all BARS top models.
-3. **Embedding regularization** — L2 penalty (lambda=0.01) specifically on embedding weights, separate from weight_decay. Universal across BARS top models.
-4. **Gradient clipping** — `clip_grad_norm_(params, 1.0)`. One-line addition.
-5. **Reduce embed_dim to 10** — BARS standard. Our 16 may be overparameterized.
-6. **Reduce early stopping patience** — BARS uses patience=2 (after LR reduction). Our 20 is way too generous.
-7. **Label smoothing** — Soften binary labels by eps=0.05. Prevents overconfident predictions.
-8. **Focal loss** — Down-weight easy examples: FL = -alpha*(1-p)^gamma*log(p), gamma=2. One-line change.
+22 experiments run on ml-1m. Run-to-run variance is **~0.03 AUC** (same code gives 0.758–0.790).
 
-### Tier 2 — Architecture upgrades (medium difficulty, high impact)
+**Kept improvements** (cumulative, all architecture/feature changes):
 
-9. **FinalNet field gate** — Learned gate on embeddings: gate = sigmoid(W*field_stats+b), output = concat(emb, emb*gate). Single linear layer addition, biggest AUC model.
-10. **DIN-style attention for history** — Replace mean pooling with target-item-aware attention: weight_i = f(history_emb_i, target_emb). Direct upgrade to our history feature.
-11. **FinalNet two-block** — Two parallel MLP blocks (one gated, one plain), average outputs, distillation loss between blocks.
-12. **DCN-V2 cross layers** — Replace pairwise dot interactions with explicit cross layers: x_{l+1} = x_0 * (W_l*x_l + b_l) + x_l.
-13. **Deeper/wider top MLP** — Increase to [400, 400, 400] with dropout=0.3 + BN (matching BARS configs).
-14. **Implicit feedback + BPR loss** — Treat all ratings as positive, sample unrated as negatives, pairwise ranking loss. LightFM achieves 0.86-0.90 AUC this way.
+| # | Experiment | AUC | Delta | Commit |
+|---|-----------|-----|-------|--------|
+| 0 | Baseline: hybrid BCE, DLRM | 0.756 | — | e8e0f07 |
+| 4 | DIN attention for user history | 0.767 | +0.011 | ae4ccd8 |
+| 6 | User-genre affinity dot product feature | 0.777 | +0.010 | e8130cd |
+| 7 | DCN-V2: 2 cross layers | 0.788 | +0.011 | 997ee5b |
+| 15 | Wider bottom MLP (128) + deeper top MLP (3 layers) | 0.790 | +0.002 | 592170e |
 
-### Tier 3 — Feature engineering (easy-medium, moderate impact)
+**Discarded experiments** (all hurt or were within noise):
 
-15. **Temporal features** — Hour of day, day of week from timestamps.
-16. **User-genre affinity** — Per-user average rating for each genre.
-17. **Movie release year** — Extract from title string, use as categorical.
-18. **Mixed negative sampling** — Add unrated items as explicit negatives alongside ratings.
-19. **Popularity-biased negative sampling** — Sample negatives proportional to item_popularity^0.75.
+| # | Experiment | AUC | Why it failed |
+|---|-----------|-----|---------------|
+| 1 | Online negative sampling | 0.757 | No improvement over fixed |
+| 2 | LR=5e-4 + AdamW + cosine + wider MLP | 0.642 | LR way too high |
+| 3 | LR=2e-4 + cosine decay | 0.719 | Collapsed at epoch 3 |
+| 5 | Hour-of-day temporal features | 0.696 | Hurt significantly |
+| 8 | DCN-V2 3 cross layers | 0.772 | Too much capacity |
+| 9 | Dropout 0.4 | 0.787 | No change |
+| 10 | Embed_dim=32 | 0.779 | More overfitting |
+| 11 | Batch_size=2048 | 0.771 | Worse and slower |
+| 12 | NEG_RATIO=8 | 0.785 | No improvement |
+| 13 | FinalNet field gate | 0.743 | Overfits badly |
+| 14 | Popularity-biased neg sampling | 0.718 | Task too hard |
+| 16 | HISTORY_LEN=100 | 0.784 | Dilutes attention |
+| 17 | Movie release year feature | 0.785 | No improvement |
+| 18 | Residual connections in top MLP | 0.784 | No improvement |
+| 19 | Weight_decay=1e-3 | 0.773 | Too strong |
+| 20 | Multi-head DIN (2 heads) | 0.791 | Only 1 epoch ran (too slow), likely noise |
+| 21 | Deeper DIN attention (3-layer) | 0.751 | 16min/epoch, unusable |
+| 22 | NEG_RATIO=2 | 0.775 | Only 1 epoch (multi-head was still loaded) |
 
-### Tier 4 — Advanced (hard, uncertain impact)
+**Tier 1 ideas also tested via parallel agents (all hurt on ml-1m):**
 
-20. **SASRec-style self-attention on history** — Transformer encoder over user sequence.
-21. **AutoInt+ attention over all features** — Multi-head self-attention treating each feature embedding as a token.
-22. **Contrastive/InfoNCE loss** — Treat recommendation as classification over sampled items.
-23. **LightGCN** — Graph-based collaborative filtering. Different paradigm, hard to integrate into DLRM.
+| Experiment | AUC | Why |
+|-----------|-----|-----|
+| ReduceLROnPlateau (factor=0.5, patience=3) | 0.758 | LR decayed too aggressively before convergence |
+| BatchNorm in MLPs | 0.676 | Hurt significantly, changed loss landscape |
+| Embedding L2 reg (lambda=0.001) | 0.753 | Full-table norm penalty too strong |
+| Gradient clipping (max_norm=1.0) | 0.741 | No benefit |
+| Focal loss (gamma=2) | 0.726 | Over-suppresses easy negatives |
+
+### Key learnings
+
+1. **Overfitting is the dominant problem.** The model peaks at epoch 1-3 then degrades on every run. Early stopping catches this but it means we get very few useful gradient updates.
+
+2. **Architecture changes work, training procedure changes don't.** DIN attention, DCN-V2, user-genre affinity, wider MLPs all helped. LR schedules, regularization, loss function changes all hurt or had no effect.
+
+3. **Run-to-run variance is ~0.03 AUC.** Same code gives 0.758–0.790 on different runs due to random negative sampling in prepare.py (fixed seed but training shuffle varies). Improvements < 0.01 are noise. Need to either average 3+ runs or fix all random seeds.
+
+4. **DIN attention is expensive on MPS.** Single-head DIN: ~30s/epoch. Multi-head: ~16min/epoch (unusable). The attention over HISTORY_LEN=50 items per sample is a bottleneck. On GPU this should be much faster.
+
+5. **The neg_ratio=4 with fixed pre-generated negatives in prepare.py works fine.** Online sampling didn't help. The model memorizes quickly regardless.
+
+6. **ml-100k is only useful as a smoke test.** AUC on ml-100k does not predict ml-1m performance. Only use it to catch crashes.
+
+### What to try next (on GPU)
+
+**High priority (likely to help):**
+- **Fix random seeds completely** — set `torch.manual_seed`, `np.random.seed`, etc. to reduce variance and enable fair comparisons
+- **Larger datasets** (ml-10m, ml-25m) — more data should reduce overfitting and make the model generalize better
+- **Multiple negatives per positive in the loss** (in-batch negatives) — instead of pre-generated fixed negatives, use items from the same batch as negatives. Free, diverse negatives without extra sampling
+- **SASRec / Transformer over user history** — now feasible with GPU, was too slow on MPS
+- **Combined BPR + BCE loss** — use BPR for ranking quality + BCE for calibration
+
+**Medium priority:**
+- **FinalNet two-block** — two parallel MLPs, average outputs
+- **AutoInt+** — self-attention over feature embeddings
+- **Larger embed_dim (32-64)** with stronger regularization — GPU can handle more params if we regularize properly
+- **Learning rate warmup** — the model may benefit from a few warmup steps before full LR
+
+**Lower priority (already tried variants, likely noise):**
+- Embedding-specific L2 regularization (tried 0.001, too strong — could retry with per-batch regularization instead of full-table)
+- Label smoothing, focal loss (both hurt)
+- Deeper/wider architectures without regularization (overfits faster)
+
+### Useful references
+
+- BARS benchmark (Zhu et al., SIGIR 2022) — different task but good training practices
+- FuxiCTR library — well-tuned CTR model implementations
+- LightFM — implicit feedback baseline (BPR/WARP loss)

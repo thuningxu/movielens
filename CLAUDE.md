@@ -4,15 +4,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Autonomous research repo for improving pointwise movie recommendation (AUC) using DLRM-style models on MovieLens data. Follows the autoresearch loop defined in `program.md`.
+Research repo for movie recommendation on MovieLens. Uses a hybrid engagement prediction task: predict whether a user will rate a movie >= 4 stars, with both "watched but didn't like" (hard negatives) and "random unrated" (easy negatives) as label=0. Output is a calibrated probability via BCE loss, suitable for front-page recommendation with a threshold.
+
+Current model: DLRM with DIN attention, DCN-V2 cross layers, user-genre affinity features.
+Current AUC: ~0.77 on ml-1m (+/- 0.016 run-to-run variance). See `program.md` for full experiment history.
 
 ## Commands
 
 ```bash
-# Quick smoke test (ml-100k, ~seconds)
+# Quick smoke test (ml-100k, ~seconds) — only for crash detection, NOT for AUC comparison
 DATASET=ml-100k uv run train.py
 
-# Standard experiment (ml-1m, default, ~minutes)
+# Standard experiment (ml-1m, ~5-10 minutes on MPS, faster on CUDA)
 DATASET=ml-1m uv run train.py
 
 # Full experiment run (redirected, for autoresearch loop)
@@ -24,15 +27,42 @@ grep "^val_auc:\|^peak_memory_mb:" run.log
 
 ## Architecture
 
-- **`prepare.py`** — Data download/loading (all MovieLens sizes), time-based train/val/test splits, AUC evaluation, `print_summary()`. May be modified when the model demands a different data setup (e.g. implicit feedback, negative sampling). Keep `evaluate()` and `print_summary()` stable.
-- **`train.py`** — The experimentation file. Feature engineering, DLRM model, training loop. All modifications go here.
-- **`program.md`** — The autoresearch protocol: setup, experiment loop, logging, research directions.
+- **`prepare.py`** — Data download/loading (all MovieLens sizes), `load_data_hybrid()` for the current formulation, time-based train/val/test splits, AUC evaluation, `print_summary()`. May be modified for data setup changes. Keep `evaluate()` and `print_summary()` stable.
+- **`train.py`** — The experimentation file. Feature engineering, model architecture (DLRM + DIN + DCN-V2), training loop. Primary file to modify.
+- **`program.md`** — The autoresearch protocol: setup, experiment loop, logging, full experiment history and learnings from 22 experiments.
 - **`results.tsv`** — Experiment log (untracked). Tab-separated: commit, val_auc, memory_mb, status, description.
 
 ## Key Details
 
-- **Metric**: val_auc (higher is better). Binary label: rating >= 4 is positive.
-- **Device**: MPS (Apple Silicon). Falls back to CUDA/CPU.
-- **Time budget**: 10 minutes training wall clock per experiment (constant in `prepare.py`).
-- **Datasets**: `ml-100k` (unit test), `ml-1m` (iteration), `ml-10m`, `ml-25m` (scale). Selected via `DATASET` env var.
+- **Metric**: val_auc (higher is better).
+- **Label**: rating >= 4 → positive (1), rating < 4 or random unrated → negative (0).
+- **Device**: auto-detects MPS/CUDA/CPU. Moving to NVIDIA GPU for faster iteration.
+- **Time budget**: 10 minutes training wall clock (constant `TIME_BUDGET` in `prepare.py`). May need adjustment for GPU speed.
+- **Datasets**: `ml-100k` (smoke test only), `ml-1m` (iteration), `ml-10m`, `ml-25m` (scale). Selected via `DATASET` env var.
+- **Variance**: Run-to-run variance is ~0.03 AUC on ml-1m. Improvements < 0.01 are noise. Consider fixing all random seeds or averaging 3+ runs.
 - Data is auto-downloaded to `data/` on first use. Not checked into git.
+
+## Current model architecture (train.py)
+
+```
+Features:
+  - Sparse: userId, movieId (embeddings, dim=16)
+  - Genre: multi-hot → linear projection → dim=16
+  - User history: last 50 items → DIN attention (target-item-aware) → dim=16
+  - Dense: timestamp, user stats (3), item stats (3), user-genre affinity dot (1) → bottom MLP → dim=16
+
+Interaction: DCN-V2 with 2 cross layers over concatenated 5×16=80 dim vector
+
+Top MLP: 80 → 256 → 128 → 64 → 1 (with dropout 0.2)
+
+Loss: BCEWithLogitsLoss
+Optimizer: Adam, LR=1e-4, weight_decay=1e-5
+Early stopping: patience=10 evals
+```
+
+## Critical learnings from experiments
+
+1. **Architecture changes work, training procedure changes don't.** DIN, DCN-V2, features helped. LR schedules, regularization, focal loss all hurt.
+2. **Model overfits after 1-3 epochs consistently.** This is the main bottleneck. More data (ml-10m+) may help.
+3. **ml-100k is smoke test only.** Never compare AUC on ml-100k.
+4. **DIN attention is expensive.** Single-head: ~30s/epoch on MPS. Multi-head: ~16min/epoch (unusable on MPS, should be fine on GPU).
