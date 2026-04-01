@@ -16,6 +16,10 @@ import sys
 import time
 
 import numpy as np
+
+# Fix all random seeds for reproducibility
+SEED = 42
+np.random.seed(SEED)
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -40,18 +44,22 @@ LR = 1e-4
 WEIGHT_DECAY = 1e-5
 EMBED_DIM = 16
 HISTORY_LEN = 50
-NUM_DENSE = 8  # 1 timestamp + 3 user stats + 3 item stats + 1 user-genre affinity dot
+NUM_DENSE = 11  # 1 timestamp + 3 user stats + 3 item stats + 1 ug_dot + 1 year + 1 genre_count + 1 movie_age
 NEG_RATIO = 4  # random unrated negatives per positive in training data
 EVAL_EVERY = 1
-PATIENCE = 10
+PATIENCE = 5
 
 # ─── Device ─────────────────────────────────────────────────────────
-if torch.backends.mps.is_available():
-    DEVICE = torch.device("mps")
-elif torch.cuda.is_available():
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
     DEVICE = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
 else:
     DEVICE = torch.device("cpu")
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 log.info(f"Device: {DEVICE}")
 
 # ─── Load Data ──────────────────────────────────────────────────────
@@ -135,32 +143,55 @@ user_genre_affinity[mask] = (user_genre_affinity[mask] - mu) / sigma
 ts_min = float(real_train["timestamp"].min())
 ts_range = float(real_train["timestamp"].max() - ts_min) + 1.0
 
+# 6. Movie release year (parsed from title) — normalized
+import re
+movie_year = np.zeros(num_items, dtype=np.float32)
+for _, row in movies_df.iterrows():
+    mid = int(row["movieId"])
+    if mid < num_items:
+        m = re.search(r'\((\d{4})\)', str(row.get("title", "")))
+        if m:
+            movie_year[mid] = float(m.group(1))
+valid_years = movie_year[movie_year > 0]
+if len(valid_years) > 0:
+    median_year = np.median(valid_years)
+    movie_year[movie_year == 0] = median_year
+    movie_year = (movie_year - movie_year.mean()) / (movie_year.std() + 1e-8)
+
+# 7. Genre count per movie — normalized
+movie_genre_count = movie_genres.sum(axis=1).astype(np.float32)
+movie_genre_count = (movie_genre_count - movie_genre_count.mean()) / (movie_genre_count.std() + 1e-8)
+
 
 # ═══════════════════════════════════════════════════════════════════
-# DATASET — precompute all features as GPU tensors
+# DATASET — precompute features on GPU (lookup tables stay compact)
 # ═══════════════════════════════════════════════════════════════════
+
+# Compact lookup tables on GPU (indexed by user/item ID, not per-sample)
+_user_histories_gpu = torch.from_numpy(user_histories).to(DEVICE)      # (num_users, L)
+_movie_genres_gpu = torch.from_numpy(movie_genres).to(DEVICE)          # (num_items, G)
 
 def _build_gpu_tensors(df):
-    """Precompute all features and move to GPU once."""
+    """Precompute per-sample features on GPU. Histories/genres looked up at training time."""
     uids = df["userId"].values.astype(np.int64)
     mids = df["movieId"].values.astype(np.int64)
     labels = df["label"].values.astype(np.float32)
     ts_norm = ((df["timestamp"].values - ts_min) / ts_range).astype(np.float32)
     ug_dot = np.sum(user_genre_affinity[uids] * movie_genres[mids], axis=1).astype(np.float32)
+    movie_age = ts_norm - movie_year[mids]
     dense = np.column_stack([
         ts_norm, user_stats[uids], item_stats[mids], ug_dot,
+        movie_year[mids], movie_genre_count[mids], movie_age,
     ]).astype(np.float32)
     return (
         torch.from_numpy(uids).to(DEVICE),
         torch.from_numpy(mids).to(DEVICE),
         torch.from_numpy(dense).to(DEVICE),
-        torch.from_numpy(user_histories[uids].copy()).to(DEVICE),
-        torch.from_numpy(movie_genres[mids].copy()).to(DEVICE),
         torch.from_numpy(labels).to(DEVICE),
     )
 
 log.info("Precomputing training tensors on GPU...")
-train_uids, train_mids, train_dense, train_hist, train_genres, train_labels = _build_gpu_tensors(train_df)
+train_uids, train_mids, train_dense, train_labels = _build_gpu_tensors(train_df)
 n_train = len(train_labels)
 n_batches_per_epoch = n_train // BATCH_SIZE
 
@@ -214,7 +245,7 @@ _eval_labels = np.concatenate([
 ])
 
 log.info("Precomputing eval tensors on GPU...")
-_eval_uids_t, _eval_mids_t, _eval_dense_t, _eval_hist_t, _eval_genres_t, _ = _build_gpu_tensors(
+_eval_uids_t, _eval_mids_t, _eval_dense_t, _ = _build_gpu_tensors(
     pd.DataFrame({
         "userId": _eval_users, "movieId": _eval_items,
         "timestamp": _eval_ts, "label": _eval_labels,
@@ -232,10 +263,11 @@ def run_eval():
     with torch.no_grad():
         for start in range(0, n_eval, eval_batch):
             end = min(start + eval_batch, n_eval)
+            u = _eval_uids_t[start:end]
+            m = _eval_mids_t[start:end]
             logits = model(
-                _eval_uids_t[start:end], _eval_mids_t[start:end],
-                _eval_dense_t[start:end], _eval_hist_t[start:end],
-                _eval_genres_t[start:end],
+                u, m, _eval_dense_t[start:end],
+                _user_histories_gpu[u], _movie_genres_gpu[m],
             )
             all_scores.append(torch.sigmoid(logits).cpu().numpy())
 
@@ -275,12 +307,14 @@ class DLRM(nn.Module):
             nn.ReLU(),
         )
 
-        # DCN-V2: cross layers instead of pairwise dot products
+        # GDCN: gated cross layers (DCN-V2 + sigmoid gate)
         cross_dim = 5 * D
         self.cross_w1 = nn.Linear(cross_dim, cross_dim, bias=False)
         self.cross_b1 = nn.Parameter(torch.zeros(cross_dim))
+        self.cross_g1 = nn.Linear(cross_dim, cross_dim)
         self.cross_w2 = nn.Linear(cross_dim, cross_dim, bias=False)
         self.cross_b2 = nn.Parameter(torch.zeros(cross_dim))
+        self.cross_g2 = nn.Linear(cross_dim, cross_dim)
 
         # Top MLP after cross layers (3 hidden layers)
         self.top_mlp = nn.Sequential(
@@ -309,8 +343,8 @@ class DLRM(nn.Module):
                     nn.init.zeros_(m.weight[m.padding_idx])
 
     def forward(self, user_id, movie_id, dense, history, genres):
-        user_e = self.user_embed(user_id)
-        item_e = self.item_embed(movie_id)
+        user_e = nn.functional.dropout(self.user_embed(user_id), 0.1, self.training)
+        item_e = nn.functional.dropout(self.item_embed(movie_id), 0.1, self.training)
 
         hist_e_raw = self.hist_embed(history)                          # (B, L, D)
         target_e = item_e.unsqueeze(1).expand_as(hist_e_raw)          # (B, L, D)
@@ -326,10 +360,14 @@ class DLRM(nn.Module):
         # Concatenate all embeddings
         x0 = torch.cat([user_e, item_e, hist_e, dense_e, genre_e], dim=-1)  # (B, 5*D)
 
-        # Cross layer 1: x1 = x0 * (W1 * x0 + b1) + x0
-        x1 = x0 * (self.cross_w1(x0) + self.cross_b1) + x0
-        # Cross layer 2: x2 = x0 * (W2 * x1 + b2) + x1
-        x2 = x0 * (self.cross_w2(x1) + self.cross_b2) + x1
+        # Gated cross layer 1
+        cross1 = x0 * (self.cross_w1(x0) + self.cross_b1)
+        gate1 = torch.sigmoid(self.cross_g1(x0))
+        x1 = gate1 * cross1 + (1 - gate1) * x0
+        # Gated cross layer 2
+        cross2 = x0 * (self.cross_w2(x1) + self.cross_b2)
+        gate2 = torch.sigmoid(self.cross_g2(x1))
+        x2 = gate2 * cross2 + (1 - gate2) * x1
 
         return self.top_mlp(x2).squeeze(-1)
 
@@ -354,10 +392,12 @@ scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
 training_start = time.time()
 peak_memory_mb = 0.0
-epoch = 0
 best_auc = 0.0
 best_state = None
 evals_without_improvement = 0
+global_step = 0
+eval_every_steps = max(n_batches_per_epoch // 2, 1)  # eval ~2x per epoch
+epoch = 0
 
 while True:
     model.train()
@@ -369,10 +409,12 @@ while True:
     for i in range(n_batches_per_epoch):
         idx = perm[i * BATCH_SIZE : (i + 1) * BATCH_SIZE]
 
+        u_batch = train_uids[idx]
+        m_batch = train_mids[idx]
         with torch.amp.autocast("cuda", enabled=use_amp):
             logits = model(
-                train_uids[idx], train_mids[idx], train_dense[idx],
-                train_hist[idx], train_genres[idx],
+                u_batch, m_batch, train_dense[idx],
+                _user_histories_gpu[u_batch], _movie_genres_gpu[m_batch],
             )
             loss = criterion(logits, train_labels[idx])
 
@@ -382,29 +424,32 @@ while True:
         scaler.update()
 
         epoch_loss += loss.item()
+        global_step += 1
+
+        # Sub-epoch evaluation
+        if global_step % eval_every_steps == 0:
+            avg_loss = epoch_loss / (i + 1)
+            elapsed = time.time() - training_start
+            val_metrics = run_eval()
+            val_auc = val_metrics["auc"]
+            improved = "***" if val_auc > best_auc else ""
+            log.info(f"Step {global_step:6d} | Loss {avg_loss:.4f} | Val AUC {val_auc:.4f} {improved} | {elapsed:.0f}s")
+
+            if val_auc > best_auc:
+                best_auc = val_auc
+                best_state = copy.deepcopy(model.state_dict())
+                evals_without_improvement = 0
+            else:
+                evals_without_improvement += 1
+
+            if evals_without_improvement >= PATIENCE:
+                log.info(f"Early stopping: no improvement for {PATIENCE} evals (best AUC: {best_auc:.4f})")
+                break
+            model.train()
 
     epoch += 1
-    avg_loss = epoch_loss / max(n_batches_per_epoch, 1)
-    elapsed = time.time() - training_start
-
-    if epoch % EVAL_EVERY == 0:
-        val_metrics = run_eval()
-        val_auc = val_metrics["auc"]
-        improved = "***" if val_auc > best_auc else ""
-        log.info(f"Epoch {epoch:4d} | Loss {avg_loss:.4f} | Val AUC {val_auc:.4f} {improved} | {elapsed:.0f}s")
-
-        if val_auc > best_auc:
-            best_auc = val_auc
-            best_state = copy.deepcopy(model.state_dict())
-            evals_without_improvement = 0
-        else:
-            evals_without_improvement += 1
-
-        if evals_without_improvement >= PATIENCE:
-            log.info(f"Early stopping: no improvement for {PATIENCE} evals (best AUC: {best_auc:.4f})")
-            break
-    else:
-        log.info(f"Epoch {epoch:4d} | Loss {avg_loss:.4f} | {elapsed:.0f}s")
+    if evals_without_improvement >= PATIENCE:
+        break
 
 # Record peak CUDA memory after training
 if DEVICE.type == "cuda":
