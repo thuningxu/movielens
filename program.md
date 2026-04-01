@@ -105,17 +105,18 @@ The experiment runs on a dedicated branch (e.g. `autoresearch/mar31`).
 
 LOOP FOREVER:
 
-1. Pick **two** experiment ideas from the backlog (or invent new ones).
-2. Launch **two subagents in parallel** (using the Agent tool with `isolation: "worktree"`), each working in its own git worktree:
-   - Each subagent modifies `train.py` with its experimental idea.
-   - Each subagent commits, smoke tests with `DATASET=ml-100k python3 train.py`, then runs the real experiment with `DATASET=ml-10m python3 train.py > run.log 2>&1`.
-   - Each subagent reports back: val_auc, peak_memory_mb, and a short description.
-3. Collect results from both subagents.
-4. Record both results in `results.tsv` (NOTE: do not commit results.tsv, leave it untracked by git).
-5. If either experiment improved val_auc, cherry-pick or merge the **best** one into the main experiment branch, then `git push` to upstream. The other experiment is discarded — even if it also improved, its results are invalid against the new baseline and must not be merged without re-testing.
-6. If neither improved, discard both and move on.
+1. Pick an experiment idea from the backlog (or invent a new one).
+2. Modify `train.py` with the experimental idea.
+3. git commit.
+4. Smoke test: `DATASET=ml-100k python3 train.py` — check it doesn't crash.
+5. Real run: `DATASET=ml-10m python3 train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context).
+6. Read results: `grep "^val_auc:\|^peak_memory_mb:" run.log`
+7. If grep is empty, the run crashed. Run `tail -n 50 run.log` to read the stack trace and attempt a fix. If you can't fix it after a few attempts, give up on this idea.
+8. Record results in `results.tsv` (NOTE: do not commit results.tsv, leave it untracked by git).
+9. If val_auc improved: keep the commit, `git push` to upstream.
+10. If val_auc is equal or worse: `git reset --hard HEAD~1` to discard.
 
-The idea is that you are a completely autonomous researcher trying things out **two at a time**. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate.
+The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate.
 
 **Crashes**: If a run crashes (OOM, CUDA error, or a bug), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
 
