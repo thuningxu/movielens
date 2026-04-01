@@ -44,7 +44,7 @@ LR = 1e-4
 WEIGHT_DECAY = 1e-5
 EMBED_DIM = 16
 HISTORY_LEN = 50
-NUM_DENSE = 8  # 1 timestamp + 3 user stats + 3 item stats + 1 user-genre affinity dot
+NUM_DENSE = 11  # 1 timestamp + 3 user stats + 3 item stats + 1 ug_dot + 1 year + 1 genre_count + 1 movie_age
 NEG_RATIO = 4  # random unrated negatives per positive in training data
 EVAL_EVERY = 1
 PATIENCE = 5
@@ -143,6 +143,25 @@ user_genre_affinity[mask] = (user_genre_affinity[mask] - mu) / sigma
 ts_min = float(real_train["timestamp"].min())
 ts_range = float(real_train["timestamp"].max() - ts_min) + 1.0
 
+# 6. Movie release year (parsed from title) — normalized
+import re
+movie_year = np.zeros(num_items, dtype=np.float32)
+for _, row in movies_df.iterrows():
+    mid = int(row["movieId"])
+    if mid < num_items:
+        m = re.search(r'\((\d{4})\)', str(row.get("title", "")))
+        if m:
+            movie_year[mid] = float(m.group(1))
+valid_years = movie_year[movie_year > 0]
+if len(valid_years) > 0:
+    median_year = np.median(valid_years)
+    movie_year[movie_year == 0] = median_year
+    movie_year = (movie_year - movie_year.mean()) / (movie_year.std() + 1e-8)
+
+# 7. Genre count per movie — normalized
+movie_genre_count = movie_genres.sum(axis=1).astype(np.float32)
+movie_genre_count = (movie_genre_count - movie_genre_count.mean()) / (movie_genre_count.std() + 1e-8)
+
 
 # ═══════════════════════════════════════════════════════════════════
 # DATASET — precompute features on GPU (lookup tables stay compact)
@@ -159,8 +178,10 @@ def _build_gpu_tensors(df):
     labels = df["label"].values.astype(np.float32)
     ts_norm = ((df["timestamp"].values - ts_min) / ts_range).astype(np.float32)
     ug_dot = np.sum(user_genre_affinity[uids] * movie_genres[mids], axis=1).astype(np.float32)
+    movie_age = ts_norm - movie_year[mids]
     dense = np.column_stack([
         ts_norm, user_stats[uids], item_stats[mids], ug_dot,
+        movie_year[mids], movie_genre_count[mids], movie_age,
     ]).astype(np.float32)
     return (
         torch.from_numpy(uids).to(DEVICE),
