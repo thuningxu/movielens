@@ -137,11 +137,15 @@ ts_range = float(real_train["timestamp"].max() - ts_min) + 1.0
 
 
 # ═══════════════════════════════════════════════════════════════════
-# DATASET — precompute all features as GPU tensors
+# DATASET — precompute features on GPU (lookup tables stay compact)
 # ═══════════════════════════════════════════════════════════════════
 
+# Compact lookup tables on GPU (indexed by user/item ID, not per-sample)
+_user_histories_gpu = torch.from_numpy(user_histories).to(DEVICE)      # (num_users, L)
+_movie_genres_gpu = torch.from_numpy(movie_genres).to(DEVICE)          # (num_items, G)
+
 def _build_gpu_tensors(df):
-    """Precompute all features and move to GPU once."""
+    """Precompute per-sample features on GPU. Histories/genres looked up at training time."""
     uids = df["userId"].values.astype(np.int64)
     mids = df["movieId"].values.astype(np.int64)
     labels = df["label"].values.astype(np.float32)
@@ -154,13 +158,11 @@ def _build_gpu_tensors(df):
         torch.from_numpy(uids).to(DEVICE),
         torch.from_numpy(mids).to(DEVICE),
         torch.from_numpy(dense).to(DEVICE),
-        torch.from_numpy(user_histories[uids].copy()).to(DEVICE),
-        torch.from_numpy(movie_genres[mids].copy()).to(DEVICE),
         torch.from_numpy(labels).to(DEVICE),
     )
 
 log.info("Precomputing training tensors on GPU...")
-train_uids, train_mids, train_dense, train_hist, train_genres, train_labels = _build_gpu_tensors(train_df)
+train_uids, train_mids, train_dense, train_labels = _build_gpu_tensors(train_df)
 n_train = len(train_labels)
 n_batches_per_epoch = n_train // BATCH_SIZE
 
@@ -214,7 +216,7 @@ _eval_labels = np.concatenate([
 ])
 
 log.info("Precomputing eval tensors on GPU...")
-_eval_uids_t, _eval_mids_t, _eval_dense_t, _eval_hist_t, _eval_genres_t, _ = _build_gpu_tensors(
+_eval_uids_t, _eval_mids_t, _eval_dense_t, _ = _build_gpu_tensors(
     pd.DataFrame({
         "userId": _eval_users, "movieId": _eval_items,
         "timestamp": _eval_ts, "label": _eval_labels,
@@ -232,10 +234,11 @@ def run_eval():
     with torch.no_grad():
         for start in range(0, n_eval, eval_batch):
             end = min(start + eval_batch, n_eval)
+            u = _eval_uids_t[start:end]
+            m = _eval_mids_t[start:end]
             logits = model(
-                _eval_uids_t[start:end], _eval_mids_t[start:end],
-                _eval_dense_t[start:end], _eval_hist_t[start:end],
-                _eval_genres_t[start:end],
+                u, m, _eval_dense_t[start:end],
+                _user_histories_gpu[u], _movie_genres_gpu[m],
             )
             all_scores.append(torch.sigmoid(logits).cpu().numpy())
 
@@ -371,10 +374,12 @@ while True:
     for i in range(n_batches_per_epoch):
         idx = perm[i * BATCH_SIZE : (i + 1) * BATCH_SIZE]
 
+        u_batch = train_uids[idx]
+        m_batch = train_mids[idx]
         with torch.amp.autocast("cuda", enabled=use_amp):
             logits = model(
-                train_uids[idx], train_mids[idx], train_dense[idx],
-                train_hist[idx], train_genres[idx],
+                u_batch, m_batch, train_dense[idx],
+                _user_histories_gpu[u_batch], _movie_genres_gpu[m_batch],
             )
             loss = criterion(logits, train_labels[idx])
 
