@@ -204,26 +204,59 @@ Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedb
 
 ### What to try next (on GPU)
 
-**High priority (likely to help):**
-- **Fix random seeds completely** — set `torch.manual_seed`, `np.random.seed`, etc. to reduce variance and enable fair comparisons
-- **Larger datasets** (ml-10m, ml-25m) — more data should reduce overfitting and make the model generalize better
-- **Multiple negatives per positive in the loss** (in-batch negatives) — instead of pre-generated fixed negatives, use items from the same batch as negatives. Free, diverse negatives without extra sampling
-- **SASRec / Transformer over user history** — now feasible with GPU, was too slow on MPS
-- **Combined BPR + BCE loss** — use BPR for ranking quality + BCE for calibration
+#### Tier 0 — Infrastructure (do first)
+- **Fix random seeds** — `torch.manual_seed`, `np.random.seed`, `torch.cuda.manual_seed_all`, DataLoader worker seeds. Currently ~0.03 AUC variance between runs.
+- **Scale to ml-10m** — more data should reduce the 1-3 epoch overfitting problem
+- **Adjust TIME_BUDGET** — GPU is faster, may need longer budget or more epochs
 
-**Medium priority:**
-- **FinalNet two-block** — two parallel MLPs, average outputs
-- **AutoInt+** — self-attention over feature embeddings
-- **Larger embed_dim (32-64)** with stronger regularization — GPU can handle more params if we regularize properly
-- **Learning rate warmup** — the model may benefit from a few warmup steps before full LR
+#### Tier 1 — Quick wins (easy, try first)
+- **GDCN (Gated DCN)** — add sigmoid gate to each cross layer: `output = gate * cross + (1-gate) * input`. One-line change per cross layer.
+- **MaskNet** — instance-guided feature masking: small MLP generates per-instance mask on embeddings before interaction. Easy addition.
+- **DuoRec contrastive loss** — two forward passes with different dropout masks, InfoNCE auxiliary loss. Addresses representation collapse. Very easy.
+- **In-batch negatives** — use other items in the batch as contrastive negatives. Free diverse negatives, no sampling needed.
+- **Multi-task learning** — add auxiliary head predicting actual rating (MSE), shared backbone. loss = BCE + 0.1 * MSE. Natural for MovieLens.
+- **FinalMLP two-stream** — split features into user stream + item stream, process separately, bilinear fusion.
 
-**Lower priority (already tried variants, likely noise):**
-- Embedding-specific L2 regularization (tried 0.001, too strong — could retry with per-batch regularization instead of full-table)
-- Label smoothing, focal loss (both hurt)
-- Deeper/wider architectures without regularization (overfits faster)
+#### Tier 2 — Sequential modeling (medium, high potential on GPU)
+- **SASRec** — causal Transformer over user history. 2-3 layers, 2-4 heads. Replace or augment DIN attention. Well-proven on MovieLens.
+- **BST (Behavior Sequence Transformer)** — Transformer encoder on history, integrated into DLRM. Natural extension of current DIN.
+- **DIEN (Deep Interest Evolution Network)** — GRU with target-aware attentional update gate (AUGRU). Captures interest drift over time.
+- **CL4SRec** — contrastive learning with sequence augmentations (crop, mask, reorder). Auxiliary InfoNCE loss.
+- **GRU4Rec** — simple GRU baseline for history encoding. Fast, good comparison point.
+- **BERT4Rec** — bidirectional masked item prediction. Auxiliary masked-item loss + primary BCE.
+
+#### Tier 3 — Advanced architectures (medium-hard)
+- **RankMixer (ByteDance)** — MLP-Mixer adapted for CTR: field-mixing + channel-mixing MLPs. Replaces cross-network.
+- **EulerNet** — complex-valued feature interactions via Euler's formula. Novel interaction modeling.
+- **xDeepFM** — Compressed Interaction Network for explicit high-order feature crosses.
+- **MoE (Mixture of Experts)** — replace MLP layers with N expert networks + gating. Specializes for user/item clusters.
+- **Knowledge distillation** — train large teacher, distill to smaller student. Regularization benefit.
+
+#### Tier 4 — Research frontier (hard, potentially transformative)
+- **HSTU (Meta, ICML 2024)** — hierarchical sequential transduction. Generative recommendation at scale. Processes history at session + item level.
+- **TIGER (Google, NeurIPS 2023)** — generative retrieval with semantic IDs via RQ-VAE + autoregressive Transformer.
+- **LLM-enhanced features** — encode movie titles/descriptions with sentence transformer, add as dense features. Helps cold start.
+- **RecFormer / P5** — text-to-text recommendation via LM fine-tuning. Different paradigm entirely.
+- **Wukong scaling laws (Meta, 2024)** — scaling laws for recommendation: wider embeddings + deeper interaction > deeper MLPs.
+
+#### Already tried, didn't work (don't retry as-is)
+- LR schedules (ReduceLROnPlateau, cosine decay) — all hurt on this formulation
+- BatchNorm in MLPs — hurt significantly
+- Embedding L2 regularization (full-table norm) — too strong; could retry with per-batch reg
+- Focal loss (gamma=2) — over-suppresses easy negatives
+- Label smoothing — hurt
+- FinalNet field gate — overfits
+- Popularity-biased negative sampling — task too hard
+- Larger embed_dim (32) without extra regularization — more overfitting
+- 3 cross layers — too much capacity
+- HISTORY_LEN=100 — dilutes attention
+- Stronger weight_decay (1e-3) — too aggressive
 
 ### Useful references
 
-- BARS benchmark (Zhu et al., SIGIR 2022) — different task but good training practices
-- FuxiCTR library — well-tuned CTR model implementations
-- LightFM — implicit feedback baseline (BPR/WARP loss)
+- BARS benchmark (Zhu et al., SIGIR 2022) — different task (tag CTR) but good training practices and model zoo
+- FuxiCTR library (github.com/reczoo/FuxiCTR) — well-tuned CTR model implementations
+- LightFM — implicit feedback baseline (BPR/WARP loss), ~0.86-0.90 AUC on ml-100k
+- HSTU paper: "Actions Speak Louder than Words" — Zhai et al., Meta, ICML 2024
+- TIGER paper: "Recommender Systems with Generative Retrieval" — Rajput et al., Google, NeurIPS 2023
+- Wukong: "Towards a Scaling Law for Large-Scale Recommendation" — Zhang et al., Meta, 2024
