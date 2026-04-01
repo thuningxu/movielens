@@ -175,6 +175,111 @@ def load_data(dataset_name="ml-1m", val_frac=0.1, test_frac=0.1):
     }
 
 
+def load_data_hybrid(dataset_name="ml-1m", val_frac=0.1, test_frac=0.1, neg_ratio=4):
+    """
+    Load a MovieLens dataset for hybrid engagement prediction.
+
+    Label scheme (for front-page recommendation: "will user engage positively?"):
+      - label=1: user rated the movie >= LABEL_THRESHOLD (watched and liked)
+      - label=0: user rated the movie < LABEL_THRESHOLD (watched but didn't like, hard negative)
+      - label=0: random unrated movies (wouldn't click, easy negative) — sampled at neg_ratio per positive
+
+    Returns a dict with keys:
+        train, val, test : DataFrames — columns: userId, movieId, rating, timestamp, label
+        movies           : DataFrame — columns: movieId, title, genres (pipe-separated)
+        stats            : dict of dataset statistics
+        user_all_items   : dict mapping userId -> set of all movieIds the user rated in train
+    All user/movie IDs are remapped to contiguous 0-based integers.
+    """
+    path = _download_dataset(dataset_name)
+    ratings, movies = _LOADERS[dataset_name](path)
+
+    # Binary label: liked (>= threshold) vs not
+    ratings["label"] = (ratings["rating"] >= LABEL_THRESHOLD).astype(np.int32)
+
+    # Time-based split
+    ratings = ratings.sort_values("timestamp").reset_index(drop=True)
+    n = len(ratings)
+    train_end = int(n * (1 - val_frac - test_frac))
+    val_end = int(n * (1 - test_frac))
+
+    train = ratings.iloc[:train_end].copy()
+    val = ratings.iloc[train_end:val_end].copy()
+    test = ratings.iloc[val_end:].copy()
+
+    # Remap IDs
+    all_users = ratings["userId"].unique()
+    all_movies = ratings["movieId"].unique()
+    user_map = {uid: i for i, uid in enumerate(all_users)}
+    movie_map = {mid: i for i, mid in enumerate(all_movies)}
+
+    for df in [train, val, test]:
+        df["userId"] = df["userId"].map(user_map)
+        df["movieId"] = df["movieId"].map(movie_map)
+
+    movies = movies.copy()
+    movies["movieId"] = movies["movieId"].map(movie_map)
+    movies = movies.dropna(subset=["movieId"])
+    movies["movieId"] = movies["movieId"].astype(int)
+
+    num_users_count = len(all_users)
+    num_items_count = len(all_movies)
+
+    # Build user -> set of ALL rated items from train (for negative sampling exclusion)
+    user_all_items = {}
+    for uid, group in train.groupby("userId"):
+        user_all_items[uid] = set(group["movieId"].values)
+
+    # Add random unrated negatives to train set (neg_ratio per positive)
+    num_pos = int(train["label"].sum())
+    num_neg_to_add = num_pos * neg_ratio
+    rng = np.random.RandomState(42)
+
+    neg_users, neg_items = [], []
+    train_users = train["userId"].unique()
+    for _ in range(num_neg_to_add):
+        uid = rng.choice(train_users)
+        rated = user_all_items.get(uid, set())
+        mid = rng.randint(0, num_items_count)
+        while mid in rated:
+            mid = rng.randint(0, num_items_count)
+        neg_users.append(uid)
+        neg_items.append(mid)
+
+    neg_df = pd.DataFrame({
+        "userId": neg_users,
+        "movieId": neg_items,
+        "rating": 0.0,
+        "timestamp": int(train["timestamp"].median()),
+        "label": 0,
+    })
+    train = pd.concat([train, neg_df], ignore_index=True)
+    # Shuffle so negatives are mixed in
+    train = train.sample(frac=1, random_state=42).reset_index(drop=True)
+
+    pos_rate = train["label"].mean()
+
+    stats = {
+        "dataset": dataset_name,
+        "num_users": num_users_count,
+        "num_items": num_items_count,
+        "num_ratings": n,
+        "num_train": len(train),
+        "num_val": len(val),
+        "num_test": len(test),
+        "pos_rate": pos_rate,
+    }
+
+    return {
+        "train": train,
+        "val": val,
+        "test": test,
+        "movies": movies,
+        "stats": stats,
+        "user_all_items": user_all_items,
+    }
+
+
 def load_data_implicit(dataset_name="ml-1m", val_frac=0.1, test_frac=0.1):
     """
     Load a MovieLens dataset for implicit feedback with BPR training.

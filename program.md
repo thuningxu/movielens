@@ -129,13 +129,18 @@ Prioritized by expected impact and implementation difficulty. Reference: BARS/Fu
 
 ### Our results
 
-| Commit | Dataset | AUC | Setup |
-|--------|---------|-----|-------|
-| c65f884 | ml-100k | 0.686 | Explicit (rating>=4) + BCE, DLRM baseline |
-| 9e2d68c | ml-100k | 0.833 | Implicit feedback + BPR loss |
-| 9e2d68c | ml-1m | 0.841 | Implicit feedback + BPR loss |
+| Commit | Dataset | AUC | Logloss | Setup |
+|--------|---------|-----|---------|-------|
+| c65f884 | ml-100k | 0.686 | — | Explicit (rating>=4) + BCE, DLRM baseline |
+| 9e2d68c | ml-100k | 0.833 | — | Implicit feedback + BPR loss |
+| 9e2d68c | ml-1m | 0.836 | — | Implicit feedback + BPR loss |
+| pending | ml-100k | 0.755 | 0.621 | Hybrid (liked + hard neg + easy neg) + BCE |
+| pending | ml-1m | 0.789 | 0.579 | Hybrid (liked + hard neg + easy neg) + BCE |
 
-Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k with implicit feedback.
+Note: AUC is not comparable across formulations — each measures a different task.
+- Implicit: "will user interact?" (easiest)
+- Hybrid: "will user engage positively?" (hardest, but most useful for production)
+- Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedback.
 
 ### Useful ideas from the literature
 

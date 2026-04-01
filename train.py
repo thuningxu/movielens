@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-DLRM with implicit feedback + BPR (Bayesian Personalised Ranking) loss.
+DLRM for hybrid engagement prediction on MovieLens.
 
-Changes from the explicit-rating baseline:
-  - All ratings treated as positive implicit feedback
-  - BPR pairwise loss: -log(sigmoid(score_pos - score_neg))
-  - Online negative sampling: random unrated items as negatives
-  - Evaluation: AUC over (val positives vs unrated items)
+Label scheme:
+  - 1: user rated >= 4 (watched and liked)
+  - 0: user rated < 4 (hard negative) OR random unrated movie (easy negative)
+
+Loss: BCE (calibrated probabilities for threshold-based serving).
 """
 
 import copy
@@ -20,7 +20,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from prepare import load_data_implicit, evaluate, print_summary, TIME_BUDGET
+from prepare import load_data_hybrid, evaluate, print_summary, TIME_BUDGET
 
 # ─── Logging ────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -37,10 +37,11 @@ log = logging.getLogger("train")
 DATASET = os.environ.get("DATASET", "ml-1m")
 BATCH_SIZE = 8192
 LR = 1e-4
-WEIGHT_DECAY = 1e-4
+WEIGHT_DECAY = 1e-5
 EMBED_DIM = 16
 HISTORY_LEN = 50
 NUM_DENSE = 7  # 1 timestamp + 3 user stats + 3 item stats
+NEG_RATIO = 4  # random unrated negatives per positive in training data
 EVAL_EVERY = 1
 PATIENCE = 10
 
@@ -55,14 +56,14 @@ log.info(f"Device: {DEVICE}")
 
 # ─── Load Data ──────────────────────────────────────────────────────
 total_start = time.time()
-data = load_data_implicit(DATASET)
+data = load_data_hybrid(DATASET, neg_ratio=NEG_RATIO)
 train_df, val_df = data["train"], data["val"]
 movies_df, stats = data["movies"], data["stats"]
-all_item_ids = data["all_item_ids"]
-user_pos_items = data["user_pos_items"]
+user_all_items = data["user_all_items"]
 num_users, num_items = stats["num_users"], stats["num_items"]
 log.info(f"Dataset: {DATASET} | Users: {num_users} | Items: {num_items} | "
-         f"Train: {stats['num_train']} | Val: {stats['num_val']} | Implicit feedback mode")
+         f"Train: {stats['num_train']} | Val: {stats['num_val']} | "
+         f"Pos rate: {stats['pos_rate']:.2%}")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -85,15 +86,17 @@ for _, row in movies_df.iterrows():
             if g in genre_to_idx:
                 movie_genres[mid, genre_to_idx[g]] = 1.0
 
-# 2. User and item statistics (computed on train only)
+# 2. User and item statistics (computed on rated items in train only, before neg augmentation)
+# Filter to real ratings (rating > 0) for stats computation
+real_train = train_df[train_df["rating"] > 0]
 user_stats = np.zeros((num_users, 3), dtype=np.float32)
 item_stats = np.zeros((num_items, 3), dtype=np.float32)
 
-for uid, group in train_df.groupby("userId"):
+for uid, group in real_train.groupby("userId"):
     r = group["rating"].values.astype(np.float32)
     user_stats[uid] = [len(r), r.mean(), r.std() if len(r) > 1 else 0.0]
 
-for mid, group in train_df.groupby("movieId"):
+for mid, group in real_train.groupby("movieId"):
     r = group["rating"].values.astype(np.float32)
     item_stats[mid] = [len(r), r.mean(), r.std() if len(r) > 1 else 0.0]
 
@@ -103,98 +106,140 @@ for arr in [user_stats, item_stats]:
         sigma = arr[:, col].std() + 1e-8
         arr[:, col] = (arr[:, col] - mu) / sigma
 
-# 3. User history sequences (last HISTORY_LEN items from training data)
+# 3. User history sequences (last HISTORY_LEN rated items from training data)
 PAD_IDX = num_items
 user_histories = np.full((num_users, HISTORY_LEN), PAD_IDX, dtype=np.int64)
-for uid, group in train_df.groupby("userId"):
-    items = group["movieId"].values
+for uid, group in real_train.groupby("userId"):
+    items = group.sort_values("timestamp")["movieId"].values
     seq = items[-HISTORY_LEN:]
     user_histories[uid, -len(seq):] = seq
 
-# 4. Timestamp normalization parameters (from training data)
-ts_min = float(train_df["timestamp"].min())
-ts_range = float(train_df["timestamp"].max() - ts_min) + 1.0
-
-# 5. Pre-compute user positive item sets as sorted arrays for fast negative sampling
-user_pos_arrays = {}
-for uid, pos_set in user_pos_items.items():
-    user_pos_arrays[uid] = np.array(sorted(pos_set), dtype=np.int64)
+# 4. Timestamp normalization (from real ratings)
+ts_min = float(real_train["timestamp"].min())
+ts_range = float(real_train["timestamp"].max() - ts_min) + 1.0
 
 
 # ═══════════════════════════════════════════════════════════════════
-# DATASET — BPR triplet sampling
+# DATASET — pointwise BCE
 # ═══════════════════════════════════════════════════════════════════
 
-class BPRDataset(Dataset):
-    """Returns (user, pos_item, neg_item) triples with online negative sampling."""
+class RecDataset(Dataset):
     def __init__(self, df):
         self.user_ids = df["userId"].values.astype(np.int64)
         self.movie_ids = df["movieId"].values.astype(np.int64)
+        self.labels = df["label"].values.astype(np.float32)
         self.ts_norm = ((df["timestamp"].values - ts_min) / ts_range).astype(np.float32)
 
     def __len__(self):
-        return len(self.user_ids)
+        return len(self.labels)
 
     def __getitem__(self, idx):
         uid = self.user_ids[idx]
-        pos_mid = self.movie_ids[idx]
-
-        # Sample negative: random item user hasn't interacted with
-        neg_mid = np.random.randint(0, num_items)
-        pos_set = user_pos_items.get(uid, set())
-        # Rejection sampling (fast when num_items >> num_user_interactions)
-        while neg_mid in pos_set:
-            neg_mid = np.random.randint(0, num_items)
-
-        ts = self.ts_norm[idx]
-
-        # Dense features for positive item
-        pos_dense = np.concatenate([
-            [ts],
+        mid = self.movie_ids[idx]
+        dense = np.concatenate([
+            [self.ts_norm[idx]],
             user_stats[uid],
-            item_stats[pos_mid],
+            item_stats[mid],
         ])
-
-        # Dense features for negative item
-        neg_dense = np.concatenate([
-            [ts],
-            user_stats[uid],
-            item_stats[neg_mid],
-        ])
-
         return (
-            uid,                          # int64
-            pos_mid,                      # int64
-            neg_mid,                      # int64
-            pos_dense,                    # float32[NUM_DENSE]
-            neg_dense,                    # float32[NUM_DENSE]
-            user_histories[uid],          # int64[HISTORY_LEN]
-            movie_genres[pos_mid],        # float32[num_genres]
-            movie_genres[neg_mid],        # float32[num_genres]
+            uid,
+            mid,
+            dense,
+            user_histories[uid],
+            movie_genres[mid],
+            self.labels[idx],
         )
 
 
 train_loader = DataLoader(
-    BPRDataset(train_df), batch_size=BATCH_SIZE, shuffle=True,
+    RecDataset(train_df), batch_size=BATCH_SIZE, shuffle=True,
     num_workers=0, pin_memory=False, drop_last=True,
 )
 
 
 # ═══════════════════════════════════════════════════════════════════
-# MODEL — same DLRM architecture, scores individual (user, item) pairs
+# EVAL SET — val rated items + sampled unrated negatives
+# ═══════════════════════════════════════════════════════════════════
+
+# Val positives: rated >= 4 in val set (label=1)
+# Val hard negatives: rated < 4 in val set (label=0)
+# Val easy negatives: random unrated movies (label=0), 1 per val positive
+_val_pos_mask = val_df["label"] == 1
+_val_pos = val_df[_val_pos_mask]
+_val_hard_neg = val_df[~_val_pos_mask]
+_n_val_pos = len(_val_pos)
+
+# Build user -> all items (train + val) for eval neg sampling exclusion
+_val_user_all = {}
+for uid, items in user_all_items.items():
+    _val_user_all[uid] = set(items)
+for uid, group in val_df.groupby("userId"):
+    if uid not in _val_user_all:
+        _val_user_all[uid] = set()
+    _val_user_all[uid].update(group["movieId"].values)
+
+# Sample fixed easy negatives for val positives
+_eval_rng = np.random.RandomState(42)
+_easy_neg_users = _val_pos["userId"].values.astype(np.int64)
+_easy_neg_items = np.empty(_n_val_pos, dtype=np.int64)
+for i in range(_n_val_pos):
+    uid = _easy_neg_users[i]
+    rated = _val_user_all.get(uid, set())
+    mid = _eval_rng.randint(0, num_items)
+    while mid in rated:
+        mid = _eval_rng.randint(0, num_items)
+    _easy_neg_items[i] = mid
+
+# Combine: val positives + val hard negatives + easy negatives
+_eval_users = np.concatenate([
+    _val_pos["userId"].values, _val_hard_neg["userId"].values, _easy_neg_users
+]).astype(np.int64)
+_eval_items = np.concatenate([
+    _val_pos["movieId"].values, _val_hard_neg["movieId"].values, _easy_neg_items
+]).astype(np.int64)
+_eval_ts = np.concatenate([
+    _val_pos["timestamp"].values, _val_hard_neg["timestamp"].values, _val_pos["timestamp"].values
+])
+_eval_ts_norm = ((_eval_ts - ts_min) / ts_range).astype(np.float32)
+_eval_labels = np.concatenate([
+    np.ones(_n_val_pos), np.zeros(len(_val_hard_neg)), np.zeros(_n_val_pos)
+])
+
+_eval_dense = np.stack([
+    np.concatenate([[_eval_ts_norm[i]], user_stats[_eval_users[i]], item_stats[_eval_items[i]]])
+    for i in range(len(_eval_users))
+]).astype(np.float32)
+_eval_histories = user_histories[_eval_users]
+_eval_genres = movie_genres[_eval_items]
+
+log.info(f"Eval set: {_n_val_pos} pos + {len(_val_hard_neg)} hard neg + {_n_val_pos} easy neg = {len(_eval_users)} total")
+
+
+def run_eval():
+    """Evaluate AUC on validation set."""
+    model.eval()
+    eval_batch = BATCH_SIZE * 2
+    all_scores = []
+    with torch.no_grad():
+        for start in range(0, len(_eval_users), eval_batch):
+            end = min(start + eval_batch, len(_eval_users))
+            u = torch.from_numpy(_eval_users[start:end]).to(DEVICE)
+            m = torch.from_numpy(_eval_items[start:end]).to(DEVICE)
+            d = torch.from_numpy(_eval_dense[start:end]).to(DEVICE)
+            h = torch.from_numpy(_eval_histories[start:end]).to(DEVICE)
+            g = torch.from_numpy(_eval_genres[start:end]).to(DEVICE)
+            logits = model(u, m, d, h, g)
+            all_scores.append(torch.sigmoid(logits).cpu().numpy())
+
+    scores = np.concatenate(all_scores)
+    return evaluate(_eval_labels, scores)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MODEL
 # ═══════════════════════════════════════════════════════════════════
 
 class DLRM(nn.Module):
-    """
-    Deep Learning Recommendation Model.
-
-    Architecture:
-      - Bottom MLP transforms dense features -> embed_dim
-      - Sparse features (user, item, genre, history) each -> embed_dim
-      - Feature interaction: pairwise dot products of all embedding vectors
-      - Top MLP: concat of dot products + embedding vectors -> logit
-    """
-
     def __init__(self):
         super().__init__()
         D = EMBED_DIM
@@ -266,78 +311,11 @@ log.info(f"Parameters: {num_params / 1e6:.1f}M | Genres: {num_genres}")
 
 
 # ═══════════════════════════════════════════════════════════════════
-# EVALUATION — AUC on val set (positives = val interactions, negatives = unrated items)
-# Pre-compute fixed eval negatives for stable AUC across epochs
-# ═══════════════════════════════════════════════════════════════════
-
-# Build user -> all positive items (train + val) for eval negative sampling
-_val_user_all_pos = {}
-for uid, pos_set in user_pos_items.items():
-    _val_user_all_pos[uid] = set(pos_set)
-for uid, group in val_df.groupby("userId"):
-    if uid not in _val_user_all_pos:
-        _val_user_all_pos[uid] = set()
-    _val_user_all_pos[uid].update(group["movieId"].values)
-
-# Collect val positives
-_eval_val_users = val_df["userId"].values.astype(np.int64)
-_eval_val_items = val_df["movieId"].values.astype(np.int64)
-_eval_val_ts = ((val_df["timestamp"].values - ts_min) / ts_range).astype(np.float32)
-_n_val = len(_eval_val_users)
-
-# Pre-sample fixed negatives (deterministic seed for reproducibility)
-_eval_rng = np.random.RandomState(42)
-_eval_neg_items = np.empty(_n_val, dtype=np.int64)
-for i in range(_n_val):
-    uid = _eval_val_users[i]
-    pos_set = _val_user_all_pos.get(uid, set())
-    neg = _eval_rng.randint(0, num_items)
-    while neg in pos_set:
-        neg = _eval_rng.randint(0, num_items)
-    _eval_neg_items[i] = neg
-
-# Pre-build all eval arrays
-_eval_all_users = np.concatenate([_eval_val_users, _eval_val_users])
-_eval_all_items = np.concatenate([_eval_val_items, _eval_neg_items])
-_eval_all_ts = np.concatenate([_eval_val_ts, _eval_val_ts])
-_eval_all_labels = np.concatenate([np.ones(_n_val), np.zeros(_n_val)])
-
-_eval_all_dense = np.stack([
-    np.concatenate([[_eval_all_ts[i]], user_stats[_eval_all_users[i]], item_stats[_eval_all_items[i]]])
-    for i in range(len(_eval_all_users))
-]).astype(np.float32)
-
-_eval_all_histories = user_histories[_eval_all_users]
-_eval_all_genres = movie_genres[_eval_all_items]
-
-log.info(f"Eval set prepared: {_n_val} pos + {_n_val} neg = {2*_n_val} samples")
-
-
-def run_eval():
-    """Evaluate AUC on validation set with pre-computed fixed negatives."""
-    model.eval()
-    eval_batch = BATCH_SIZE * 2
-    all_scores = []
-    with torch.no_grad():
-        for start in range(0, len(_eval_all_users), eval_batch):
-            end = min(start + eval_batch, len(_eval_all_users))
-            u = torch.from_numpy(_eval_all_users[start:end]).to(DEVICE)
-            m = torch.from_numpy(_eval_all_items[start:end]).to(DEVICE)
-            d = torch.from_numpy(_eval_all_dense[start:end]).to(DEVICE)
-            h = torch.from_numpy(_eval_all_histories[start:end]).to(DEVICE)
-            g = torch.from_numpy(_eval_all_genres[start:end]).to(DEVICE)
-            logits = model(u, m, d, h, g)
-            all_scores.append(torch.sigmoid(logits).cpu().numpy())
-
-    scores = np.concatenate(all_scores)
-    return evaluate(_eval_all_labels, scores)
-
-
-# ═══════════════════════════════════════════════════════════════════
-# TRAINING LOOP — BPR pairwise loss
+# TRAINING LOOP — BCE loss
 # ═══════════════════════════════════════════════════════════════════
 
 optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+criterion = nn.BCEWithLogitsLoss()
 
 training_start = time.time()
 peak_memory_mb = 0.0
@@ -355,27 +333,19 @@ while True:
     epoch_loss = 0.0
     n_batches = 0
 
-    for uid, pos_mid, neg_mid, pos_dense, neg_dense, history, pos_genres, neg_genres in train_loader:
+    for uid, mid, dense, history, genres, label in train_loader:
         if time.time() - training_start >= TIME_BUDGET:
             break
 
         uid = uid.to(DEVICE)
+        mid = mid.to(DEVICE)
+        dense = dense.to(DEVICE)
         history = history.to(DEVICE)
+        genres = genres.to(DEVICE)
+        label = label.to(DEVICE)
 
-        # Score positive items
-        pos_score = model(
-            uid, pos_mid.to(DEVICE), pos_dense.to(DEVICE),
-            history, pos_genres.to(DEVICE),
-        )
-
-        # Score negative items
-        neg_score = model(
-            uid, neg_mid.to(DEVICE), neg_dense.to(DEVICE),
-            history, neg_genres.to(DEVICE),
-        )
-
-        # BPR loss: -log(sigmoid(pos_score - neg_score))
-        loss = -torch.nn.functional.logsigmoid(pos_score - neg_score).mean()
+        logits = model(uid, mid, dense, history, genres)
+        loss = criterion(logits, label)
 
         optimizer.zero_grad()
         loss.backward()
@@ -418,7 +388,7 @@ training_seconds = time.time() - training_start
 
 
 # ═══════════════════════════════════════════════════════════════════
-# EVALUATION (uses prepare.evaluate)
+# EVALUATION
 # ═══════════════════════════════════════════════════════════════════
 
 if best_state is not None:
