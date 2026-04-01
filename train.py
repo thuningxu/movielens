@@ -16,6 +16,10 @@ import sys
 import time
 
 import numpy as np
+
+# Fix all random seeds for reproducibility
+SEED = 42
+np.random.seed(SEED)
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -46,12 +50,16 @@ EVAL_EVERY = 1
 PATIENCE = 5
 
 # ─── Device ─────────────────────────────────────────────────────────
-if torch.backends.mps.is_available():
-    DEVICE = torch.device("mps")
-elif torch.cuda.is_available():
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
     DEVICE = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
 else:
     DEVICE = torch.device("cpu")
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 log.info(f"Device: {DEVICE}")
 
 # ─── Load Data ──────────────────────────────────────────────────────
