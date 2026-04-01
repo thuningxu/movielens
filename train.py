@@ -36,7 +36,7 @@ log = logging.getLogger("train")
 # ─── Configuration ──────────────────────────────────────────────────
 DATASET = os.environ.get("DATASET", "ml-1m")
 BATCH_SIZE = 8192
-LR = 1e-4
+LR = 5e-4
 WEIGHT_DECAY = 1e-5
 EMBED_DIM = 16
 HISTORY_LEN = 50
@@ -354,10 +354,12 @@ scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
 training_start = time.time()
 peak_memory_mb = 0.0
-epoch = 0
 best_auc = 0.0
 best_state = None
 evals_without_improvement = 0
+global_step = 0
+eval_every_steps = max(n_batches_per_epoch // 2, 1)  # eval ~2x per epoch
+epoch = 0
 
 while True:
     model.train()
@@ -382,29 +384,32 @@ while True:
         scaler.update()
 
         epoch_loss += loss.item()
+        global_step += 1
+
+        # Sub-epoch evaluation
+        if global_step % eval_every_steps == 0:
+            avg_loss = epoch_loss / (i + 1)
+            elapsed = time.time() - training_start
+            val_metrics = run_eval()
+            val_auc = val_metrics["auc"]
+            improved = "***" if val_auc > best_auc else ""
+            log.info(f"Step {global_step:6d} | Loss {avg_loss:.4f} | Val AUC {val_auc:.4f} {improved} | {elapsed:.0f}s")
+
+            if val_auc > best_auc:
+                best_auc = val_auc
+                best_state = copy.deepcopy(model.state_dict())
+                evals_without_improvement = 0
+            else:
+                evals_without_improvement += 1
+
+            if evals_without_improvement >= PATIENCE:
+                log.info(f"Early stopping: no improvement for {PATIENCE} evals (best AUC: {best_auc:.4f})")
+                break
+            model.train()
 
     epoch += 1
-    avg_loss = epoch_loss / max(n_batches_per_epoch, 1)
-    elapsed = time.time() - training_start
-
-    if epoch % EVAL_EVERY == 0:
-        val_metrics = run_eval()
-        val_auc = val_metrics["auc"]
-        improved = "***" if val_auc > best_auc else ""
-        log.info(f"Epoch {epoch:4d} | Loss {avg_loss:.4f} | Val AUC {val_auc:.4f} {improved} | {elapsed:.0f}s")
-
-        if val_auc > best_auc:
-            best_auc = val_auc
-            best_state = copy.deepcopy(model.state_dict())
-            evals_without_improvement = 0
-        else:
-            evals_without_improvement += 1
-
-        if evals_without_improvement >= PATIENCE:
-            log.info(f"Early stopping: no improvement for {PATIENCE} evals (best AUC: {best_auc:.4f})")
-            break
-    else:
-        log.info(f"Epoch {epoch:4d} | Loss {avg_loss:.4f} | {elapsed:.0f}s")
+    if evals_without_improvement >= PATIENCE:
+        break
 
 # Record peak CUDA memory after training
 if DEVICE.type == "cuda":
