@@ -38,7 +38,7 @@ if hasattr(sys.stdout, "reconfigure"):
 log = logging.getLogger("train")
 
 # ─── Configuration ──────────────────────────────────────────────────
-DATASET = os.environ.get("DATASET", "ml-1m")
+DATASET = os.environ.get("DATASET", "ml-25m")
 BATCH_SIZE = 8192
 LR = 1e-4
 WEIGHT_DECAY = 1e-5
