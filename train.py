@@ -492,7 +492,9 @@ while True:
                 _movie_genres_gpu[m_batch],
                 _item_histories_gpu[m_batch], _item_hist_ratings_gpu[m_batch],
             )
-            loss = criterion(logits, train_labels[idx])
+            # Label smoothing: soft targets
+            smooth_labels = train_labels[idx] * 0.9 + 0.05
+            loss = criterion(logits, smooth_labels)
 
         optimizer.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
