@@ -217,17 +217,31 @@ Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedb
 | 5 | batch_size=16384 | 0.796 | +0.003 | fde1deb |
 | 6 | ACCUM_STEPS=4→8 | 0.798 | +0.002 | 70ebdeb |
 | 7 | wider stream MLPs (256-64) | 0.798 | +0.001 | c2d8a81 |
+| 8 | Lightweight causal self-attention before DIN | 0.799 | +0.001 | 15cf247 |
 
-**Discarded on ml-25m:**
+**Discarded on ml-25m (18 experiments, all at 0.791-0.799):**
 - embed_dim=32 — 0.778 (slight overfit even with 25m data)
+- embed_dim=32 + dropout 0.2 — 0.792 (still worse than dim=24)
 - embed_dim=20 — 0.789 (24 is better)
+- embed dropout 0.05 — 0.770 (0.1 is better)
 - 4 GDCN cross layers — 0.742 (too much capacity)
 - ITEM_HIST_LEN=50 — 0.793 (no change from 30)
 - BST 1-layer Transformer — 0.778 (4x slower, no gain)
+- 2-head causal attention — 0.799 (same AUC, 2.5x slower)
+- Item-side causal attention — 0.791 (slower and worse)
 - LR=2e-4 — 0.771 (worse)
 - MLP dropout 0.3 — 0.796 (no improvement over 0.2)
-- embed dropout 0.05 — 0.770 (0.1 is better)
-- Tag genome features (1128-dim) — 0.798 (no improvement, only 23% movie coverage)
+- Tag genome features (1128-dim) — 0.798 (no improvement, 23% coverage)
+- Multi-task rating MSE — 0.797 (no improvement)
+- NEG_RATIO=6 — 0.798 (no improvement)
+- weight_decay=1e-4 — 0.792 (too strong)
+- LightGCN BPR (training failed to converge) — 0.797
+- Wider DIN attention (128 hidden) — 0.797 (worse)
+- User + item bias terms — 0.792 (overfits)
+- Residual top MLP — 0.793 (worse and slower)
+- LayerNorm after cross-network — 0.795 (hurts)
+- Learnable DIN temperature — 0.799 (no change)
+- Cosine annealing LR — 0.799 (no change)
 
 ### Key learnings
 
