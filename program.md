@@ -242,6 +242,14 @@ Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedb
 - **CL4SRec** — contrastive learning with sequence augmentations (crop, mask, reorder). Auxiliary InfoNCE loss.
 - **BERT4Rec** — bidirectional masked item prediction. Auxiliary masked-item loss + primary BCE.
 
+#### Tier 2b — Graph neural networks (medium, requires building graph)
+- **LightGCN** — simplest GNN for CF: propagate embeddings on user-item bipartite graph (no feature transformation, just mean aggregation). Use pre-trained GCN embeddings as features or end-to-end. Very well-proven on MovieLens.
+- **NGCF (Neural Graph CF)** — GCN with feature transformation + nonlinearity at each layer. Captures multi-hop collaborative signal.
+- **PinSage** — GraphSAGE adapted for recommendation. Random walk + neighborhood sampling for scalable GNN. Good for ml-10m scale.
+- **SR-GNN (Session-based Rec with GNN)** — build session graph from user history, apply gated GNN. Captures item transitions within sessions.
+- **KGAT (Knowledge Graph Attention)** — if we build a knowledge graph from genres/tags/year, propagate item knowledge via attention-weighted GNN.
+- **Pre-trained GCN embeddings** — simplest approach: train LightGCN offline, freeze embeddings, concatenate as additional item/user features. No graph needed at training time, just a preprocessing step.
+
 #### Tier 3 — Advanced architectures (medium-hard)
 - **RankMixer (ByteDance)** — MLP-Mixer adapted for CTR: field-mixing + channel-mixing MLPs. Replaces cross-network.
 - **EulerNet** — complex-valued feature interactions via Euler's formula. Novel interaction modeling.
