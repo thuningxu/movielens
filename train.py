@@ -39,7 +39,7 @@ log = logging.getLogger("train")
 
 # ─── Configuration ──────────────────────────────────────────────────
 DATASET = os.environ.get("DATASET", "ml-25m")
-BATCH_SIZE = 8192
+BATCH_SIZE = 16384
 LR = 1e-4
 WEIGHT_DECAY = 1e-5
 EMBED_DIM = 24
