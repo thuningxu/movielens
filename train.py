@@ -408,7 +408,7 @@ class DLRM(nn.Module):
         user_hist_e = (hist_item_e * attn_w).sum(dim=1)               # (B, D)
 
         # --- Item-side DIN: attention over users who rated this item ---
-        rater_e = self.rater_embed(item_hist)                          # (B, IL, D)
+        rater_e = nn.functional.dropout(self.rater_embed(item_hist), 0.1, self.training)  # (B, IL, D)
         rater_rat_e = self.rating_proj(item_hist_ratings.unsqueeze(-1)) # (B, IL, D)
         rater_e_raw = torch.cat([rater_e, rater_rat_e], dim=-1)       # (B, IL, 2D)
         query_e = torch.cat([user_e, user_e], dim=-1)                 # (B, 2D)
