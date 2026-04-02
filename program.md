@@ -140,9 +140,10 @@ The hybrid formulation is the current setup. It predicts "will user engage posit
 
 Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedback.
 
-### Experiment log (autoresearch/mar31)
+### Experiment log (autoresearch/mar31) — ml-1m
 
-22 experiments run on ml-1m. Run-to-run variance is **~0.03 AUC** (same code gives 0.758–0.790).
+> **⚠ All AUC values below are on ml-1m (1M ratings, 6K users, 3.7K items). NOT comparable to ml-10m results.**
+> Run-to-run variance was **~0.03 AUC** (no seed fixing at this point).
 
 **Kept improvements** (cumulative, all architecture/feature changes):
 
@@ -177,7 +178,7 @@ Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedb
 | 21 | Deeper DIN attention (3-layer) | 0.751 | 16min/epoch, unusable |
 | 22 | NEG_RATIO=2 | 0.775 | Only 1 epoch (multi-head was still loaded) |
 
-**Tier 1 ideas also tested via parallel agents (all hurt on ml-1m):**
+**Tier 1 ideas also tested via parallel agents (all hurt on ml-1m, not re-tested on ml-10m):**
 
 | Experiment | AUC | Why |
 |-----------|-----|-----|
@@ -187,9 +188,9 @@ Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedb
 | Gradient clipping (max_norm=1.0) | 0.741 | No benefit |
 | Focal loss (gamma=2) | 0.726 | Over-suppresses easy negatives |
 
-### Experiment log (autoresearch/apr01)
+### Experiment log (autoresearch/apr01) — ml-10m
 
-~25 experiments on ml-10m. Deterministic after seed fix (SEED=42).
+> **All AUC values below are on ml-10m (10M ratings, 70K users, 10.7K items). Deterministic (SEED=42).**
 
 **Kept improvements** (cumulative):
 
@@ -257,7 +258,7 @@ Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedb
 
 #### Already tried, didn't work (don't retry as-is)
 
-**From ml-1m experiments (autoresearch/mar31):**
+**From ml-1m experiments (autoresearch/mar31) — may behave differently on ml-10m:**
 - LR schedules (ReduceLROnPlateau, cosine decay) — all hurt
 - BatchNorm in MLPs — hurt significantly
 - Embedding L2 regularization (full-table norm) — too strong
