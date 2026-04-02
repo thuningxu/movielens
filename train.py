@@ -463,6 +463,7 @@ optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECA
 criterion = nn.BCEWithLogitsLoss()
 use_amp = DEVICE.type == "cuda"
 scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+ACCUM_STEPS = 2
 
 training_start = time.time()
 peak_memory_mb = 0.0
@@ -496,10 +497,11 @@ while True:
             smooth_labels = train_labels[idx] * 0.9 + 0.05
             loss = criterion(logits, smooth_labels)
 
-        optimizer.zero_grad(set_to_none=True)
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+        scaler.scale(loss / ACCUM_STEPS).backward()
+        if (i + 1) % ACCUM_STEPS == 0:
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
 
         epoch_loss += loss.item()
         global_step += 1
