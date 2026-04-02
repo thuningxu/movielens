@@ -38,16 +38,16 @@ if hasattr(sys.stdout, "reconfigure"):
 log = logging.getLogger("train")
 
 # ─── Configuration ──────────────────────────────────────────────────
-DATASET = os.environ.get("DATASET", "ml-1m")
-BATCH_SIZE = 8192
+DATASET = os.environ.get("DATASET", "ml-25m")
+BATCH_SIZE = 16384
 LR = 1e-4
 WEIGHT_DECAY = 1e-5
-EMBED_DIM = 16
-HISTORY_LEN = 50
+EMBED_DIM = 24
+HISTORY_LEN = 100
 NUM_DENSE = 11  # 1 timestamp + 3 user stats + 3 item stats + 1 ug_dot + 1 year + 1 genre_count + 1 movie_age
 NEG_RATIO = 4  # random unrated negatives per positive in training data
 EVAL_EVERY = 1
-PATIENCE = 5
+PATIENCE = 2
 
 # ─── Device ─────────────────────────────────────────────────────────
 torch.manual_seed(SEED)
@@ -60,6 +60,7 @@ else:
     DEVICE = torch.device("cpu")
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
+torch.set_float32_matmul_precision('high')  # enable TF32 tensor cores
 log.info(f"Device: {DEVICE}")
 
 # ─── Load Data ──────────────────────────────────────────────────────
@@ -351,6 +352,9 @@ class DLRM(nn.Module):
         self.cross_w2 = nn.Linear(cross_dim, cross_dim, bias=False)
         self.cross_b2 = nn.Parameter(torch.zeros(cross_dim))
         self.cross_g2 = nn.Linear(cross_dim, cross_dim)
+        self.cross_w3 = nn.Linear(cross_dim, cross_dim, bias=False)
+        self.cross_b3 = nn.Parameter(torch.zeros(cross_dim))
+        self.cross_g3 = nn.Linear(cross_dim, cross_dim)
 
         # Two-stream MLPs (FinalMLP-style)
         # User stream: user_e + user_hist_e + dense_e = 3*D
@@ -433,6 +437,10 @@ class DLRM(nn.Module):
         cross2 = x0 * (self.cross_w2(x1) + self.cross_b2)
         gate2 = torch.sigmoid(self.cross_g2(x1))
         x2 = gate2 * cross2 + (1 - gate2) * x1
+        # Gated cross layer 3
+        cross3 = x0 * (self.cross_w3(x2) + self.cross_b3)
+        gate3 = torch.sigmoid(self.cross_g3(x2))
+        x3 = gate3 * cross3 + (1 - gate3) * x2
 
         # Two-stream processing
         user_stream_out = self.user_stream(torch.cat([user_e, user_hist_e, dense_e], dim=-1))
@@ -442,7 +450,7 @@ class DLRM(nn.Module):
         bilinear = user_stream_out * item_stream_out  # element-wise product (B, 64)
 
         # Combine cross-network + streams + bilinear
-        combined = torch.cat([x2, user_stream_out, item_stream_out, bilinear], dim=-1)
+        combined = torch.cat([x3, user_stream_out, item_stream_out, bilinear], dim=-1)
         return self.top_mlp(combined).squeeze(-1)
 
 
