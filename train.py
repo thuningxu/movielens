@@ -352,9 +352,21 @@ class DLRM(nn.Module):
         self.cross_b2 = nn.Parameter(torch.zeros(cross_dim))
         self.cross_g2 = nn.Linear(cross_dim, cross_dim)
 
-        # Top MLP after cross layers (3 hidden layers)
+        # Two-stream MLPs (FinalMLP-style)
+        # User stream: user_e + user_hist_e + dense_e = 3*D
+        self.user_stream = nn.Sequential(
+            nn.Linear(3 * D, 128), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(128, 64), nn.ReLU(),
+        )
+        # Item stream: item_e + item_hist_e + genre_e = 3*D
+        self.item_stream = nn.Sequential(
+            nn.Linear(3 * D, 128), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(128, 64), nn.ReLU(),
+        )
+
+        # Top MLP: cross-network + streams + bilinear
         self.top_mlp = nn.Sequential(
-            nn.Linear(cross_dim, 256),
+            nn.Linear(cross_dim + 64 + 64 + 64, 256),
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(256, 128),
@@ -396,7 +408,7 @@ class DLRM(nn.Module):
         user_hist_e = (hist_item_e * attn_w).sum(dim=1)               # (B, D)
 
         # --- Item-side DIN: attention over users who rated this item ---
-        rater_e = self.rater_embed(item_hist)                          # (B, IL, D)
+        rater_e = nn.functional.dropout(self.rater_embed(item_hist), 0.1, self.training)  # (B, IL, D)
         rater_rat_e = self.rating_proj(item_hist_ratings.unsqueeze(-1)) # (B, IL, D)
         rater_e_raw = torch.cat([rater_e, rater_rat_e], dim=-1)       # (B, IL, 2D)
         query_e = torch.cat([user_e, user_e], dim=-1)                 # (B, 2D)
@@ -422,7 +434,16 @@ class DLRM(nn.Module):
         gate2 = torch.sigmoid(self.cross_g2(x1))
         x2 = gate2 * cross2 + (1 - gate2) * x1
 
-        return self.top_mlp(x2).squeeze(-1)
+        # Two-stream processing
+        user_stream_out = self.user_stream(torch.cat([user_e, user_hist_e, dense_e], dim=-1))
+        item_stream_out = self.item_stream(torch.cat([item_e, item_hist_e, genre_e], dim=-1))
+
+        # Bilinear interaction between streams
+        bilinear = user_stream_out * item_stream_out  # element-wise product (B, 64)
+
+        # Combine cross-network + streams + bilinear
+        combined = torch.cat([x2, user_stream_out, item_stream_out, bilinear], dim=-1)
+        return self.top_mlp(combined).squeeze(-1)
 
 
 model = DLRM().to(DEVICE)
@@ -442,6 +463,7 @@ optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECA
 criterion = nn.BCEWithLogitsLoss()
 use_amp = DEVICE.type == "cuda"
 scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+ACCUM_STEPS = 2
 
 training_start = time.time()
 peak_memory_mb = 0.0
@@ -471,12 +493,15 @@ while True:
                 _movie_genres_gpu[m_batch],
                 _item_histories_gpu[m_batch], _item_hist_ratings_gpu[m_batch],
             )
-            loss = criterion(logits, train_labels[idx])
+            # Label smoothing: soft targets
+            smooth_labels = train_labels[idx] * 0.9 + 0.05
+            loss = criterion(logits, smooth_labels)
 
-        optimizer.zero_grad(set_to_none=True)
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+        scaler.scale(loss / ACCUM_STEPS).backward()
+        if (i + 1) % ACCUM_STEPS == 0:
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
 
         epoch_loss += loss.item()
         global_step += 1

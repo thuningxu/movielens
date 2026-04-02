@@ -134,15 +134,16 @@ Three formulations were tried. AUC is NOT comparable across them — different t
 |-------------|----------|----------|------|-----------|
 | Explicit | rating >= 4 | rating < 4 | BCE | ~0.69 (ml-100k) |
 | Implicit | any rating | random unrated | BPR | ~0.84 (ml-1m) |
-| **Hybrid (current)** | rating >= 4 | rated < 4 (hard) + random unrated (easy) | BCE | **~0.77** (ml-1m) |
+| **Hybrid (current)** | rating >= 4 | rated < 4 (hard) + random unrated (easy) | BCE | **~0.79** (ml-1m), **~0.74** (ml-10m) |
 
 The hybrid formulation is the current setup. It predicts "will user engage positively?" — suitable for front-page recommendation where you need calibrated probabilities and a threshold.
 
 Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedback.
 
-### Experiment log (autoresearch/mar31)
+### Experiment log (autoresearch/mar31) — ml-1m
 
-22 experiments run on ml-1m. Run-to-run variance is **~0.03 AUC** (same code gives 0.758–0.790).
+> **⚠ All AUC values below are on ml-1m (1M ratings, 6K users, 3.7K items). NOT comparable to ml-10m results.**
+> Run-to-run variance was **~0.03 AUC** (no seed fixing at this point).
 
 **Kept improvements** (cumulative, all architecture/feature changes):
 
@@ -177,7 +178,7 @@ Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedb
 | 21 | Deeper DIN attention (3-layer) | 0.751 | 16min/epoch, unusable |
 | 22 | NEG_RATIO=2 | 0.775 | Only 1 epoch (multi-head was still loaded) |
 
-**Tier 1 ideas also tested via parallel agents (all hurt on ml-1m):**
+**Tier 1 ideas also tested via parallel agents (all hurt on ml-1m, not re-tested on ml-10m):**
 
 | Experiment | AUC | Why |
 |-----------|-----|-----|
@@ -187,43 +188,67 @@ Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedb
 | Gradient clipping (max_norm=1.0) | 0.741 | No benefit |
 | Focal loss (gamma=2) | 0.726 | Over-suppresses easy negatives |
 
+### Experiment log (autoresearch/apr01) — ml-10m
+
+> **All AUC values below are on ml-10m (10M ratings, 70K users, 10.7K items). Deterministic (SEED=42).**
+
+**Kept improvements** (cumulative):
+
+| # | Experiment | AUC | Delta | Commit |
+|---|-----------|-----|-------|--------|
+| 0 | Baseline (sub-epoch eval, embed dropout 0.1, patience=5) | 0.692 | — | 7a93a21 |
+| 1 | Movie year + genre count + movie age dense features | 0.705 | +0.013 | 6c4cfc0 |
+| 2 | GDCN gated cross layers | 0.710 | +0.005 | af84445 |
+| 3 | User hist ratings + item-side DIN over recent raters | 0.739 | +0.029 | 870042b |
+
 ### Key learnings
 
-1. **Overfitting is the dominant problem.** The model peaks at epoch 1-3 then degrades on every run. Early stopping catches this but it means we get very few useful gradient updates.
+1. **Overfitting is the dominant problem.** The model peaks at 1-2.5 epochs on ml-10m then degrades. Embed dropout 0.1 is the only regularization that helps — it slows memorization without hurting peak AUC.
 
-2. **Architecture changes work, training procedure changes don't.** DIN attention, DCN-V2, user-genre affinity, wider MLPs all helped. LR schedules, regularization, loss function changes all hurt or had no effect.
+2. **Feature enrichment works, especially on the item side.** Movie year, genre count, movie age as dense features (+0.013). User history ratings in DIN (+0.029 combined with item-side DIN). The item tower was severely underspecified.
 
-3. **Run-to-run variance is ~0.03 AUC.** Same code gives 0.758–0.790 on different runs due to random negative sampling in prepare.py (fixed seed but training shuffle varies). Improvements < 0.01 are noise. Need to either average 3+ runs or fix all random seeds.
+3. **Item-side DIN is a major win.** Attention over recent raters ("users like you rated this") gives strong collaborative signal. This was the single biggest improvement (+0.029).
 
-4. **DIN attention was expensive on MPS but is fast on CUDA.** Single-head DIN: ~18s/epoch on L4 (was ~30s on MPS). Multi-head DIN may now be feasible on GPU.
+4. **Architecture changes work, training procedure changes don't.** GDCN gates (+0.005), item-side DIN (+0.029), features (+0.013) all helped. LR schedules, regularization, loss changes, EMA, multi-task all hurt or had no effect.
 
-5. **The neg_ratio=4 with fixed pre-generated negatives in prepare.py works fine.** Online sampling didn't help. The model memorizes quickly regardless.
+5. **Fixed random seeds are essential.** Run-to-run variance on ml-10m was ~0.05 AUC before seeding. After fixing seeds (SEED=42), variance is <0.001. This was blocking our ability to detect real improvements.
 
-6. **ml-100k is only useful as a smoke test.** AUC on ml-100k does not predict ml-1m performance. Only use it to catch crashes.
+6. **fp16 > bf16 for attention-heavy models.** bf16's reduced mantissa precision hurts DIN attention weights by ~0.006-0.008 AUC. fp16 with `-1e4` masking is the right choice.
+
+7. **VRAM optimization via ID-based lookup.** Storing lookup tables by user/item ID instead of per-sample saves ~12 GB VRAM on ml-10m (14.4 → 2.7 GB), enabling larger models.
+
+8. **ml-100k is only useful as a smoke test.** AUC on ml-100k does not predict ml-10m performance.
 
 ### What to try next (on GPU)
 
-#### Tier 0 — Infrastructure (do first)
-- **Fix random seeds** — `torch.manual_seed`, `np.random.seed`, `torch.cuda.manual_seed_all`, DataLoader worker seeds. Currently ~0.03 AUC variance between runs.
+#### Tier 0 — Infrastructure
+- ~~**Fix random seeds**~~ — DONE: deterministic training (SEED=42). Variance eliminated.
 - ~~**Scale to ml-10m**~~ — DONE: ml-10m is now the default dataset, feature engineering vectorized for scale.
 - ~~**Adjust TIME_BUDGET**~~ — DONE: removed fixed time budget, training now terminates via early stopping only.
-- ~~**Move to NVIDIA GPU**~~ — DONE: running on NVIDIA L4 (CUDA), ~18s/epoch on ml-1m.
+- ~~**Move to NVIDIA GPU**~~ — DONE: running on NVIDIA L4 (CUDA). Precomputed GPU tensors, AMP fp16, torch.compile.
+- ~~**VRAM optimization**~~ — DONE: ID-based lookup instead of per-sample precompute (14.4 GB → 2.7 GB).
 
 #### Tier 1 — Quick wins (easy, try first)
-- **GDCN (Gated DCN)** — add sigmoid gate to each cross layer: `output = gate * cross + (1-gate) * input`. One-line change per cross layer.
-- **MaskNet** — instance-guided feature masking: small MLP generates per-instance mask on embeddings before interaction. Easy addition.
-- **DuoRec contrastive loss** — two forward passes with different dropout masks, InfoNCE auxiliary loss. Addresses representation collapse. Very easy.
+- **DuoRec contrastive loss** — two forward passes with different dropout masks, InfoNCE auxiliary loss. Addresses representation collapse.
 - **In-batch negatives** — use other items in the batch as contrastive negatives. Free diverse negatives, no sampling needed.
-- **Multi-task learning** — add auxiliary head predicting actual rating (MSE), shared backbone. loss = BCE + 0.1 * MSE. Natural for MovieLens.
 - **FinalMLP two-stream** — split features into user stream + item stream, process separately, bilinear fusion.
+- **Tag features** — ml-10m has 95K user tags. Build tag multi-hot per movie → learned projection. 5371/10677 movies have tags.
+- **Embed_dim=32 with embed dropout** — embed_dim=32 hurt before without dropout. Now that embed dropout 0.1 is in place, larger embeddings might work.
+- **3 cross layers with GDCN gates** — 3 plain cross layers hurt before (too much capacity), but GDCN gates may prevent that.
 
 #### Tier 2 — Sequential modeling (medium, high potential on GPU)
 - **SASRec** — causal Transformer over user history. 2-3 layers, 2-4 heads. Replace or augment DIN attention. Well-proven on MovieLens.
-- **BST (Behavior Sequence Transformer)** — Transformer encoder on history, integrated into DLRM. Natural extension of current DIN.
 - **DIEN (Deep Interest Evolution Network)** — GRU with target-aware attentional update gate (AUGRU). Captures interest drift over time.
 - **CL4SRec** — contrastive learning with sequence augmentations (crop, mask, reorder). Auxiliary InfoNCE loss.
-- **GRU4Rec** — simple GRU baseline for history encoding. Fast, good comparison point.
 - **BERT4Rec** — bidirectional masked item prediction. Auxiliary masked-item loss + primary BCE.
+
+#### Tier 2b — Graph neural networks (medium, requires building graph)
+- **LightGCN** — simplest GNN for CF: propagate embeddings on user-item bipartite graph (no feature transformation, just mean aggregation). Use pre-trained GCN embeddings as features or end-to-end. Very well-proven on MovieLens.
+- **NGCF (Neural Graph CF)** — GCN with feature transformation + nonlinearity at each layer. Captures multi-hop collaborative signal.
+- **PinSage** — GraphSAGE adapted for recommendation. Random walk + neighborhood sampling for scalable GNN. Good for ml-10m scale.
+- **SR-GNN (Session-based Rec with GNN)** — build session graph from user history, apply gated GNN. Captures item transitions within sessions.
+- **KGAT (Knowledge Graph Attention)** — if we build a knowledge graph from genres/tags/year, propagate item knowledge via attention-weighted GNN.
+- **Pre-trained GCN embeddings** — simplest approach: train LightGCN offline, freeze embeddings, concatenate as additional item/user features. No graph needed at training time, just a preprocessing step.
 
 #### Tier 3 — Advanced architectures (medium-hard)
 - **RankMixer (ByteDance)** — MLP-Mixer adapted for CTR: field-mixing + channel-mixing MLPs. Replaces cross-network.
@@ -240,17 +265,40 @@ Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedb
 - **Wukong scaling laws (Meta, 2024)** — scaling laws for recommendation: wider embeddings + deeper interaction > deeper MLPs.
 
 #### Already tried, didn't work (don't retry as-is)
-- LR schedules (ReduceLROnPlateau, cosine decay) — all hurt on this formulation
+
+**From ml-1m experiments (autoresearch/mar31) — may behave differently on ml-10m:**
+- LR schedules (ReduceLROnPlateau, cosine decay) — all hurt
 - BatchNorm in MLPs — hurt significantly
-- Embedding L2 regularization (full-table norm) — too strong; could retry with per-batch reg
+- Embedding L2 regularization (full-table norm) — too strong
 - Focal loss (gamma=2) — over-suppresses easy negatives
 - Label smoothing — hurt
 - FinalNet field gate — overfits
 - Popularity-biased negative sampling — task too hard
-- Larger embed_dim (32) without extra regularization — more overfitting
-- 3 cross layers — too much capacity
-- HISTORY_LEN=100 — dilutes attention
+- Larger embed_dim (32) without dropout — more overfitting
+- 3 cross layers (plain DCN-V2) — too much capacity
+- HISTORY_LEN=100 with DIN only — dilutes attention
 - Stronger weight_decay (1e-3) — too aggressive
+
+**From ml-10m experiments (autoresearch/apr01):**
+- Embed_dim=32 + wider MLP + dropout 0.3 — 0.696 (worse, overfits faster)
+- Multi-task aux rating MSE (weight=0.1) — 0.708 (no improvement)
+- LR=5e-5 — 0.717 (too slow to converge)
+- Separate embed LR (3x higher for embeddings) — 0.723 (worse)
+- DIN + GRU dual history — 0.725 (slower and worse)
+- NEG_RATIO=2 — 0.733 (no improvement)
+- Embed dropout 0.15 — 0.738 (0.1 is better)
+- Embed dropout 0.2 — 0.718 (too strong)
+- Batch_size=16384 — 0.731 (too few steps per epoch)
+- MaskNet instance masking — 0.741 (no improvement)
+- History embed dropout 0.1 — 0.718 (hurts DIN attention)
+- MLP dropout 0.3 — 0.723 (too strong, 0.2 is better)
+- Eval 4x/epoch + patience=8 — 0.725 (worse than 2x/epoch + patience=5)
+- BST 1-layer transformer + target attn — 0.740 (slower, no gain)
+- HISTORY_LEN=100 with ID-lookup — 0.722 (dilutes attention)
+- AdamW wd=0.01 — 0.712 (too strong)
+- EMA decay=0.999 — 0.738 (no improvement)
+- Feature-level dropout 0.1 — 0.735 (too aggressive)
+- bf16 AMP — 0.731 (slightly worse than fp16 for attention-heavy model)
 
 ### Useful references
 
