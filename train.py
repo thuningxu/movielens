@@ -359,13 +359,13 @@ class DLRM(nn.Module):
         # Two-stream MLPs (FinalMLP-style)
         # User stream: user_e + user_hist_e + dense_e = 3*D
         self.user_stream = nn.Sequential(
-            nn.Linear(3 * D, 128), nn.ReLU(), nn.Dropout(0.2),
-            nn.Linear(128, 64), nn.ReLU(),
+            nn.Linear(3 * D, 256), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(256, 64), nn.ReLU(),
         )
         # Item stream: item_e + item_hist_e + genre_e = 3*D
         self.item_stream = nn.Sequential(
-            nn.Linear(3 * D, 128), nn.ReLU(), nn.Dropout(0.2),
-            nn.Linear(128, 64), nn.ReLU(),
+            nn.Linear(3 * D, 256), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(256, 64), nn.ReLU(),
         )
 
         # Top MLP: cross-network + streams + bilinear
