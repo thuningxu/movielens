@@ -47,7 +47,7 @@ HISTORY_LEN = 100
 NUM_DENSE = 11  # 1 timestamp + 3 user stats + 3 item stats + 1 ug_dot + 1 year + 1 genre_count + 1 movie_age
 NEG_RATIO = 4  # random unrated negatives per positive in training data
 EVAL_EVERY = 1
-PATIENCE = 5
+PATIENCE = 2
 
 # ─── Device ─────────────────────────────────────────────────────────
 torch.manual_seed(SEED)
@@ -60,6 +60,7 @@ else:
     DEVICE = torch.device("cpu")
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
+torch.set_float32_matmul_precision('high')  # enable TF32 tensor cores
 log.info(f"Device: {DEVICE}")
 
 # ─── Load Data ──────────────────────────────────────────────────────
