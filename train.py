@@ -364,9 +364,9 @@ class DLRM(nn.Module):
             nn.Linear(128, 64), nn.ReLU(),
         )
 
-        # Top MLP: cross-network output + stream outputs
+        # Top MLP: cross-network + streams + bilinear
         self.top_mlp = nn.Sequential(
-            nn.Linear(cross_dim + 64 + 64, 256),
+            nn.Linear(cross_dim + 64 + 64 + 64, 256),
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(256, 128),
@@ -438,8 +438,11 @@ class DLRM(nn.Module):
         user_stream_out = self.user_stream(torch.cat([user_e, user_hist_e, dense_e], dim=-1))
         item_stream_out = self.item_stream(torch.cat([item_e, item_hist_e, genre_e], dim=-1))
 
-        # Combine cross-network + streams
-        combined = torch.cat([x2, user_stream_out, item_stream_out], dim=-1)
+        # Bilinear interaction between streams
+        bilinear = user_stream_out * item_stream_out  # element-wise product (B, 64)
+
+        # Combine cross-network + streams + bilinear
+        combined = torch.cat([x2, user_stream_out, item_stream_out, bilinear], dim=-1)
         return self.top_mlp(combined).squeeze(-1)
 
 
