@@ -352,9 +352,21 @@ class DLRM(nn.Module):
         self.cross_b2 = nn.Parameter(torch.zeros(cross_dim))
         self.cross_g2 = nn.Linear(cross_dim, cross_dim)
 
-        # Top MLP after cross layers (3 hidden layers)
+        # Two-stream MLPs (FinalMLP-style)
+        # User stream: user_e + user_hist_e + dense_e = 3*D
+        self.user_stream = nn.Sequential(
+            nn.Linear(3 * D, 128), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(128, 64), nn.ReLU(),
+        )
+        # Item stream: item_e + item_hist_e + genre_e = 3*D
+        self.item_stream = nn.Sequential(
+            nn.Linear(3 * D, 128), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(128, 64), nn.ReLU(),
+        )
+
+        # Top MLP: cross-network output + stream outputs
         self.top_mlp = nn.Sequential(
-            nn.Linear(cross_dim, 256),
+            nn.Linear(cross_dim + 64 + 64, 256),
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(256, 128),
@@ -422,7 +434,13 @@ class DLRM(nn.Module):
         gate2 = torch.sigmoid(self.cross_g2(x1))
         x2 = gate2 * cross2 + (1 - gate2) * x1
 
-        return self.top_mlp(x2).squeeze(-1)
+        # Two-stream processing
+        user_stream_out = self.user_stream(torch.cat([user_e, user_hist_e, dense_e], dim=-1))
+        item_stream_out = self.item_stream(torch.cat([item_e, item_hist_e, genre_e], dim=-1))
+
+        # Combine cross-network + streams
+        combined = torch.cat([x2, user_stream_out, item_stream_out], dim=-1)
+        return self.top_mlp(combined).squeeze(-1)
 
 
 model = DLRM().to(DEVICE)
