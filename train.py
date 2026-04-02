@@ -318,7 +318,12 @@ class DLRM(nn.Module):
         # Rating projection: scalar rating → D-dim vector
         self.rating_proj = nn.Linear(1, D)
 
-        # DIN: target-item-aware attention over user history (item + rating)
+        # Lightweight causal self-attention on history (single head, no FFN)
+        self.hist_q = nn.Linear(D, D, bias=False)
+        self.hist_k = nn.Linear(D, D, bias=False)
+        self.hist_v = nn.Linear(D, D, bias=False)
+
+        # DIN: target-item-aware attention over history
         self.din_attn = nn.Sequential(
             nn.Linear(3 * 2 * D, 64),  # 2*D per position (item+rating), 3 groups
             nn.ReLU(),
@@ -399,9 +404,24 @@ class DLRM(nn.Module):
         user_e = nn.functional.dropout(self.user_embed(user_id), 0.1, self.training)
         item_e = nn.functional.dropout(self.item_embed(movie_id), 0.1, self.training)
 
-        # --- User-side DIN: attention over items user watched, with ratings ---
+        # --- User-side: causal self-attention + DIN ---
         hist_item_e = self.hist_embed(history)                         # (B, L, D)
         hist_rat_e = self.rating_proj(hist_ratings.unsqueeze(-1))      # (B, L, D)
+        # Causal self-attention on item embeddings
+        Q = self.hist_q(hist_item_e)                                   # (B, L, D)
+        K = self.hist_k(hist_item_e)                                   # (B, L, D)
+        V = self.hist_v(hist_item_e)                                   # (B, L, D)
+        scale = Q.size(-1) ** 0.5
+        causal_scores = torch.bmm(Q, K.transpose(1, 2)) / scale       # (B, L, L)
+        # Causal mask + padding
+        L = history.size(1)
+        causal_mask = torch.triu(torch.full((L, L), -1e4, device=history.device), diagonal=1)
+        pad_mask = (history == PAD_IDX).unsqueeze(1).expand(-1, L, -1) # (B, L, L)
+        causal_scores = causal_scores + causal_mask.unsqueeze(0)
+        causal_scores = causal_scores.masked_fill(pad_mask, -1e4)
+        causal_weights = torch.softmax(causal_scores, dim=-1)
+        hist_item_e = torch.bmm(causal_weights, V)                    # (B, L, D) — contextual
+        # DIN on contextual embeddings
         hist_e_raw = torch.cat([hist_item_e, hist_rat_e], dim=-1)     # (B, L, 2D)
         target_e = torch.cat([item_e, item_e], dim=-1)                # (B, 2D) — no rating for target
         target_exp = target_e.unsqueeze(1).expand_as(hist_e_raw)      # (B, L, 2D)
