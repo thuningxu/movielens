@@ -471,7 +471,7 @@ optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECA
 criterion = nn.BCEWithLogitsLoss()
 use_amp = DEVICE.type == "cuda"
 scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-ACCUM_STEPS = 2
+ACCUM_STEPS = 4
 
 training_start = time.time()
 peak_memory_mb = 0.0
