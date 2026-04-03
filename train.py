@@ -444,12 +444,14 @@ class DLRM(nn.Module):
             nn.ReLU(),
         )
 
-        # Tag genome: learned compression 1128 → D with gating
+        # Tag genome: learned bottleneck compression 1128 → D with gating
         self.genome_proj = nn.Sequential(
-            nn.Linear(GENOME_DIM, 128),
+            nn.Linear(GENOME_DIM, 256),
+            nn.ReLU(),
+            nn.Linear(256, 64),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(128, D),
+            nn.Linear(64, D),
         )
         self.genome_gate = nn.Linear(D, D)  # sigmoid gate to blend genome with item_embed fallback
 
