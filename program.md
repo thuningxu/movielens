@@ -463,7 +463,28 @@ Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedb
 
 #### Experiment results
 
-*(to be filled as experiments complete)*
+**Kept improvements** (cumulative, building on 0.806 baseline):
+
+| # | Experiment | AUC | Delta | Commit |
+|---|-----------|-----|-------|--------|
+| R1-2 | Tag genome learned MLP compression (1128→128→D) + sigmoid gate | 0.8108 | +0.005 | 81f9e60 |
+| R2-1 | Deeper genome bottleneck (1128→256→64→D) 3-layer | 0.8138 | +0.003 | de28ad8 |
+
+**Discarded (10 experiments):**
+- R1-1: User tags top-200 multi-hot + tag_count + user_tag_dot as 7th field — 0.8071 (marginal)
+- R2-1a: Wider genome (1128→256→D) — 0.8114 (marginal over 0.8108)
+- R2-2: User tags stacked on genome as 8th field — 0.8008 (overfits badly)
+- R3-1: 4-layer genome bottleneck (512→128→64→D) — 0.7985 (overfits)
+- R3-2: Genome dropout 0.2 — 0.8059 (too strong)
+- R3-3: Genome no detach on gate — 0.8059 (no change)
+- R3-4: User tags as 3 dense features — 0.8105 (slight regression)
+
+**Key findings:**
+- Tag genome with learned compression is the breakthrough — PCA failed (0.798) but learned MLP succeeds (0.811-0.814)
+- 3-layer bottleneck (256→64→D) beats 2-layer (128→D) — compression forces better feature extraction
+- 4-layer is too deep (overfits). The sweet spot is 3 layers.
+- User-generated tags provide no useful signal in any form (field, dense, or combined with genome)
+- The sigmoid gate for missing-data fallback is critical (22% coverage handled gracefully)
 
 ### Useful references
 
