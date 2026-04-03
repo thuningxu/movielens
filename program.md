@@ -486,6 +486,39 @@ Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedb
 - User-generated tags provide no useful signal in any form (field, dense, or combined with genome)
 - The sigmoid gate for missing-data fallback is critical (22% coverage handled gracefully)
 
+---
+
+### Experiment log (autoresearch/apr03d) — ml-25m, multi-agent v2
+
+> **4-agent setup with research critic. Target: 0.820 AUC (from 0.8138 baseline).**
+> Hardware: 2x NVIDIA L4 (CUDA:0, CUDA:1), parallel experiments.
+
+#### Multi-agent protocol v2
+
+**Agents:**
+- **Research Scientist** (coordinator) — proposes experiment ideas with rationale
+- **Research Critic** (reviewer) — challenges proposals before execution, reviews results for sanity, suggests refinements
+- **MLE-1** (GPU 0) — executes experiments in git worktree
+- **MLE-2** (GPU 1) — executes experiments in git worktree
+
+**Workflow:**
+1. Researcher proposes 2 experiment ideas with rationale
+2. **Critic reviews proposals** — challenges assumptions, identifies risks, suggests alternatives or modifications
+3. Researcher revises plan based on critique
+4. MLE-1 and MLE-2 execute (parallel worktrees)
+5. Researcher + Critic review results together
+6. Keep/tune/discard decision with up to 10 trials per idea
+
+**Why the critic role:**
+- Pre-screens ideas to avoid wasting GPU time on doomed experiments
+- Catches inconsistencies in results (e.g., wrong baseline, worktree issues)
+- Provides adversarial pressure on idea quality
+- Lightweight: analysis only, no code execution
+
+#### Experiment results
+
+*(to be filled as experiments complete)*
+
 ### Useful references
 
 - BARS benchmark (Zhu et al., SIGIR 2022) — different task (tag CTR) but good training practices and model zoo
