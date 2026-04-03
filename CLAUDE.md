@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Research repo for movie recommendation on MovieLens. Uses a hybrid engagement prediction task: predict whether a user will rate a movie >= 4 stars, with both "watched but didn't like" (hard negatives) and "random unrated" (easy negatives) as label=0. Output is a calibrated probability via BCE loss, suitable for front-page recommendation with a threshold.
 
 Current model: DLRM with rating-aware DIN + causal self-attention, item-side DIN, 4 GDCN cross layers, FinalMLP two-stream with bilinear.
-Current AUC: **0.806 on ml-25m** (deterministic, SEED=42). See `program.md` for full experiment history (~130 experiments).
+Current AUC: **0.806 on ml-25m** (deterministic, SEED=42). See `program.md` for full experiment history (~150 experiments).
 
 ## Commands
 
@@ -29,7 +29,7 @@ grep "^val_auc:\|^peak_memory_mb:" run.log
 
 - **`prepare.py`** — Data download/loading (all MovieLens sizes), `load_data_hybrid()` for the current formulation, time-based train/val/test splits, AUC evaluation, `print_summary()`. May be modified for data setup changes. Keep `evaluate()` and `print_summary()` stable.
 - **`train.py`** — The experimentation file. Feature engineering, model architecture (DLRM + DIN + GDCN + FinalMLP), training loop. Primary file to modify.
-- **`program.md`** — The autoresearch protocol: setup, experiment loop, logging, full experiment history (~130 experiments) and learnings.
+- **`program.md`** — The autoresearch protocol: setup, experiment loop, logging, full experiment history (~150 experiments) and learnings.
 - **`results.tsv`** — Experiment log (untracked). Tab-separated: commit, val_auc, memory_mb, status, description.
 
 ## Key Details
