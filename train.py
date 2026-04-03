@@ -42,9 +42,9 @@ DATASET = os.environ.get("DATASET", "ml-25m")
 BATCH_SIZE = 16384
 LR = 1e-4
 WEIGHT_DECAY = 1e-5
-EMBED_DIM = 24
+EMBED_DIM = 28
 HISTORY_LEN = 100
-NUM_DENSE = 11  # 1 timestamp + 3 user stats + 3 item stats + 1 ug_dot + 1 year + 1 genre_count + 1 movie_age
+NUM_DENSE = 17  # 1 timestamp + 5 user hist bins + 1 user count + 5 item hist bins + 1 item count + 1 ug_dot + 1 year + 1 genre_count + 1 movie_age
 NEG_RATIO = 4  # random unrated negatives per positive in training data
 EVAL_EVERY = 1
 PATIENCE = 2
@@ -95,25 +95,38 @@ for _, row in movies_df.iterrows():
             if g in genre_to_idx:
                 movie_genres[mid, genre_to_idx[g]] = 1.0
 
-# 2. User and item statistics (computed on rated items in train only, before neg augmentation)
+# 2. User and item rating histograms (computed on rated items in train only, before neg augmentation)
 # Filter to real ratings (rating > 0) for stats computation
 real_train = train_df[train_df["rating"] > 0]
-user_stats = np.zeros((num_users, 3), dtype=np.float32)
-item_stats = np.zeros((num_items, 3), dtype=np.float32)
+
+# Rating histograms: fraction of ratings at each level
+# Bucket into 5 bins: [0-1], (1-2], (2-3], (3-4], (4-5]
+user_hist_bins = np.zeros((num_users, 5), dtype=np.float32)
+item_hist_bins = np.zeros((num_items, 5), dtype=np.float32)
+user_count = np.zeros(num_users, dtype=np.float32)
+item_count = np.zeros(num_items, dtype=np.float32)
 
 for uid, group in real_train.groupby("userId"):
-    r = group["rating"].values.astype(np.float32)
-    user_stats[uid] = [len(r), r.mean(), r.std() if len(r) > 1 else 0.0]
+    ratings = group["rating"].values
+    bins = np.clip((ratings - 0.01) // 1, 0, 4).astype(int)
+    for b in bins:
+        user_hist_bins[uid, b] += 1
+    user_count[uid] = len(ratings)
 
 for mid, group in real_train.groupby("movieId"):
-    r = group["rating"].values.astype(np.float32)
-    item_stats[mid] = [len(r), r.mean(), r.std() if len(r) > 1 else 0.0]
+    ratings = group["rating"].values
+    bins = np.clip((ratings - 0.01) // 1, 0, 4).astype(int)
+    for b in bins:
+        item_hist_bins[mid, b] += 1
+    item_count[mid] = len(ratings)
 
-for arr in [user_stats, item_stats]:
-    for col in range(arr.shape[1]):
-        mu = arr[:, col].mean()
-        sigma = arr[:, col].std() + 1e-8
-        arr[:, col] = (arr[:, col] - mu) / sigma
+# Normalize to fractions
+user_hist_bins = user_hist_bins / (user_count[:, None] + 1e-8)
+item_hist_bins = item_hist_bins / (item_count[:, None] + 1e-8)
+
+# Keep count as separate feature (normalized)
+user_count_norm = (user_count - user_count.mean()) / (user_count.std() + 1e-8)
+item_count_norm = (item_count - item_count.mean()) / (item_count.std() + 1e-8)
 
 # 3. User history sequences (last HISTORY_LEN rated items + their ratings)
 PAD_IDX = num_items
@@ -204,7 +217,10 @@ def _build_gpu_tensors(df):
     ug_dot = np.sum(user_genre_affinity[uids] * movie_genres[mids], axis=1).astype(np.float32)
     movie_age = ts_norm - movie_year[mids]
     dense = np.column_stack([
-        ts_norm, user_stats[uids], item_stats[mids], ug_dot,
+        ts_norm,
+        user_hist_bins[uids], user_count_norm[uids],
+        item_hist_bins[mids], item_count_norm[mids],
+        ug_dot,
         movie_year[mids], movie_genre_count[mids], movie_age,
     ]).astype(np.float32)
     return (
@@ -360,6 +376,9 @@ class DLRM(nn.Module):
         self.cross_w3 = nn.Linear(cross_dim, cross_dim, bias=False)
         self.cross_b3 = nn.Parameter(torch.zeros(cross_dim))
         self.cross_g3 = nn.Linear(cross_dim, cross_dim)
+        self.cross_w4 = nn.Linear(cross_dim, cross_dim, bias=False)
+        self.cross_b4 = nn.Parameter(torch.zeros(cross_dim))
+        self.cross_g4 = nn.Linear(cross_dim, cross_dim)
 
         # Two-stream MLPs (FinalMLP-style)
         # User stream: user_e + user_hist_e + dense_e = 3*D
@@ -461,6 +480,10 @@ class DLRM(nn.Module):
         cross3 = x0 * (self.cross_w3(x2) + self.cross_b3)
         gate3 = torch.sigmoid(self.cross_g3(x2))
         x3 = gate3 * cross3 + (1 - gate3) * x2
+        # Gated cross layer 4
+        cross4 = x0 * (self.cross_w4(x3) + self.cross_b4)
+        gate4 = torch.sigmoid(self.cross_g4(x3))
+        x4 = gate4 * cross4 + (1 - gate4) * x3
 
         # Two-stream processing
         user_stream_out = self.user_stream(torch.cat([user_e, user_hist_e, dense_e], dim=-1))
@@ -470,7 +493,7 @@ class DLRM(nn.Module):
         bilinear = user_stream_out * item_stream_out  # element-wise product (B, 64)
 
         # Combine cross-network + streams + bilinear
-        combined = torch.cat([x3, user_stream_out, item_stream_out, bilinear], dim=-1)
+        combined = torch.cat([x4, user_stream_out, item_stream_out, bilinear], dim=-1)
         return self.top_mlp(combined).squeeze(-1)
 
 

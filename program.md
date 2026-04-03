@@ -243,6 +243,58 @@ Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedb
 - Learnable DIN temperature — 0.799 (no change)
 - Cosine annealing LR — 0.799 (no change)
 
+### Experiment log (autoresearch/apr02) — ml-25m
+
+> **All AUC values below are on ml-25m. Deterministic (SEED=42). 2x NVIDIA L4, parallel experiments.**
+
+**Kept improvements** (cumulative, building on apr01 model at 0.799):
+
+| # | Experiment | AUC | Delta | Commit |
+|---|-----------|-----|-------|--------|
+| 0 | Baseline (reproduce 0.799) | 0.799 | — | 1fadb15 |
+| 1 | Rating histogram 5-bin features replacing mean+std | 0.802 | +0.003 | c6b5576 |
+| 2 | 4 GDCN gated cross layers | 0.804 | +0.002 | 2f05af1 |
+| 3 | embed_dim=28 | 0.806 | +0.002 | cc40190 |
+
+**Discarded on ml-25m (37 experiments, all at 0.786-0.805):**
+- DIEN AUGRU replacing self-attn+DIN — 0.786 (slower and worse)
+- Gated fusion replacing concat+top_mlp — 0.779 (information bottleneck)
+- Position embeddings in DIN — 0.794 (causal attn already encodes order)
+- Time-gap features in DIN — 0.799 (neutral, ts already a dense feature)
+- Popularity trajectory features — 0.799 (redundant with existing)
+- Separate embed LR 3x — 0.800 (marginal, unstable later epochs)
+- EulerNet complex-valued interactions — 0.799 (same space as GDCN)
+- Contrastive loss on stream outputs — 0.799 (training procedure)
+- Multi-scale DIN short(10)+long(100) — 0.787 (redundant capacity)
+- RankMixer MLP-Mixer replacing GDCN — 0.799 (worse interaction modeling)
+- Histogram dot+cosine similarity — 0.804 (not reproducible at 0.804)
+- Deeper bottom MLP 3-layer — 0.791 (overfits)
+- Histogram bins + dot + cosine (19 dense) — 0.796 (too many features)
+- Co-rating density feature — 0.799 (redundant with counts)
+- NEG_RATIO=3 — 0.800 (fewer negatives hurts discrimination)
+- Wider bottom MLP 256 — 0.789 (overfits)
+- ACCUM_STEPS=16 — 0.799 (too few updates)
+- User-genre cross-attention — 0.799 (redundant with ug_dot)
+- Decade one-hot replacing scalar year — 0.799 (lost granularity)
+- Eval 3x/epoch + patience=3 — 0.799 (same peak, just later stop)
+- Label smoothing 0.05 — 0.800 (0.1 is better)
+- Freeze embeds after epoch 1 — 0.799 (early stop before epoch 1)
+- LR=5e-5 — 0.802 (same AUC, 2x slower)
+- LR=7e-5 + patience=3 — 0.802 (same AUC, slower)
+- All dropout 0.15 — 0.802 (within noise)
+- Item histogram in item-DIN query — 0.799 (redundant with dense)
+- Bilinear histogram interaction — 0.800 (overfits)
+- NEG_RATIO=5 — 0.801 (marginal worse)
+- 5 GDCN cross layers — 0.800 (too deep)
+- embed_dim=32 + embed dropout 0.15 — 0.802 (still overfits)
+- ITEM_HIST_LEN=50 — 0.806 (no change, +4GB VRAM)
+- HISTORY_LEN=150 — 0.806 (no change, +4GB VRAM)
+- 2-head causal attention — 0.799 (worse)
+- embed_dim=26 — 0.798 (28 is sweet spot)
+- embed_dim=30 — 0.803 (slight overfit)
+- ACCUM_STEPS=4 — 0.805 (slightly worse)
+- Wider stream MLP 384→64 — 0.800 (overfits)
+
 ### Key learnings
 
 1. **More data helps significantly.** ml-10m→ml-25m gave +0.023 AUC for free (same model). Ideas that failed on ml-10m (3 GDCN layers, HISTORY_LEN=100, batch_size=16384, embed_dim=24) all worked on ml-25m.
@@ -263,7 +315,13 @@ Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedb
 
 9. **Batch size matters on large datasets.** batch_size=16384 + ACCUM_STEPS=8 (effective 131K) helped on ml-25m but hurt on ml-10m.
 
-### What to try next (on GPU, ml-25m, baseline 0.798)
+10. **Rating histograms > summary statistics.** 5-bin distributions (+0.003) capture more than mean+std. The full distribution shape matters for engagement prediction.
+
+11. **Richer features unlock deeper/wider models.** 4 GDCN layers failed at 0.742 before histogram bins, succeeded at 0.804 with them. embed_dim=28 works with histograms+4GDCN (0.806) but 30/32 still overfit. Feature quality shifts the capacity threshold.
+
+12. **Most experiments are neutral, not harmful.** At 0.799-0.806, ~90% of changes return within ±0.002 of baseline. The model is extremely well-optimized and resistant to perturbation.
+
+### What to try next (on GPU, ml-25m, baseline 0.806)
 
 #### Tier 0 — Infrastructure (all done)
 - ~~Fix random seeds~~ — DONE
