@@ -386,14 +386,19 @@ Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedb
 > After ~130 experiments across 4 sessions, the model appears near-saturated on MovieLens data.
 > Most remaining ideas are high-risk/low-probability. External data would likely be needed for significant gains.
 
-#### Untried ideas (speculative)
-- **Trained LightGCN embeddings** — train LightGCN with BPR loss offline, freeze embeddings, use as features. The random-init version failed (0.734 on ml-10m) but properly trained GCN embeddings capture multi-hop collaborative signal.
-- **PinSage** — GraphSAGE with random walk sampling. Scalable graph embeddings.
-- **xDeepFM CIN** — Compressed Interaction Network for explicit high-order crosses. Different interaction pattern from GDCN.
-- **HSTU (Meta, ICML 2024)** — hierarchical sequential transduction. Would require significant architectural rewrite.
-- **External data** — IMDB plot summaries, poster images, user reviews. Not available in MovieLens but would provide genuinely new content signal.
-- **SWA (Stochastic Weight Averaging)** — average weights from multiple training points to reduce overfitting. Built into PyTorch, no new deps.
-- **Stochastic depth on GDCN** — randomly skip cross layers during training (like DropPath). Regularize the 4-layer cross network.
+#### Tried in apr03 (8 experiments, all neutral or worse at 0.806)
+- SWA (averaged 4 checkpoints) — 0.805 (SWA worse than best single checkpoint)
+- DropPath 0.1 on GDCN deltas — 0.806 (neutral)
+- xDeepFM CIN 2-layer — 0.790 (explicit crosses overfit badly)
+- Trained LightGCN BPR embeddings — crash (sparse matmul too slow on 25m)
+- Poly-1 loss — 0.806 (neutral)
+- Snapshot ensemble (avg top-2 weights) — 0.806 (2nd best too weak to help)
+- Asymmetric loss pos_weight=2.0 — 0.805 (neutral)
+
+#### Untried ideas (speculative, high-risk)
+- **PinSage** — GraphSAGE with random walk sampling. May scale better than LightGCN.
+- **HSTU (Meta, ICML 2024)** — hierarchical sequential transduction. Significant rewrite.
+- **External data** — IMDB plot summaries, poster images. Not in MovieLens but the only clear path to genuinely new signal.
 
 ### Useful references
 
