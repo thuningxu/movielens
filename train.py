@@ -13,6 +13,7 @@ import copy
 import logging
 import os
 import sys
+from pathlib import Path
 import time
 
 import numpy as np
@@ -76,126 +77,149 @@ log.info(f"Dataset: {DATASET} | Users: {num_users} | Items: {num_items} | "
 
 
 # ═══════════════════════════════════════════════════════════════════
-# FEATURE ENGINEERING
+# FEATURE ENGINEERING (with disk caching)
 # ═══════════════════════════════════════════════════════════════════
 
-# 1. Genre multi-hot encoding
-all_genres_set = set()
-for g in movies_df["genres"].dropna():
-    all_genres_set.update(g.split("|"))
-all_genres = sorted(all_genres_set - {""})
-genre_to_idx = {g: i for i, g in enumerate(all_genres)}
-num_genres = len(all_genres)
+import hashlib, json
+_cache_key = hashlib.md5(json.dumps({
+    "dataset": DATASET, "neg_ratio": NEG_RATIO,
+    "history_len": HISTORY_LEN, "num_users": num_users, "num_items": num_items,
+}).encode()).hexdigest()[:12]
+_cache_path = Path(__file__).parent / "data" / f"features_{_cache_key}.npz"
 
-movie_genres = np.zeros((num_items, num_genres), dtype=np.float32)
-for _, row in movies_df.iterrows():
-    mid = int(row["movieId"])
-    if mid < num_items and isinstance(row["genres"], str):
-        for g in row["genres"].split("|"):
-            if g in genre_to_idx:
-                movie_genres[mid, genre_to_idx[g]] = 1.0
+if _cache_path.exists():
+    log.info(f"Loading cached features from {_cache_path.name}...")
+    _cache = np.load(_cache_path, allow_pickle=True)
+    movie_genres = _cache["movie_genres"]
+    num_genres = movie_genres.shape[1]
+    user_hist_bins = _cache["user_hist_bins"]
+    item_hist_bins = _cache["item_hist_bins"]
+    user_count_norm = _cache["user_count_norm"]
+    item_count_norm = _cache["item_count_norm"]
+    user_histories = _cache["user_histories"]
+    user_hist_ratings = _cache["user_hist_ratings"]
+    item_histories = _cache["item_histories"]
+    item_hist_ratings = _cache["item_hist_ratings"]
+    user_genre_affinity = _cache["user_genre_affinity"]
+    ts_min = float(_cache["ts_min"])
+    ts_range = float(_cache["ts_range"])
+    movie_year = _cache["movie_year"]
+    movie_genre_count = _cache["movie_genre_count"]
+    PAD_IDX = num_items
+    USER_PAD_IDX = num_users
+    ITEM_HIST_LEN = item_histories.shape[1]
+    del _cache
+    log.info("Cached features loaded.")
+else:
+    log.info("Computing features (will cache for next run)...")
+    real_train = train_df[train_df["rating"] > 0]
 
-# 2. User and item rating histograms (computed on rated items in train only, before neg augmentation)
-# Filter to real ratings (rating > 0) for stats computation
-real_train = train_df[train_df["rating"] > 0]
+    # 1. Genre multi-hot encoding
+    all_genres_set = set()
+    for g in movies_df["genres"].dropna():
+        all_genres_set.update(g.split("|"))
+    all_genres = sorted(all_genres_set - {""})
+    genre_to_idx = {g: i for i, g in enumerate(all_genres)}
+    num_genres = len(all_genres)
+    movie_genres = np.zeros((num_items, num_genres), dtype=np.float32)
+    for _, row in movies_df.iterrows():
+        mid = int(row["movieId"])
+        if mid < num_items and isinstance(row["genres"], str):
+            for g in row["genres"].split("|"):
+                if g in genre_to_idx:
+                    movie_genres[mid, genre_to_idx[g]] = 1.0
 
-# Rating histograms (vectorized with np.add.at)
-_rt_uids = real_train["userId"].values
-_rt_mids = real_train["movieId"].values
-_rt_ratings = real_train["rating"].values
-_rt_bins = np.clip((_rt_ratings - 0.01) // 1, 0, 4).astype(np.intp)
+    # 2. Rating histograms (vectorized)
+    _rt_uids = real_train["userId"].values
+    _rt_mids = real_train["movieId"].values
+    _rt_ratings = real_train["rating"].values
+    _rt_bins = np.clip((_rt_ratings - 0.01) // 1, 0, 4).astype(np.intp)
+    user_hist_bins = np.zeros((num_users, 5), dtype=np.float32)
+    item_hist_bins = np.zeros((num_items, 5), dtype=np.float32)
+    np.add.at(user_hist_bins, (_rt_uids, _rt_bins), 1)
+    np.add.at(item_hist_bins, (_rt_mids, _rt_bins), 1)
+    user_count = user_hist_bins.sum(axis=1)
+    item_count = item_hist_bins.sum(axis=1)
+    user_hist_bins = user_hist_bins / (user_count[:, None] + 1e-8)
+    item_hist_bins = item_hist_bins / (item_count[:, None] + 1e-8)
+    user_count_norm = (user_count - user_count.mean()) / (user_count.std() + 1e-8)
+    item_count_norm = (item_count - item_count.mean()) / (item_count.std() + 1e-8)
+    del _rt_bins
 
-user_hist_bins = np.zeros((num_users, 5), dtype=np.float32)
-item_hist_bins = np.zeros((num_items, 5), dtype=np.float32)
-np.add.at(user_hist_bins, (_rt_uids, _rt_bins), 1)
-np.add.at(item_hist_bins, (_rt_mids, _rt_bins), 1)
+    # 3. User/item history sequences (vectorized)
+    PAD_IDX = num_items
+    USER_PAD_IDX = num_users
+    ITEM_HIST_LEN = 30
 
-user_count = user_hist_bins.sum(axis=1)
-item_count = item_hist_bins.sum(axis=1)
-user_hist_bins = user_hist_bins / (user_count[:, None] + 1e-8)
-item_hist_bins = item_hist_bins / (item_count[:, None] + 1e-8)
-user_count_norm = (user_count - user_count.mean()) / (user_count.std() + 1e-8)
-item_count_norm = (item_count - item_count.mean()) / (item_count.std() + 1e-8)
-del _rt_bins
+    def _build_history_arrays(ids, targets, ratings, timestamps, num_entities, pad_idx, max_len):
+        sort_idx = np.lexsort((timestamps, ids))
+        s_ids, s_targets = ids[sort_idx], targets[sort_idx]
+        s_ratings = ratings[sort_idx].astype(np.float32) / 5.0
+        hist = np.full((num_entities, max_len), pad_idx, dtype=np.int64)
+        hist_rat = np.zeros((num_entities, max_len), dtype=np.float32)
+        boundaries = np.where(np.diff(s_ids) != 0)[0] + 1
+        starts = np.concatenate([[0], boundaries])
+        ends = np.concatenate([boundaries, [len(s_ids)]])
+        entity_ids = s_ids[starts]
+        for i in range(len(entity_ids)):
+            eid, s, e = entity_ids[i], starts[i], ends[i]
+            length = min(e - s, max_len)
+            hist[eid, -length:] = s_targets[e - length:e]
+            hist_rat[eid, -length:] = s_ratings[e - length:e]
+        return hist, hist_rat
 
-# 3. User history sequences (last HISTORY_LEN rated items + their ratings)
-PAD_IDX = num_items
-USER_PAD_IDX = num_users
-ITEM_HIST_LEN = 30  # recent raters per item
+    _rt_ts = real_train["timestamp"].values
+    user_histories, user_hist_ratings = _build_history_arrays(
+        _rt_uids, _rt_mids, _rt_ratings, _rt_ts, num_users, PAD_IDX, HISTORY_LEN)
+    item_histories, item_hist_ratings = _build_history_arrays(
+        _rt_mids, _rt_uids, _rt_ratings, _rt_ts, num_items, USER_PAD_IDX, ITEM_HIST_LEN)
 
-def _build_history_arrays(ids, targets, ratings, timestamps, num_entities, pad_idx, max_len):
-    """Vectorized history builder: sort by timestamp, take last max_len per entity."""
-    # Sort all records by (entity_id, timestamp)
-    sort_idx = np.lexsort((timestamps, ids))
-    s_ids = ids[sort_idx]
-    s_targets = targets[sort_idx]
-    s_ratings = (ratings[sort_idx].astype(np.float32) / 5.0)
+    # 4. User-genre affinity
+    user_genre_affinity = np.zeros((num_users, num_genres), dtype=np.float32)
+    user_genre_count = np.zeros((num_users, num_genres), dtype=np.float32)
+    _genres_of_items = movie_genres[_rt_mids]
+    np.add.at(user_genre_affinity, _rt_uids, _rt_ratings[:, None].astype(np.float32) * _genres_of_items)
+    np.add.at(user_genre_count, _rt_uids, _genres_of_items)
+    del _rt_uids, _rt_mids, _rt_ratings, _rt_ts, _genres_of_items
+    mask = user_genre_count > 0
+    user_genre_affinity[mask] /= user_genre_count[mask]
+    mu, sigma = user_genre_affinity[mask].mean(), user_genre_affinity[mask].std() + 1e-8
+    user_genre_affinity[mask] = (user_genre_affinity[mask] - mu) / sigma
 
-    hist = np.full((num_entities, max_len), pad_idx, dtype=np.int64)
-    hist_rat = np.zeros((num_entities, max_len), dtype=np.float32)
+    # 5. Timestamp normalization
+    ts_min = float(real_train["timestamp"].min())
+    ts_range = float(real_train["timestamp"].max() - ts_min) + 1.0
 
-    # Find boundaries between entities
-    boundaries = np.where(np.diff(s_ids) != 0)[0] + 1
-    starts = np.concatenate([[0], boundaries])
-    ends = np.concatenate([boundaries, [len(s_ids)]])
-    entity_ids = s_ids[starts]
+    # 6. Movie release year
+    import re
+    movie_year = np.zeros(num_items, dtype=np.float32)
+    for _, row in movies_df.iterrows():
+        mid = int(row["movieId"])
+        if mid < num_items:
+            m = re.search(r'\((\d{4})\)', str(row.get("title", "")))
+            if m:
+                movie_year[mid] = float(m.group(1))
+    valid_years = movie_year[movie_year > 0]
+    if len(valid_years) > 0:
+        median_year = np.median(valid_years)
+        movie_year[movie_year == 0] = median_year
+        movie_year = (movie_year - movie_year.mean()) / (movie_year.std() + 1e-8)
 
-    for i in range(len(entity_ids)):
-        eid = entity_ids[i]
-        s, e = starts[i], ends[i]
-        length = min(e - s, max_len)
-        hist[eid, -length:] = s_targets[e - length:e]
-        hist_rat[eid, -length:] = s_ratings[e - length:e]
-    return hist, hist_rat
+    # 7. Genre count per movie
+    movie_genre_count = movie_genres.sum(axis=1).astype(np.float32)
+    movie_genre_count = (movie_genre_count - movie_genre_count.mean()) / (movie_genre_count.std() + 1e-8)
 
-_rt_ts = real_train["timestamp"].values
-user_histories, user_hist_ratings = _build_history_arrays(
-    _rt_uids, _rt_mids, _rt_ratings, _rt_ts, num_users, PAD_IDX, HISTORY_LEN)
-
-# 3b. Item history sequences (last ITEM_HIST_LEN raters + their ratings)
-item_histories, item_hist_ratings = _build_history_arrays(
-    _rt_mids, _rt_uids, _rt_ratings, _rt_ts, num_items, USER_PAD_IDX, ITEM_HIST_LEN)
-del _rt_uids, _rt_mids, _rt_ratings, _rt_ts
-
-# 4. User-genre affinity: average rating per genre for each user (vectorized)
-user_genre_affinity = np.zeros((num_users, num_genres), dtype=np.float32)
-user_genre_count = np.zeros((num_users, num_genres), dtype=np.float32)
-_uids = real_train["userId"].values
-_mids = real_train["movieId"].values
-_ratings = real_train["rating"].values.astype(np.float32)
-_genres_of_items = movie_genres[_mids]  # (N, num_genres)
-np.add.at(user_genre_affinity, _uids, _ratings[:, None] * _genres_of_items)
-np.add.at(user_genre_count, _uids, _genres_of_items)
-del _uids, _mids, _ratings, _genres_of_items
-mask = user_genre_count > 0
-user_genre_affinity[mask] /= user_genre_count[mask]
-# Normalize
-mu = user_genre_affinity[mask].mean()
-sigma = user_genre_affinity[mask].std() + 1e-8
-user_genre_affinity[mask] = (user_genre_affinity[mask] - mu) / sigma
-
-# 5. Timestamp normalization (from real ratings)
-ts_min = float(real_train["timestamp"].min())
-ts_range = float(real_train["timestamp"].max() - ts_min) + 1.0
-
-# 6. Movie release year (parsed from title) — normalized
-import re
-movie_year = np.zeros(num_items, dtype=np.float32)
-for _, row in movies_df.iterrows():
-    mid = int(row["movieId"])
-    if mid < num_items:
-        m = re.search(r'\((\d{4})\)', str(row.get("title", "")))
-        if m:
-            movie_year[mid] = float(m.group(1))
-valid_years = movie_year[movie_year > 0]
-if len(valid_years) > 0:
-    median_year = np.median(valid_years)
-    movie_year[movie_year == 0] = median_year
-    movie_year = (movie_year - movie_year.mean()) / (movie_year.std() + 1e-8)
-
-# 7. Genre count per movie — normalized
-movie_genre_count = movie_genres.sum(axis=1).astype(np.float32)
-movie_genre_count = (movie_genre_count - movie_genre_count.mean()) / (movie_genre_count.std() + 1e-8)
+    # Save cache
+    np.savez_compressed(_cache_path,
+        movie_genres=movie_genres, user_hist_bins=user_hist_bins,
+        item_hist_bins=item_hist_bins, user_count_norm=user_count_norm,
+        item_count_norm=item_count_norm, user_histories=user_histories,
+        user_hist_ratings=user_hist_ratings, item_histories=item_histories,
+        item_hist_ratings=item_hist_ratings, user_genre_affinity=user_genre_affinity,
+        ts_min=np.array(ts_min), ts_range=np.array(ts_range),
+        movie_year=movie_year, movie_genre_count=movie_genre_count,
+    )
+    log.info(f"Features cached to {_cache_path.name}")
 
 
 # ═══════════════════════════════════════════════════════════════════
