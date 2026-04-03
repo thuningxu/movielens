@@ -99,62 +99,63 @@ for _, row in movies_df.iterrows():
 # Filter to real ratings (rating > 0) for stats computation
 real_train = train_df[train_df["rating"] > 0]
 
-# Rating histograms: fraction of ratings at each level
-# Bucket into 5 bins: [0-1], (1-2], (2-3], (3-4], (4-5]
+# Rating histograms (vectorized with np.add.at)
+_rt_uids = real_train["userId"].values
+_rt_mids = real_train["movieId"].values
+_rt_ratings = real_train["rating"].values
+_rt_bins = np.clip((_rt_ratings - 0.01) // 1, 0, 4).astype(np.intp)
+
 user_hist_bins = np.zeros((num_users, 5), dtype=np.float32)
 item_hist_bins = np.zeros((num_items, 5), dtype=np.float32)
-user_count = np.zeros(num_users, dtype=np.float32)
-item_count = np.zeros(num_items, dtype=np.float32)
+np.add.at(user_hist_bins, (_rt_uids, _rt_bins), 1)
+np.add.at(item_hist_bins, (_rt_mids, _rt_bins), 1)
 
-for uid, group in real_train.groupby("userId"):
-    ratings = group["rating"].values
-    bins = np.clip((ratings - 0.01) // 1, 0, 4).astype(int)
-    for b in bins:
-        user_hist_bins[uid, b] += 1
-    user_count[uid] = len(ratings)
-
-for mid, group in real_train.groupby("movieId"):
-    ratings = group["rating"].values
-    bins = np.clip((ratings - 0.01) // 1, 0, 4).astype(int)
-    for b in bins:
-        item_hist_bins[mid, b] += 1
-    item_count[mid] = len(ratings)
-
-# Normalize to fractions
+user_count = user_hist_bins.sum(axis=1)
+item_count = item_hist_bins.sum(axis=1)
 user_hist_bins = user_hist_bins / (user_count[:, None] + 1e-8)
 item_hist_bins = item_hist_bins / (item_count[:, None] + 1e-8)
-
-# Keep count as separate feature (normalized)
 user_count_norm = (user_count - user_count.mean()) / (user_count.std() + 1e-8)
 item_count_norm = (item_count - item_count.mean()) / (item_count.std() + 1e-8)
+del _rt_bins
 
 # 3. User history sequences (last HISTORY_LEN rated items + their ratings)
 PAD_IDX = num_items
 USER_PAD_IDX = num_users
 ITEM_HIST_LEN = 30  # recent raters per item
 
-user_histories = np.full((num_users, HISTORY_LEN), PAD_IDX, dtype=np.int64)
-user_hist_ratings = np.zeros((num_users, HISTORY_LEN), dtype=np.float32)
-for uid, group in real_train.groupby("userId"):
-    sorted_g = group.sort_values("timestamp")
-    items = sorted_g["movieId"].values
-    ratings = sorted_g["rating"].values.astype(np.float32) / 5.0  # normalize to [0, 1]
-    seq = items[-HISTORY_LEN:]
-    rat = ratings[-HISTORY_LEN:]
-    user_histories[uid, -len(seq):] = seq
-    user_hist_ratings[uid, -len(rat):] = rat
+def _build_history_arrays(ids, targets, ratings, timestamps, num_entities, pad_idx, max_len):
+    """Vectorized history builder: sort by timestamp, take last max_len per entity."""
+    # Sort all records by (entity_id, timestamp)
+    sort_idx = np.lexsort((timestamps, ids))
+    s_ids = ids[sort_idx]
+    s_targets = targets[sort_idx]
+    s_ratings = (ratings[sort_idx].astype(np.float32) / 5.0)
+
+    hist = np.full((num_entities, max_len), pad_idx, dtype=np.int64)
+    hist_rat = np.zeros((num_entities, max_len), dtype=np.float32)
+
+    # Find boundaries between entities
+    boundaries = np.where(np.diff(s_ids) != 0)[0] + 1
+    starts = np.concatenate([[0], boundaries])
+    ends = np.concatenate([boundaries, [len(s_ids)]])
+    entity_ids = s_ids[starts]
+
+    for i in range(len(entity_ids)):
+        eid = entity_ids[i]
+        s, e = starts[i], ends[i]
+        length = min(e - s, max_len)
+        hist[eid, -length:] = s_targets[e - length:e]
+        hist_rat[eid, -length:] = s_ratings[e - length:e]
+    return hist, hist_rat
+
+_rt_ts = real_train["timestamp"].values
+user_histories, user_hist_ratings = _build_history_arrays(
+    _rt_uids, _rt_mids, _rt_ratings, _rt_ts, num_users, PAD_IDX, HISTORY_LEN)
 
 # 3b. Item history sequences (last ITEM_HIST_LEN raters + their ratings)
-item_histories = np.full((num_items, ITEM_HIST_LEN), USER_PAD_IDX, dtype=np.int64)
-item_hist_ratings = np.zeros((num_items, ITEM_HIST_LEN), dtype=np.float32)
-for mid, group in real_train.groupby("movieId"):
-    sorted_g = group.sort_values("timestamp")
-    users = sorted_g["userId"].values
-    ratings = sorted_g["rating"].values.astype(np.float32) / 5.0
-    seq = users[-ITEM_HIST_LEN:]
-    rat = ratings[-ITEM_HIST_LEN:]
-    item_histories[mid, -len(seq):] = seq
-    item_hist_ratings[mid, -len(rat):] = rat
+item_histories, item_hist_ratings = _build_history_arrays(
+    _rt_mids, _rt_uids, _rt_ratings, _rt_ts, num_items, USER_PAD_IDX, ITEM_HIST_LEN)
+del _rt_uids, _rt_mids, _rt_ratings, _rt_ts
 
 # 4. User-genre affinity: average rating per genre for each user (vectorized)
 user_genre_affinity = np.zeros((num_users, num_genres), dtype=np.float32)
