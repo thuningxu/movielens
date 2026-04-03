@@ -105,6 +105,9 @@ if _cache_path.exists():
     ts_range = float(_cache["ts_range"])
     movie_year = _cache["movie_year"]
     movie_genre_count = _cache["movie_genre_count"]
+    genome_matrix = _cache["genome_matrix"]
+    has_genome = _cache["has_genome"]
+    GENOME_DIM = genome_matrix.shape[1]
     PAD_IDX = num_items
     USER_PAD_IDX = num_users
     ITEM_HIST_LEN = item_histories.shape[1]
@@ -209,6 +212,53 @@ else:
     movie_genre_count = movie_genres.sum(axis=1).astype(np.float32)
     movie_genre_count = (movie_genre_count - movie_genre_count.mean()) / (movie_genre_count.std() + 1e-8)
 
+    # 8. Tag genome features (1128 relevance scores per movie)
+    _genome_path = Path(__file__).parent / "data" / DATASET / "genome-scores.csv"
+    if _genome_path.exists():
+        log.info("Loading tag genome scores...")
+        # Replicate prepare.py's ID remapping: sort ratings by timestamp, unique movieIds in order
+        _raw_ratings_path = Path(__file__).parent / "data" / DATASET
+        if DATASET == "ml-25m":
+            _raw_ratings = pd.read_csv(_raw_ratings_path / "ratings.csv")
+        elif DATASET == "ml-10m":
+            _raw_ratings = pd.read_csv(
+                Path(__file__).parent / "data" / "ml-10M100K" / "ratings.dat",
+                sep="::", engine="python", names=["userId", "movieId", "rating", "timestamp"])
+        elif DATASET == "ml-1m":
+            _raw_ratings = pd.read_csv(
+                _raw_ratings_path / "ratings.dat", sep="::", engine="python",
+                names=["userId", "movieId", "rating", "timestamp"])
+        else:
+            _raw_ratings = None
+        if _raw_ratings is not None:
+            _raw_ratings = _raw_ratings.sort_values("timestamp").reset_index(drop=True)
+            _all_movies_ordered = _raw_ratings["movieId"].unique()
+            _movie_map = {mid: i for i, mid in enumerate(_all_movies_ordered)}
+            _genome_df = pd.read_csv(_genome_path)
+            _num_tags = int(_genome_df["tagId"].max())
+            genome_matrix = np.zeros((num_items, _num_tags), dtype=np.float32)
+            has_genome = np.zeros(num_items, dtype=np.float32)
+            # Map genome movieIds to remapped IDs
+            _genome_df["mapped_mid"] = _genome_df["movieId"].map(_movie_map)
+            _genome_df = _genome_df.dropna(subset=["mapped_mid"])
+            _genome_df["mapped_mid"] = _genome_df["mapped_mid"].astype(int)
+            # Pivot: fill genome_matrix
+            for mid, group in _genome_df.groupby("mapped_mid"):
+                if mid < num_items:
+                    tag_ids = group["tagId"].values.astype(int) - 1  # 1-indexed to 0-indexed
+                    genome_matrix[mid, tag_ids] = group["relevance"].values.astype(np.float32)
+                    has_genome[mid] = 1.0
+            log.info(f"Tag genome: {int(has_genome.sum())} movies with data out of {num_items} ({has_genome.mean()*100:.1f}%)")
+            del _genome_df, _raw_ratings, _all_movies_ordered, _movie_map
+        else:
+            genome_matrix = np.zeros((num_items, 1128), dtype=np.float32)
+            has_genome = np.zeros(num_items, dtype=np.float32)
+    else:
+        log.info("No genome-scores.csv found, using zeros.")
+        genome_matrix = np.zeros((num_items, 1128), dtype=np.float32)
+        has_genome = np.zeros(num_items, dtype=np.float32)
+    GENOME_DIM = genome_matrix.shape[1]
+
     # Save cache
     np.savez_compressed(_cache_path,
         movie_genres=movie_genres, user_hist_bins=user_hist_bins,
@@ -218,6 +268,7 @@ else:
         item_hist_ratings=item_hist_ratings, user_genre_affinity=user_genre_affinity,
         ts_min=np.array(ts_min), ts_range=np.array(ts_range),
         movie_year=movie_year, movie_genre_count=movie_genre_count,
+        genome_matrix=genome_matrix, has_genome=has_genome,
     )
     log.info(f"Features cached to {_cache_path.name}")
 
@@ -232,6 +283,8 @@ _user_hist_ratings_gpu = torch.from_numpy(user_hist_ratings).to(DEVICE) # (num_u
 _item_histories_gpu = torch.from_numpy(item_histories).to(DEVICE)       # (num_items, IL)
 _item_hist_ratings_gpu = torch.from_numpy(item_hist_ratings).to(DEVICE) # (num_items, IL)
 _movie_genres_gpu = torch.from_numpy(movie_genres).to(DEVICE)           # (num_items, G)
+_genome_gpu = torch.from_numpy(genome_matrix).to(DEVICE)               # (num_items, GENOME_DIM)
+_has_genome_gpu = torch.from_numpy(has_genome).to(DEVICE)              # (num_items,)
 
 def _build_gpu_tensors(df):
     """Precompute per-sample features on GPU. Histories/genres looked up at training time."""
@@ -335,6 +388,7 @@ def run_eval():
                 _user_histories_gpu[u], _user_hist_ratings_gpu[u],
                 _movie_genres_gpu[m],
                 _item_histories_gpu[m], _item_hist_ratings_gpu[m],
+                _genome_gpu[m], _has_genome_gpu[m],
             )
             all_scores.append(torch.sigmoid(logits).cpu().numpy())
 
@@ -390,8 +444,19 @@ class DLRM(nn.Module):
             nn.ReLU(),
         )
 
+        # Tag genome: learned bottleneck compression 1128 → D with gating
+        self.genome_proj = nn.Sequential(
+            nn.Linear(GENOME_DIM, 256),
+            nn.ReLU(),
+            nn.Linear(256, 64),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(64, D),
+        )
+        self.genome_gate = nn.Linear(D, D)  # sigmoid gate to blend genome with item_embed fallback
+
         # GDCN: gated cross layers (DCN-V2 + sigmoid gate)
-        cross_dim = 6 * D  # user, item, user_hist(DIN), item_hist(DIN), dense, genre
+        cross_dim = 7 * D  # user, item, user_hist(DIN), item_hist(DIN), dense, genre, genome
         self.cross_w1 = nn.Linear(cross_dim, cross_dim, bias=False)
         self.cross_b1 = nn.Parameter(torch.zeros(cross_dim))
         self.cross_g1 = nn.Linear(cross_dim, cross_dim)
@@ -411,9 +476,9 @@ class DLRM(nn.Module):
             nn.Linear(3 * D, 256), nn.ReLU(), nn.Dropout(0.2),
             nn.Linear(256, 64), nn.ReLU(),
         )
-        # Item stream: item_e + item_hist_e + genre_e = 3*D
+        # Item stream: item_e + item_hist_e + genre_e + genome_e = 4*D
         self.item_stream = nn.Sequential(
-            nn.Linear(3 * D, 256), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(4 * D, 256), nn.ReLU(), nn.Dropout(0.2),
             nn.Linear(256, 64), nn.ReLU(),
         )
 
@@ -444,7 +509,7 @@ class DLRM(nn.Module):
                     nn.init.zeros_(m.weight[m.padding_idx])
 
     def forward(self, user_id, movie_id, dense, history, hist_ratings,
-                genres, item_hist, item_hist_ratings):
+                genres, item_hist, item_hist_ratings, genome_raw, has_genome_mask):
         user_e = nn.functional.dropout(self.user_embed(user_id), 0.1, self.training)
         item_e = nn.functional.dropout(self.item_embed(movie_id), 0.1, self.training)
 
@@ -490,8 +555,13 @@ class DLRM(nn.Module):
         dense_e = self.bottom_mlp(dense)
         genre_e = self.genre_proj(genres)
 
+        # Tag genome: learned compression with gating
+        genome_e = self.genome_proj(genome_raw)                           # (B, D)
+        gate = torch.sigmoid(self.genome_gate(genome_e))                  # (B, D)
+        genome_field = gate * genome_e + (1 - gate) * item_e.detach()     # blend genome with item fallback
+
         # Concatenate all embeddings
-        x0 = torch.cat([user_e, item_e, user_hist_e, item_hist_e, dense_e, genre_e], dim=-1)  # (B, 6*D)
+        x0 = torch.cat([user_e, item_e, user_hist_e, item_hist_e, dense_e, genre_e, genome_field], dim=-1)  # (B, 7*D)
 
         # Gated cross layer 1
         cross1 = x0 * (self.cross_w1(x0) + self.cross_b1)
@@ -512,7 +582,7 @@ class DLRM(nn.Module):
 
         # Two-stream processing
         user_stream_out = self.user_stream(torch.cat([user_e, user_hist_e, dense_e], dim=-1))
-        item_stream_out = self.item_stream(torch.cat([item_e, item_hist_e, genre_e], dim=-1))
+        item_stream_out = self.item_stream(torch.cat([item_e, item_hist_e, genre_e, genome_field], dim=-1))
 
         # Bilinear interaction between streams
         bilinear = user_stream_out * item_stream_out  # element-wise product (B, 64)
@@ -568,6 +638,7 @@ while True:
                 _user_histories_gpu[u_batch], _user_hist_ratings_gpu[u_batch],
                 _movie_genres_gpu[m_batch],
                 _item_histories_gpu[m_batch], _item_hist_ratings_gpu[m_batch],
+                _genome_gpu[m_batch], _has_genome_gpu[m_batch],
             )
             # Label smoothing: soft targets
             smooth_labels = train_labels[idx] * 0.9 + 0.05
