@@ -376,6 +376,9 @@ class DLRM(nn.Module):
         self.cross_w3 = nn.Linear(cross_dim, cross_dim, bias=False)
         self.cross_b3 = nn.Parameter(torch.zeros(cross_dim))
         self.cross_g3 = nn.Linear(cross_dim, cross_dim)
+        self.cross_w4 = nn.Linear(cross_dim, cross_dim, bias=False)
+        self.cross_b4 = nn.Parameter(torch.zeros(cross_dim))
+        self.cross_g4 = nn.Linear(cross_dim, cross_dim)
 
         # Two-stream MLPs (FinalMLP-style)
         # User stream: user_e + user_hist_e + dense_e = 3*D
@@ -477,6 +480,10 @@ class DLRM(nn.Module):
         cross3 = x0 * (self.cross_w3(x2) + self.cross_b3)
         gate3 = torch.sigmoid(self.cross_g3(x2))
         x3 = gate3 * cross3 + (1 - gate3) * x2
+        # Gated cross layer 4
+        cross4 = x0 * (self.cross_w4(x3) + self.cross_b4)
+        gate4 = torch.sigmoid(self.cross_g4(x3))
+        x4 = gate4 * cross4 + (1 - gate4) * x3
 
         # Two-stream processing
         user_stream_out = self.user_stream(torch.cat([user_e, user_hist_e, dense_e], dim=-1))
@@ -486,7 +493,7 @@ class DLRM(nn.Module):
         bilinear = user_stream_out * item_stream_out  # element-wise product (B, 64)
 
         # Combine cross-network + streams + bilinear
-        combined = torch.cat([x3, user_stream_out, item_stream_out, bilinear], dim=-1)
+        combined = torch.cat([x4, user_stream_out, item_stream_out, bilinear], dim=-1)
         return self.top_mlp(combined).squeeze(-1)
 
 
