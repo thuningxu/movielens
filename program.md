@@ -386,14 +386,24 @@ Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedb
 > After ~130 experiments across 4 sessions, the model appears near-saturated on MovieLens data.
 > Most remaining ideas are high-risk/low-probability. External data would likely be needed for significant gains.
 
-#### Tried in apr03 (8 experiments, all neutral or worse at 0.806)
-- SWA (averaged 4 checkpoints) — 0.805 (SWA worse than best single checkpoint)
+#### Tried in apr03 (18 experiments, all neutral or worse at 0.806)
+- SWA (averaged 4 checkpoints) — 0.805 (worse than best single checkpoint)
 - DropPath 0.1 on GDCN deltas — 0.806 (neutral)
 - xDeepFM CIN 2-layer — 0.790 (explicit crosses overfit badly)
 - Trained LightGCN BPR embeddings — crash (sparse matmul too slow on 25m)
 - Poly-1 loss — 0.806 (neutral)
-- Snapshot ensemble (avg top-2 weights) — 0.806 (2nd best too weak to help)
+- Snapshot ensemble (avg top-2 weights) — 0.806 (2nd best too weak)
 - Asymmetric loss pos_weight=2.0 — 0.805 (neutral)
+- R-Drop KL regularization — 0.806 (neutral; 2x slower)
+- Embedding mixup alpha=0.2 — 0.806 (neutral; 2x slower)
+- Wide & Deep (raw embeds in top MLP) — 0.804 (wide path adds noise)
+- LR=2e-4 — 0.803 (too aggressive; collapses epoch 2)
+- weight_decay=1e-4 — 0.800 (too strong)
+- batch_size=8192 — 0.805 (faster divergence)
+- LR=5e-5 + patience=3 — 0.806 (same peak; 2x slower)
+- ACCUM_STEPS=12 eff. batch 197K — 0.806 (neutral)
+- NEG_RATIO=8 — 0.796 (too many negatives dilutes signal)
+- 3-stream FinalMLP (interaction stream) — 0.802 (extra capacity overfits)
 
 #### Untried ideas (speculative, high-risk)
 - **PinSage** — GraphSAGE with random walk sampling. May scale better than LightGCN.
