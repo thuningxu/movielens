@@ -410,6 +410,61 @@ Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedb
 - **HSTU (Meta, ICML 2024)** — hierarchical sequential transduction. Significant rewrite.
 - **External data** — IMDB plot summaries, poster images. Not in MovieLens but the only clear path to genuinely new signal.
 
+---
+
+### Experiment log (autoresearch/apr03c) — ml-25m, multi-agent setup
+
+> **Multi-agent parallel experimentation with deeper tuning.**
+> Target: 0.810 AUC (from 0.806 baseline).
+> Hardware: 2x NVIDIA L4 (CUDA:0, CUDA:1), parallel experiments.
+
+#### Multi-agent protocol
+
+**Agents:**
+- **Research Scientist** (coordinator) — proposes ideas, reviews results, directs engineers, decides keep/discard after full tuning budget
+- **MLE-1** (GPU 0, `CUDA_VISIBLE_DEVICES=0`) — executes experiments in git worktree
+- **MLE-2** (GPU 1, `CUDA_VISIBLE_DEVICES=1`) — executes experiments in git worktree
+
+**Workflow (kanban-style):**
+1. Researcher proposes 2 experiment ideas with initial hyperparameters
+2. MLE-1 and MLE-2 each take one idea, work in isolated git worktrees
+3. Each MLE: modify train.py → smoke test (ml-100k) → full run (ml-25m) → report results
+4. Researcher reviews results and decides:
+   - If promising (within 0.005 of baseline or better): assign HP tuning variations
+   - If clearly broken (>0.015 below baseline): discard and assign new idea
+   - If improved: keep, merge to branch
+5. **Tuning budget: up to 10 trials per architecture idea** (initial + 9 HP variations) before declaring it invalid
+6. After tuning budget exhausted, researcher decides keep best or discard all
+
+**Key philosophy change from previous sessions:**
+- Previously: try one config, immediately discard if no AUC gain
+- Now: give each architecture idea a fair chance with proper HP tuning
+- Challenge previous "exhausted" conclusions — revisit with better strategies
+- The 0.806 plateau may be an artifact of under-tuning, not a true ceiling
+
+**Git workflow:**
+- Each MLE works in a temporary git worktree (isolated copy)
+- Successful experiments get merged back to `autoresearch/apr03c`
+- Failed experiments: worktree discarded, no trace on branch
+- Results logged to results.tsv (untracked)
+
+#### Research agenda (apr03c)
+
+**Round 1: New data sources (challenging "metadata exhausted")**
+1. **User-generated tags (tags.csv)** — 1.09M tags, 72.5% movie coverage (vs 22% genome). Untried data source. Derive: tag hash features, tag popularity, user-tag behavior.
+2. **Tag genome with learned attention compression** — Full 1128-dim relevance vectors. Previous PCA-32 attempt (0.798) used crude dimensionality reduction. Try: attention pooling over genome dimensions, proper missing-data embedding.
+
+**Round 2+ (depending on Round 1 results):**
+- Combine tag sources if both help
+- Recency-weighted DIN with temporal decay
+- Two-phase training (freeze embeddings → fine-tune)
+- embed_dim=32 with spectral normalization
+- HSTU-style sequential architecture
+
+#### Experiment results
+
+*(to be filled as experiments complete)*
+
 ### Useful references
 
 - BARS benchmark (Zhu et al., SIGIR 2022) — different task (tag CTR) but good training practices and model zoo
