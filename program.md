@@ -295,6 +295,20 @@ Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedb
 - ACCUM_STEPS=4 — 0.805 (slightly worse)
 - Wider stream MLP 384→64 — 0.800 (overfits)
 
+**Feature-focused experiments (autoresearch/apr02b, 12 experiments, all ≤0.806):**
+- SA on combined item+rating — 0.797 (2D→D projection bottleneck)
+- Residual SA raw+contextual — 0.806 (neutral)
+- SVD-32 collaborative factors as 7th field — 0.802 (redundant with ID embeddings)
+- Kaiming He init — 0.801 (NaN instability, worse than Xavier)
+- Tag genome PCA-32 as 7th field — 0.798 (22% coverage, genre imputation insufficient)
+- Title char-trigram hash 64d (dense) — OOM (81 dense features too large)
+- Title char-trigram hash 64d (field) — 0.802 (no useful text signal from titles)
+- JS divergence + user entropy — 0.795 (derived interaction features hurt)
+- User velocity + drift + recency — 0.787 (temporal dynamics hurt significantly)
+- SVD dot product scalar — 0.779 (MF prediction interferes with learned representations)
+- Item polarization — 0.804 (derived from histogram, slight hurt)
+- Genre-aware DIN target (item_e+genre_e) — 0.806 (neutral)
+
 ### Key learnings
 
 1. **More data helps significantly.** ml-10m→ml-25m gave +0.023 AUC for free (same model). Ideas that failed on ml-10m (3 GDCN layers, HISTORY_LEN=100, batch_size=16384, embed_dim=24) all worked on ml-25m.
@@ -320,6 +334,12 @@ Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedb
 11. **Richer features unlock deeper/wider models.** 4 GDCN layers failed at 0.742 before histogram bins, succeeded at 0.804 with them. embed_dim=28 works with histograms+4GDCN (0.806) but 30/32 still overfit. Feature quality shifts the capacity threshold.
 
 12. **Most experiments are neutral, not harmful.** At 0.799-0.806, ~90% of changes return within ±0.002 of baseline. The model is extremely well-optimized and resistant to perturbation.
+
+13. **MovieLens metadata is exhausted.** Tag genome (22% coverage), movie titles (char trigrams), SVD factors — none provided useful signal beyond existing features. The dataset lacks rich content metadata.
+
+14. **Derived features from existing data hurt.** JS divergence, entropy, polarization, temporal dynamics — all derived from existing histograms/timestamps — either added noise or were redundant. The model already extracts these patterns from raw features.
+
+15. **SVD/MF predictions interfere with end-to-end learning.** SVD dot product (0.779) and full SVD factors (0.802) both hurt. The pre-computed collaborative signal conflicts with the jointly trained embeddings rather than complementing them.
 
 ### What to try next (on GPU, ml-25m, baseline 0.806)
 
