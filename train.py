@@ -42,7 +42,7 @@ log = logging.getLogger("train")
 DATASET = os.environ.get("DATASET", "ml-25m")
 BATCH_SIZE = 16384
 LR = 1e-4
-WEIGHT_DECAY = 1e-5
+WEIGHT_DECAY = 5e-5
 EMBED_DIM = 28
 HISTORY_LEN = 100
 NUM_DENSE = 17  # 1 timestamp + 5 user hist bins + 1 user count + 5 item hist bins + 1 item count + 1 ug_dot + 1 year + 1 genre_count + 1 movie_age
@@ -609,7 +609,7 @@ optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECA
 criterion = nn.BCEWithLogitsLoss()
 use_amp = DEVICE.type == "cuda"
 scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-ACCUM_STEPS = 8
+ACCUM_STEPS = 4
 
 training_start = time.time()
 peak_memory_mb = 0.0
