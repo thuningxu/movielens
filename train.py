@@ -42,7 +42,7 @@ log = logging.getLogger("train")
 DATASET = os.environ.get("DATASET", "ml-25m")
 BATCH_SIZE = 16384
 LR = 8e-5
-WEIGHT_DECAY = 5e-5
+WEIGHT_DECAY = 3e-5
 EMBED_DIM = 28
 HISTORY_LEN = 100
 NUM_DENSE = 17  # 1 timestamp + 5 user hist bins + 1 user count + 5 item hist bins + 1 item count + 1 ug_dot + 1 year + 1 genre_count + 1 movie_age
@@ -455,20 +455,9 @@ class DLRM(nn.Module):
         )
         self.genome_gate = nn.Linear(D, D)  # sigmoid gate to blend genome with item_embed fallback
 
-        # GDCN: gated cross layers (DCN-V2 + sigmoid gate)
+        # Field-level self-attention (replaces GDCN cross layers)
         cross_dim = 7 * D  # user, item, user_hist(DIN), item_hist(DIN), dense, genre, genome
-        self.cross_w1 = nn.Linear(cross_dim, cross_dim, bias=False)
-        self.cross_b1 = nn.Parameter(torch.zeros(cross_dim))
-        self.cross_g1 = nn.Linear(cross_dim, cross_dim)
-        self.cross_w2 = nn.Linear(cross_dim, cross_dim, bias=False)
-        self.cross_b2 = nn.Parameter(torch.zeros(cross_dim))
-        self.cross_g2 = nn.Linear(cross_dim, cross_dim)
-        self.cross_w3 = nn.Linear(cross_dim, cross_dim, bias=False)
-        self.cross_b3 = nn.Parameter(torch.zeros(cross_dim))
-        self.cross_g3 = nn.Linear(cross_dim, cross_dim)
-        self.cross_w4 = nn.Linear(cross_dim, cross_dim, bias=False)
-        self.cross_b4 = nn.Parameter(torch.zeros(cross_dim))
-        self.cross_g4 = nn.Linear(cross_dim, cross_dim)
+        self.field_attn = nn.MultiheadAttention(D, num_heads=1, batch_first=True, dropout=0.1)
 
         # Two-stream MLPs (FinalMLP-style)
         # User stream: user_e + user_hist_e + dense_e = 3*D
@@ -560,25 +549,10 @@ class DLRM(nn.Module):
         gate = torch.sigmoid(self.genome_gate(genome_e))                  # (B, D)
         genome_field = gate * genome_e + (1 - gate) * item_e.detach()     # blend genome with item fallback
 
-        # Concatenate all embeddings
-        x0 = torch.cat([user_e, item_e, user_hist_e, item_hist_e, dense_e, genre_e, genome_field], dim=-1)  # (B, 7*D)
-
-        # Gated cross layer 1
-        cross1 = x0 * (self.cross_w1(x0) + self.cross_b1)
-        gate1 = torch.sigmoid(self.cross_g1(x0))
-        x1 = gate1 * cross1 + (1 - gate1) * x0
-        # Gated cross layer 2
-        cross2 = x0 * (self.cross_w2(x1) + self.cross_b2)
-        gate2 = torch.sigmoid(self.cross_g2(x1))
-        x2 = gate2 * cross2 + (1 - gate2) * x1
-        # Gated cross layer 3
-        cross3 = x0 * (self.cross_w3(x2) + self.cross_b3)
-        gate3 = torch.sigmoid(self.cross_g3(x2))
-        x3 = gate3 * cross3 + (1 - gate3) * x2
-        # Gated cross layer 4
-        cross4 = x0 * (self.cross_w4(x3) + self.cross_b4)
-        gate4 = torch.sigmoid(self.cross_g4(x3))
-        x4 = gate4 * cross4 + (1 - gate4) * x3
+        # Stack 7 fields as sequence and apply field-level self-attention
+        fields = torch.stack([user_e, item_e, user_hist_e, item_hist_e, dense_e, genre_e, genome_field], dim=1)  # (B, 7, D)
+        attn_out, _ = self.field_attn(fields, fields, fields)  # (B, 7, D)
+        x4 = (fields + attn_out).reshape(fields.size(0), -1)  # (B, 7*D) — residual + flatten
 
         # Two-stream processing
         user_stream_out = self.user_stream(torch.cat([user_e, user_hist_e, dense_e], dim=-1))
