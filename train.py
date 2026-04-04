@@ -46,7 +46,7 @@ WEIGHT_DECAY = 1e-5
 EMBED_DIM = 28
 HISTORY_LEN = 100
 NUM_DENSE = 17  # 1 timestamp + 5 user hist bins + 1 user count + 5 item hist bins + 1 item count + 1 ug_dot + 1 year + 1 genre_count + 1 movie_age
-NEG_RATIO = 2  # random unrated negatives per positive in training data
+NEG_RATIO = 1  # random unrated negatives per positive in training data
 EVAL_EVERY = 1
 PATIENCE = 3
 
