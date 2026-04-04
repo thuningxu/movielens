@@ -6,8 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Research repo for movie recommendation on MovieLens. Uses a hybrid engagement prediction task: predict whether a user will rate a movie >= 4 stars, with both "watched but didn't like" (hard negatives) and "random unrated" (easy negatives) as label=0. Output is a calibrated probability via BCE loss, suitable for front-page recommendation with a threshold.
 
-Current model: DLRM with rating-aware DIN + causal self-attention, item-side DIN, 4 GDCN cross layers, FinalMLP two-stream with bilinear.
-Current AUC: **0.806 on ml-25m** (deterministic, SEED=42). See `program.md` for full experiment history (~150 experiments).
+Current model: DLRM with rating-aware DIN + causal self-attention, item-side DIN, 4 GDCN cross layers, tag genome with learned bottleneck compression, FinalMLP two-stream with bilinear.
+Current AUC: **0.820 on ml-25m** (deterministic, SEED=42). See `program.md` for full experiment history (~230 experiments).
 
 ## Commands
 
@@ -58,10 +58,10 @@ Two-stream: user stream (256→64) + item stream (256→64) + bilinear interacti
 Top MLP: (168 + 64 + 64 + 64) → 256 → 128 → 64 → 1 (with dropout 0.2)
 
 Loss: BCEWithLogitsLoss with label smoothing 0.1
-Optimizer: Adam, LR=1e-4, weight_decay=1e-5
+Optimizer: Adam, LR=8e-5, weight_decay=5e-5
 AMP: fp16, torch.compile, TF32 tensor cores
-Training: batch=16384, grad accum 8x (effective 131K), sub-epoch eval 2x, patience=2
-Params: ~13M | VRAM: ~9.7 GB on L4
+Training: batch=16384, grad accum 4x (effective 65K), NEG_RATIO=1, sub-epoch eval 3x, patience=3
+Params: ~13M | VRAM: ~7.2 GB on L4
 ```
 
 ## Critical learnings from ~130 experiments

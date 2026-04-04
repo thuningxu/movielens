@@ -517,10 +517,30 @@ Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedb
 
 #### Experiment results
 
-**No improvements found (6 experiments, all ≤0.8139):**
-- R1-1: Cross-network projection (196→256 before GDCN) — 0.8127 (overfits)
-- R1-2: Genome-gated DIN (PCA-32 cosine sim bonus in attention) — 0.8139 (neutral)
-- R2-1: Ensemble genome+non-genome model (α=0.7 best) — 0.8129 (no complementarity)
+**apr03d (6 experiments, all ≤0.8139):**
+- Cross-network projection, genome-gated DIN, ensemble, attention pooling — all neutral/worse
+
+---
+
+### Experiment log (autoresearch/apr03e) — ml-25m, HP sweep breakthrough
+
+> **0.8138 → 0.8201 AUC via systematic HP tuning. 80 experiments.**
+> Key discovery: NEG_RATIO=1 is the hidden lever (+0.005 from NEG_RATIO=4).
+
+**Kept improvements** (cumulative):
+
+| # | Experiment | AUC | Delta |
+|---|-----------|-----|-------|
+| 1 | NEG_RATIO=2, PATIENCE=3, eval 3x/epoch | 0.8171 | +0.003 |
+| 2 | NEG_RATIO=1 | 0.8183 | +0.001 |
+| 3 | WD=5e-5, ACCUM_STEPS=4 | 0.8197 | +0.001 |
+| 4 | LR=8e-5 | 0.8201 | +0.000 |
+
+**Learnings:**
+- NEG_RATIO 4→2→1 monotonically improves AUC. Fewer random negatives = cleaner training signal.
+- HP combinations stack: NEG_RATIO + WD + ACCUM + LR = +0.006 total.
+- Architecture is saturated at 0.8201: 80 experiments (attention, cross-net, features, loss) all neutral.
+- The 0.8138 "ceiling" was a tuning problem, not information-theoretic.
 - R2-2: Attention-based genome pooling (item-aware softmax over 1128 dims) — 0.8008 (worse)
 
 **Critic-driven findings:**
