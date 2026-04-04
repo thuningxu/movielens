@@ -46,9 +46,9 @@ WEIGHT_DECAY = 1e-5
 EMBED_DIM = 28
 HISTORY_LEN = 100
 NUM_DENSE = 17  # 1 timestamp + 5 user hist bins + 1 user count + 5 item hist bins + 1 item count + 1 ug_dot + 1 year + 1 genre_count + 1 movie_age
-NEG_RATIO = 4  # random unrated negatives per positive in training data
+NEG_RATIO = 2  # random unrated negatives per positive in training data
 EVAL_EVERY = 1
-PATIENCE = 2
+PATIENCE = 3
 
 # ─── Device ─────────────────────────────────────────────────────────
 torch.manual_seed(SEED)
@@ -617,7 +617,7 @@ best_auc = 0.0
 best_state = None
 evals_without_improvement = 0
 global_step = 0
-eval_every_steps = max(n_batches_per_epoch // 2, 1)  # eval ~2x per epoch
+eval_every_steps = max(n_batches_per_epoch // 3, 1)  # eval ~3x per epoch
 epoch = 0
 
 while True:
