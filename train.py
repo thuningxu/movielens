@@ -41,14 +41,14 @@ log = logging.getLogger("train")
 # ─── Configuration ──────────────────────────────────────────────────
 DATASET = os.environ.get("DATASET", "ml-25m")
 BATCH_SIZE = 16384
-LR = 1e-4
-WEIGHT_DECAY = 1e-5
+LR = 8e-5
+WEIGHT_DECAY = 5e-5
 EMBED_DIM = 28
 HISTORY_LEN = 100
 NUM_DENSE = 17  # 1 timestamp + 5 user hist bins + 1 user count + 5 item hist bins + 1 item count + 1 ug_dot + 1 year + 1 genre_count + 1 movie_age
-NEG_RATIO = 4  # random unrated negatives per positive in training data
+NEG_RATIO = 1  # random unrated negatives per positive in training data
 EVAL_EVERY = 1
-PATIENCE = 2
+PATIENCE = 3
 
 # ─── Device ─────────────────────────────────────────────────────────
 torch.manual_seed(SEED)
@@ -609,7 +609,7 @@ optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECA
 criterion = nn.BCEWithLogitsLoss()
 use_amp = DEVICE.type == "cuda"
 scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-ACCUM_STEPS = 8
+ACCUM_STEPS = 4
 
 training_start = time.time()
 peak_memory_mb = 0.0
@@ -617,7 +617,7 @@ best_auc = 0.0
 best_state = None
 evals_without_improvement = 0
 global_step = 0
-eval_every_steps = max(n_batches_per_epoch // 2, 1)  # eval ~2x per epoch
+eval_every_steps = max(n_batches_per_epoch // 3, 1)  # eval ~3x per epoch
 epoch = 0
 
 while True:
