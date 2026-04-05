@@ -42,7 +42,7 @@ log = logging.getLogger("train")
 DATASET = os.environ.get("DATASET", "ml-25m")
 BATCH_SIZE = 16384
 LR = 8e-5
-WEIGHT_DECAY = 3e-5
+WEIGHT_DECAY = 5e-5
 EMBED_DIM = 28
 HISTORY_LEN = 100
 NUM_DENSE = 17  # 1 timestamp + 5 user hist bins + 1 user count + 5 item hist bins + 1 item count + 1 ug_dot + 1 year + 1 genre_count + 1 movie_age
@@ -503,7 +503,8 @@ class DLRM(nn.Module):
         item_e = nn.functional.dropout(self.item_embed(movie_id), 0.1, self.training)
 
         # --- User-side: causal self-attention + DIN ---
-        hist_item_e = self.hist_embed(history)                         # (B, L, D)
+        raw_hist_item_e = self.hist_embed(history)                     # (B, L, D) — save raw
+        hist_item_e = raw_hist_item_e
         hist_rat_e = self.rating_proj(hist_ratings.unsqueeze(-1))      # (B, L, D)
         # Causal self-attention on item embeddings
         Q = self.hist_q(hist_item_e)                                   # (B, L, D)
@@ -518,8 +519,8 @@ class DLRM(nn.Module):
         causal_scores = causal_scores + causal_mask.unsqueeze(0)
         causal_scores = causal_scores.masked_fill(pad_mask, -1e4)
         causal_weights = torch.softmax(causal_scores, dim=-1)
-        hist_item_e = torch.bmm(causal_weights, V)                    # (B, L, D) — contextual
-        # DIN on contextual embeddings
+        hist_item_e = torch.bmm(causal_weights, V) + raw_hist_item_e   # (B, L, D) — contextual + residual
+        # DIN on contextual+residual embeddings
         hist_e_raw = torch.cat([hist_item_e, hist_rat_e], dim=-1)     # (B, L, 2D)
         target_e = torch.cat([item_e, item_e], dim=-1)                # (B, 2D) — no rating for target
         target_exp = target_e.unsqueeze(1).expand_as(hist_e_raw)      # (B, L, 2D)
