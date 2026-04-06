@@ -9,7 +9,7 @@ Research repo for movie recommendation on MovieLens. Uses a hybrid engagement pr
 Current model: DLRM with rating-aware DIN + causal self-attention (with residual), item-side DIN, tag genome with learned bottleneck compression, 1-head field attention, FinalMLP two-stream with bilinear.
 Current single-model AUC: **0.821 on ml-25m** (deterministic, SEED=42).
 Current ensemble AUC: **0.854 on ml-25m** (HistGBM stacking of 59 diverse model variants, 3-fold CV validated).
-See `program.md` for full experiment history (~500 experiments).
+See `program.md` for full experiment history (~500 experiments). See `README.md` for AUC progress chart.
 
 ## Commands
 

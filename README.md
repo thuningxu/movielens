@@ -1,10 +1,35 @@
-# Model Architecture
+# MovieLens Recommendation — Hybrid Engagement Prediction
 
-DLRM with rating-aware DIN + causal self-attention (with residual), item-side DIN, tag genome with learned bottleneck compression, 1-head field attention, FinalMLP two-stream with bilinear.
+Predict whether a user will rate a movie >= 4 stars (positive engagement). Hybrid task with hard negatives (rated < 4) and easy negatives (random unrated). ~500 experiments on ml-25m.
 
-**Single model: val_auc = 0.821 on ml-25m** | ~13M params | ~7.6 GB VRAM on NVIDIA L4
-**Ensemble (59 models): val_auc = 0.854 on ml-25m** | HistGBM stacking, 3-fold CV validated
-**~500 experiments total**
+**Single model: val_auc = 0.821** | **Ensemble (59 models): val_auc = 0.854** | NVIDIA L4 GPU
+
+## AUC Progress
+
+```mermaid
+%%{init: {'theme': 'default'}}%%
+xychart-beta
+    title "AUC Improvement Over Time (~500 experiments)"
+    x-axis ["apr01", "apr01", "apr01", "apr01", "apr02", "apr02", "apr02", "apr02", "apr03c", "apr03c", "apr03e", "apr03e", "apr03e", "apr03e", "apr04", "apr04", "apr05", "apr05"]
+    y-axis "val_auc" 0.76 --> 0.86
+    line "Single Model" [0.770, 0.781, 0.793, 0.799, 0.802, 0.804, 0.806, 0.806, 0.811, 0.814, 0.817, 0.820, 0.821, 0.821, 0.821, 0.821, 0.821, 0.821]
+    line "Ensemble" [0.770, 0.781, 0.793, 0.799, 0.802, 0.804, 0.806, 0.806, 0.811, 0.814, 0.817, 0.820, 0.821, 0.821, 0.824, 0.824, 0.836, 0.854]
+```
+
+### Key milestones
+
+| Date | AUC | Experiments | What worked |
+|------|-----|------------|-------------|
+| Apr 1 | 0.770 | 0 | Baseline DLRM on ml-25m |
+| Apr 1 | 0.799 | ~30 | HISTORY_LEN=100, 3 GDCN layers, causal self-attention |
+| Apr 2 | 0.806 | ~120 | Rating histograms, 4 GDCN layers, embed_dim=28 |
+| Apr 3 | 0.814 | ~170 | Tag genome with learned bottleneck compression |
+| Apr 4 | 0.821 | ~250 | NEG_RATIO=1, WD=5e-5, ACCUM=4, LR=8e-5 |
+| Apr 4-5 | 0.824 | ~350 | LogReg ensemble (22 diverse model variants) |
+| Apr 5 | 0.836 | ~450 | LogReg ensemble expanded to 60 models |
+| **Apr 5** | **0.854** | **~500** | **HistGBM stacking of 59 diverse models** |
+
+## Model Architecture
 
 ```mermaid
 graph TD
