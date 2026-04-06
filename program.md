@@ -613,6 +613,44 @@ Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedb
 28. **The single-model architecture is saturated.** After 200 architecture experiments at 0.8210, no modification improves. The model topology is well-matched to MovieLens features.
 29. **Ensemble beats single model when diversity is high.** Models with different inductive biases (mean pool, no DIN, small dims) contribute more than similar-architecture variants.
 
+---
+
+### Experiment log (autoresearch/apr05) — ml-25m, recency + ensemble expansion
+
+> **Ensemble expanded from 0.8242 to 0.8339 via recency-diverse models. ~20 experiments.**
+> Key discovery: models trained on different time slices provide massive ensemble diversity.
+
+**Single-model results (no improvement over 0.8210):**
+- Temporal features (hour/day): hurt (0.816)
+- User activity rate: neutral (0.819)
+- Item trend, time gap, rating variance: all hurt
+- Asymmetric DIN: 0.820 (closest, not significant)
+- 2-layer field attention, deeper bottom MLP, higher LR: all worse
+
+**Recency-diverse models for ensemble:**
+- recent50 (train on recent 50% only): 0.815-0.823 (varies by implementation)
+- recent40/60/70/80: 0.814-0.817 (less data = lower individual AUC)
+- old50: 0.793 (old data is very noisy for recent prediction)
+- recent50_meanpool: 0.815 (mean pool variant)
+- recent50_noitemdin: 0.815
+
+**Ensemble expansion:**
+
+| Ensemble | Method | AUC | Models |
+|----------|--------|-----|--------|
+| apr04 baseline | LogReg 22 models | 0.8242 | Architecture-diverse |
+| + recency variants | LogReg 40 models | 0.8339 | + 18 recency/diversity |
+| + more variants | LogReg 60 models | 0.8364 | + 20 extreme variants |
+| **HistGBM stacking** | **HistGBM 59 models** | **0.8534** | Non-linear stacking |
+| MLP stacking | MLP 59 models | 0.8495 | 2-layer neural stacking |
+
+**Key learnings (apr05):**
+30. **Recency-diverse models are the best ensemble partners.** Models trained on different time slices make different errors because user preferences drift. Even weak individual models (0.81) contribute to ensemble via low correlation.
+31. **The ensemble path has more headroom than single-model.** Going from 22→40 models gave +0.010 AUC. Each maximally-diverse variant adds ~0.001-0.002 to the ensemble.
+32. **Old ratings are noisy for recent prediction.** Training on only recent data sometimes gives higher single-model AUC, but the effect depends on feature engineering (which uses full history).
+33. **HistGBM >> LogReg for stacking.** Non-linear stacking (HistGBM: 0.854) massively outperforms linear (LogReg: 0.836) on 59 diverse models. GBM learns which model to trust for which samples. 3-fold CV validated.
+34. **59 diverse models span the full architecture space.** Variants include: field attention, GDCN, mean pool, DIN-only, no-DIN, small/large embeddings, different NEG_RATIO (0-8), recency filters (25-90%), label noise, pure MF, wide&deep, regression loss, shuffled history, etc.
+
 ### Useful references
 
 - BARS benchmark (Zhu et al., SIGIR 2022) — different task (tag CTR) but good training practices and model zoo

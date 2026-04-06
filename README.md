@@ -3,8 +3,8 @@
 DLRM with rating-aware DIN + causal self-attention (with residual), item-side DIN, tag genome with learned bottleneck compression, 1-head field attention, FinalMLP two-stream with bilinear.
 
 **Single model: val_auc = 0.821 on ml-25m** | ~13M params | ~7.6 GB VRAM on NVIDIA L4
-**Ensemble (22 models): val_auc = 0.824 on ml-25m** | LogReg stacking of architecturally diverse variants
-**~460 experiments total**
+**Ensemble (59 models): val_auc = 0.854 on ml-25m** | HistGBM stacking, 3-fold CV validated
+**~500 experiments total**
 
 ```mermaid
 graph TD
@@ -131,7 +131,13 @@ graph TD
 
 The best results come from ensembling architecturally diverse models. Key insight: models need **low prediction correlation** to provide complementary signal.
 
-**Best ensemble: 0.8242 AUC** (LogReg stacking, 22 models, 5-fold CV)
+**Best ensemble: 0.8534 AUC** (HistGBM stacking, 59 models, 3-fold CV)
+
+Stacking method comparison:
+- HistGBM (iter=300, depth=6, lr=0.2): **0.854**
+- MLP (2-layer, 128 hidden): 0.850
+- LogReg (C=0.5): 0.836
+- Simple average: 0.823
 
 Top ensemble members (by contribution):
 - `fieldattn` (0.821) — current best single model
