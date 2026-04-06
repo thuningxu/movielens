@@ -638,14 +638,18 @@ Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedb
 
 | Ensemble | Method | AUC | Models |
 |----------|--------|-----|--------|
-| Previous best | LogReg 22 models | 0.8242 | apr04 models |
-| **New best** | **LogReg 40 models** | **0.8339** | + 18 recency/diversity variants |
-| Best 2-model | Simple average | 0.8286 | recent50 + meanpool |
+| apr04 baseline | LogReg 22 models | 0.8242 | Architecture-diverse |
+| + recency variants | LogReg 40 models | 0.8339 | + 18 recency/diversity |
+| + more variants | LogReg 60 models | 0.8364 | + 20 extreme variants |
+| **HistGBM stacking** | **HistGBM 59 models** | **0.8534** | Non-linear stacking |
+| MLP stacking | MLP 59 models | 0.8495 | 2-layer neural stacking |
 
 **Key learnings (apr05):**
 30. **Recency-diverse models are the best ensemble partners.** Models trained on different time slices make different errors because user preferences drift. Even weak individual models (0.81) contribute to ensemble via low correlation.
 31. **The ensemble path has more headroom than single-model.** Going from 22→40 models gave +0.010 AUC. Each maximally-diverse variant adds ~0.001-0.002 to the ensemble.
 32. **Old ratings are noisy for recent prediction.** Training on only recent data sometimes gives higher single-model AUC, but the effect depends on feature engineering (which uses full history).
+33. **HistGBM >> LogReg for stacking.** Non-linear stacking (HistGBM: 0.854) massively outperforms linear (LogReg: 0.836) on 59 diverse models. GBM learns which model to trust for which samples. 3-fold CV validated.
+34. **59 diverse models span the full architecture space.** Variants include: field attention, GDCN, mean pool, DIN-only, no-DIN, small/large embeddings, different NEG_RATIO (0-8), recency filters (25-90%), label noise, pure MF, wide&deep, regression loss, shuffled history, etc.
 
 ### Useful references
 

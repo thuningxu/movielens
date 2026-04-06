@@ -8,8 +8,8 @@ Research repo for movie recommendation on MovieLens. Uses a hybrid engagement pr
 
 Current model: DLRM with rating-aware DIN + causal self-attention (with residual), item-side DIN, tag genome with learned bottleneck compression, 1-head field attention, FinalMLP two-stream with bilinear.
 Current single-model AUC: **0.821 on ml-25m** (deterministic, SEED=42).
-Current ensemble AUC: **0.824 on ml-25m** (LogReg stacking of 22 diverse model variants).
-See `program.md` for full experiment history (~460 experiments).
+Current ensemble AUC: **0.854 on ml-25m** (HistGBM stacking of 59 diverse model variants, 3-fold CV validated).
+See `program.md` for full experiment history (~500 experiments).
 
 ## Commands
 
@@ -78,5 +78,6 @@ See `program.md` for the full list. The most important:
 5. **NEG_RATIO is the hidden lever.** Reducing from 4→1 gave +0.005 AUC — the biggest HP-only gain. Fewer random negatives = cleaner signal focused on hard negatives.
 6. **HP combinations stack.** NEG_RATIO + WD + ACCUM_STEPS + LR each contributed incrementally for +0.006 total.
 7. **Field attention > GDCN.** 1-head MHA across 7 fields with residual slightly beats 4 gated cross layers (0.8207 vs 0.8201). Simpler and fewer parameters.
-8. **Diverse ensemble is the breakthrough path.** Architecturally diverse models (different attention, pooling, features) ensembled via LogReg stacking: 0.824. Key: low prediction correlation (<0.95) between partners, not high individual AUC.
+8. **Diverse ensemble is the breakthrough path.** 59 architecturally diverse models ensembled via HistGBM stacking: 0.854. Key: low prediction correlation between partners, not high individual AUC. GBM captures non-linear model complementarity that LogReg misses.
 9. **10-trial HP sweeps per idea.** Never test an architecture idea once and discard. The NEG_RATIO breakthrough came from systematic HP sweep after the "ceiling" was declared.
+10. **HistGBM >> LogReg for stacking.** LogReg: 0.836, MLP: 0.850, HistGBM: 0.854. Non-linear stacking is critical when models have diverse error patterns.
