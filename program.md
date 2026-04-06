@@ -555,6 +555,64 @@ Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedb
 18. **MLP bottleneck > attention for genome compression.** Softmax over 1128 dims spreads too thin. Fixed bottleneck (256→64→D) forces useful compression.
 19. **0.8138 appears to be near the ceiling for MovieLens-25m with this task formulation.** After 175+ experiments, all architectural/training changes are neutral (±0.002). Only genuinely new data (tag genome) moved the needle.
 
+---
+
+### Experiment log (autoresearch/apr04) — ml-25m, architecture + ensemble
+
+> **0.8210 single model → 0.8242 ensemble. ~200 experiments.**
+> Target: 0.84. Key breakthrough: diverse architecture ensemble.
+
+**Kept single-model improvements** (building on 0.8201):
+
+| # | Experiment | AUC | Delta |
+|---|-----------|-----|-------|
+| 1 | Replace GDCN with 1-head field attention, WD=3e-5 | 0.8207 | +0.001 |
+| 2 | History residual (raw + contextual), WD=5e-5 | 0.8210 | +0.000 |
+
+**Ensemble results:**
+
+| Ensemble | Method | AUC |
+|----------|--------|-----|
+| Best 3-model (fieldattn+meanpool+gdcn) | Simple average | 0.8228 |
+| Best 5-model (fieldattn+ratingpool+nostream+noitemdin+dim16) | Simple average | 0.8234 |
+| Best 22-model | LogReg stacking (5-fold CV, C=0.0005) | **0.8242** |
+| Best 5-model rank-based | Rank averaging | 0.8236 |
+
+**Ensemble members trained (22 variants):**
+- fieldattn (0.821), gdcn (0.819), meanpool (0.819), nogenome (0.807)
+- ratingpool (0.819), dinonly (0.818), neg3 (0.814), dim16 (0.818), nostream (0.818)
+- hist30 (0.821), noitemdin (0.821), minimal (0.806), gdcn_slow (0.817), film (0.817)
+- revhist (0.821), hist10 (0.820), dim56 (0.818)
+- mf (0.780), widedeep (0.816), itemonly (0.818), neg0 (0.759), regression (0.812)
+
+**Discarded architecture ideas (~200 experiments, all ≤0.8210 single model):**
+- SASRec transformer (10 trials): 0.803-0.813 (strictly worse than causal SA + DIN)
+- GRU/DIEN (5 trials): 0.811-0.814 (worse and 4x slower)
+- BPR ranking loss (5 trials): 0.817-0.820 (worse than BCE)
+- LightGCN pre-trained embeddings (4 trials): 0.811-0.817 (redundant with DIN history)
+- Soft labels from ratings (5 trials): 0.815-0.819 (worse)
+- Multi-task rating regression (5 trials): 0.815-0.816 (worse)
+- Genre-enriched DIN (10 trials): 0.815-0.821 (neutral, genre already captured)
+- User-genre dense features (10 trials): 0.815-0.818 (worse, ug_dot already optimal)
+- Cross-attention user/item fields: 0.816 (worse)
+- Separate user/item field attention: 0.817 (worse)
+- Wider/deeper streams, wider top MLP: all worse
+- Label threshold 3.5/4.5: 0.821/0.754 (4.0 is optimal)
+- Focal loss, sample weighting, popularity negatives: all worse
+- Cosine annealing, warmup, SWA: all neutral
+- Separate LR for embeddings/MLPs: all worse
+- Data augmentation (masking, noise, dropout): all neutral
+- Different seeds, ensemble of same architecture: negligible variance
+- 90/5/5 split: not comparable (different eval set)
+
+**Key learnings (apr04):**
+24. **Field attention is a slight improvement over GDCN.** 1-head MHA across 7 fields beats 4 gated cross layers (0.8207 vs 0.8201). Simpler, fewer params, slightly better.
+25. **Diverse ensemble is the breakthrough.** +0.003 from single model. The key is architectural diversity (low prediction correlation), not number of models. Mean pool (0.944 corr) >> GDCN (0.979 corr) as ensemble partner.
+26. **SASRec/transformers are worse than DIN.** 10 trials of transformer-based sequence models all regressed -0.01 to -0.02. The lightweight causal SA + DIN combination is better suited to this task.
+27. **GRU/DIEN is worse than causal SA.** Sequential processing loses to parallel attention on this data.
+28. **The single-model architecture is saturated.** After 200 architecture experiments at 0.8210, no modification improves. The model topology is well-matched to MovieLens features.
+29. **Ensemble beats single model when diversity is high.** Models with different inductive biases (mean pool, no DIN, small dims) contribute more than similar-architecture variants.
+
 ### Useful references
 
 - BARS benchmark (Zhu et al., SIGIR 2022) — different task (tag CTR) but good training practices and model zoo

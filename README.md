@@ -1,8 +1,10 @@
 # Model Architecture
 
-DLRM with rating-aware DIN + causal self-attention, item-side DIN, tag genome with learned bottleneck compression, 4 GDCN cross layers, FinalMLP two-stream with bilinear.
+DLRM with rating-aware DIN + causal self-attention (with residual), item-side DIN, tag genome with learned bottleneck compression, 1-head field attention, FinalMLP two-stream with bilinear.
 
-**val_auc = 0.820 on ml-25m** | ~13M params | ~7.2 GB VRAM on NVIDIA L4 | ~230 experiments
+**Single model: val_auc = 0.821 on ml-25m** | ~13M params | ~7.6 GB VRAM on NVIDIA L4
+**Ensemble (22 models): val_auc = 0.824 on ml-25m** | LogReg stacking of architecturally diverse variants
+**~460 experiments total**
 
 ```mermaid
 graph TD
@@ -26,8 +28,8 @@ graph TD
     end
 
     subgraph "User-Side Sequential Modeling"
-        HIST_E --> CAUSAL["Causal Self-Attention<br/>(single head, Q/K/V linear)<br/>items only *"]
-        CAUSAL --> CONTEXTUAL["Contextual History<br/>(B, 100, 28)"]
+        HIST_E --> CAUSAL["Causal Self-Attention<br/>(single head, Q/K/V linear)<br/>+ additive residual from raw embeds"]
+        CAUSAL --> CONTEXTUAL["Contextual + Raw History<br/>(B, 100, 28)"]
         CONTEXTUAL --> DIN_CAT["Concat: contextual + ratings<br/>(B, 100, 56)"]
         HIST_RAT --> DIN_CAT
         DIN_CAT --> DIN["DIN Attention<br/>(target-item-aware)<br/>Linear(168, 64) → ReLU → Linear(64, 1)"]
@@ -58,20 +60,16 @@ graph TD
         GATE --> GENOME_FIELD["genome_field (28)<br/>gate * genome_e +<br/>(1-gate) * item_e"]
     end
 
-    subgraph "GDCN Cross Network (4 layers)"
-        USER_E --> CONCAT["Concat all 7 fields<br/>7 × 28 = 196 dim"]
-        ITEM_E --> CONCAT
-        USER_HIST_E --> CONCAT
-        ITEM_HIST_E --> CONCAT
-        DENSE_E --> CONCAT
-        GENRE_E --> CONCAT
-        GENOME_FIELD --> CONCAT
-        CONCAT --> X0["x0 (196)"]
-        X0 --> GCL1["Gated Cross Layer 1<br/>cross = x0 ⊙ (W·xi + b)<br/>gate = σ(G·xi)<br/>xi+1 = gate⊙cross + (1-gate)⊙xi"]
-        GCL1 --> GCL2["Gated Cross Layer 2"]
-        GCL2 --> GCL3["Gated Cross Layer 3"]
-        GCL3 --> GCL4["Gated Cross Layer 4"]
-        GCL4 --> X4["x4 (196)"]
+    subgraph "Field Attention (replaces GDCN)"
+        USER_E --> STACK["Stack 7 fields<br/>(B, 7, 28)"]
+        ITEM_E --> STACK
+        USER_HIST_E --> STACK
+        ITEM_HIST_E --> STACK
+        DENSE_E --> STACK
+        GENRE_E --> STACK
+        GENOME_FIELD --> STACK
+        STACK --> FATTN["Multi-Head Attention<br/>1 head, dropout=0.1<br/>+ additive residual"]
+        FATTN --> X4["x4 (196)<br/>flatten 7 × 28"]
     end
 
     subgraph "FinalMLP Two-Stream"
@@ -115,10 +113,7 @@ graph TD
     style IDIN fill:#fff3e0
     style GENOME_PROJ fill:#e8eaf6
     style GATE fill:#e8eaf6
-    style GCL1 fill:#f3e5f5
-    style GCL2 fill:#f3e5f5
-    style GCL3 fill:#f3e5f5
-    style GCL4 fill:#f3e5f5
+    style FATTN fill:#f3e5f5
     style US fill:#e8f5e9
     style IS fill:#e8f5e9
     style BILINEAR fill:#e8f5e9
@@ -126,6 +121,24 @@ graph TD
     style PRED fill:#c8e6c9
 ```
 
-\* **Known design note:** Causal self-attention operates on item embeddings only, then the output is concatenated with per-position rating embeddings for DIN. This means the contextual embedding at position i (a weighted mix of items 0..i) is paired with the rating specifically for item i. Tested with residual/combined input — identical AUC, so the model compensates.
+\* **History residual:** Causal self-attention output is added to raw item embeddings before DIN, preserving item identity alongside contextual representation.
 
-\*\* **Tag genome gating:** 78% of movies lack genome data. The sigmoid gate learns to fall back to `item_e` when genome features are zeros. PCA compression failed (0.798); the learned 3-layer bottleneck MLP succeeds (0.811→0.814) because it discovers non-linear feature combinations.
+\*\* **Tag genome gating:** 78% of movies lack genome data. The sigmoid gate learns to fall back to `item_e` when genome features are zeros. PCA compression failed (0.798); the learned 3-layer bottleneck MLP succeeds (0.811→0.814).
+
+\*\*\* **Field attention replaces GDCN:** 1-head multi-head attention across 7 feature fields with additive residual. Simpler than 4 gated cross layers, slightly better AUC (0.8207 vs 0.8201).
+
+## Ensemble
+
+The best results come from ensembling architecturally diverse models. Key insight: models need **low prediction correlation** to provide complementary signal.
+
+**Best ensemble: 0.8242 AUC** (LogReg stacking, 22 models, 5-fold CV)
+
+Top ensemble members (by contribution):
+- `fieldattn` (0.821) — current best single model
+- `meanpool` (0.819) — no attention, mean pooling history (correlation 0.944)
+- `ratingpool` (0.819) — rating-weighted mean pooling (correlation ~0.94)
+- `noitemdin` (0.821) — no item-side DIN
+- `nostream` (0.818) — no two-stream separation
+- `dim16` (0.818) — embed_dim=16, much smaller model
+
+Models with >0.97 prediction correlation with fieldattn (GDCN, nogenome) add little ensemble value. The most valuable partners are those with fundamentally different inductive biases.
