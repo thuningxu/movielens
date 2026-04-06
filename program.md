@@ -405,10 +405,10 @@ Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedb
 - NEG_RATIO=8 — 0.796 (too many negatives dilutes signal)
 - 3-stream FinalMLP (interaction stream) — 0.802 (extra capacity overfits)
 
-#### Untried ideas (speculative, high-risk)
-- **PinSage** — GraphSAGE with random walk sampling. May scale better than LightGCN.
-- **HSTU (Meta, ICML 2024)** — hierarchical sequential transduction. Significant rewrite.
-- **External data** — IMDB plot summaries, poster images. Not in MovieLens but the only clear path to genuinely new signal.
+#### Untried ideas (as of apr03, now mostly tried — see apr04/apr05 logs)
+- ~~PinSage~~ — LightGCN failed; PinSage untried but GNN signal is redundant with DIN history
+- ~~HSTU~~ — SASRec transformer tried and failed (0.80-0.81); HSTU might be different but risky
+- ~~External data~~ — Still untried; only clear path to genuinely new content signal
 
 ---
 
@@ -650,6 +650,44 @@ Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedb
 32. **Old ratings are noisy for recent prediction.** Training on only recent data sometimes gives higher single-model AUC, but the effect depends on feature engineering (which uses full history).
 33. **HistGBM >> LogReg for stacking.** Non-linear stacking (HistGBM: 0.854) massively outperforms linear (LogReg: 0.836) on 59 diverse models. GBM learns which model to trust for which samples. 3-fold CV validated.
 34. **59 diverse models span the full architecture space.** Variants include: field attention, GDCN, mean pool, DIN-only, no-DIN, small/large embeddings, different NEG_RATIO (0-8), recency filters (25-90%), label noise, pure MF, wide&deep, regression loss, shuffled history, etc.
+
+### What to try next (backlog for future sessions)
+
+> Current: single model 0.821, ensemble 0.854. Target: push higher on both fronts.
+> Single model improvements feed into ensemble — a better base model lifts ALL 59 variants.
+
+#### Single model ideas (not yet tried or undertried)
+
+**High priority (Critic-recommended, never tried):**
+1. **Curriculum negative sampling** — Start training with NEG_RATIO=4 (easy negatives), decay to NEG_RATIO=1 over epochs. HSTU paper showed +0.015-0.025 AUC from curriculum sampling. This is the single most promising untried idea.
+2. **Temporal negative sampling** — Sample negatives from items popular BEFORE the target interaction timestamp, not random. More realistic "what the user could have seen" negatives.
+3. **Stratified negative sampling by popularity** — Different NEG_RATIO for popular vs long-tail items (e.g., 3/2/1 by decile). Popular items need more negatives to distinguish.
+4. **Recency as feature, not data split** — Add recency_decay = exp(-lambda * time_gap) as a dense feature instead of filtering training data. Lets the model learn to weight recent data more.
+
+**Medium priority (discussed, partially explored):**
+5. **Single-model recency tuning** — RECENCY_FRAC=0.8 + LR=1e-4 gave 0.8223 (new single-model best, not committed). Needs full 10-trial sweep with WD/ACCUM/PATIENCE variations.
+6. **Collaborative filtering features** — Pre-compute ALS/SVD on implicit feedback (all ratings = positive), add top-K latent factors as dense features. Different from the SVD that was tried before (which was on explicit ratings).
+7. **User cluster embeddings** — Soft-cluster users by history similarity (K-means on user_genre_affinity), use cluster ID as a sparse feature. Adds collaborative signal without the overhead of full GNN.
+8. **Replace genre projection with small transformer** (user-suggested) — Model genre interactions (Action+Sci-Fi means different things than either alone). Pushed back due to only 20 genres, but worth 1 trial.
+
+**Speculative (high-risk, high-reward):**
+9. **HSTU architecture** — Hierarchical sequential transduction (Meta, ICML 2024). Complete model rewrite. Prior SASRec attempt failed, but HSTU is fundamentally different (hierarchical, not flat).
+10. **External data** — IMDB plot summaries via links.csv → IMDB API. Poster images. Not in MovieLens but the only clear path to genuinely new content signal.
+11. **PinSage** — GraphSAGE with random walk sampling on user-item bipartite graph. LightGCN failed (sparse matmul too slow), but PinSage uses sampling which scales better.
+
+#### Ensemble ideas (not yet tried)
+
+**High priority:**
+1. **Rebuild ensemble on improved single model** — If single model goes from 0.821→0.823, retrain all 59 variants from the new base and re-stack. Could push ensemble from 0.854→0.86+.
+2. **HistGBM hyperparameter optimization** — Current best was iter=300, depth=6, lr=0.2. Full GridSearchCV might find better. Also try XGBoost, LightGBM, CatBoost.
+3. **Train more recency variants** — KEEP_FRAC=0.15, 0.35, 0.45, 0.55, 0.65, 0.85, 0.95. Each adds ensemble diversity.
+4. **Curriculum-trained models for ensemble** — If curriculum neg sampling works (#1 above), train 5 variants with different curriculum schedules.
+
+**Medium priority:**
+5. **Factorization machine on ensemble predictions** — FM on (pred_i, pred_j) pairs captures interaction effects that LogReg/GBM may miss.
+6. **Two-stage stacking** — First stage: 5 LogReg meta-learners on subsets of models. Second stage: GBM on the 5 meta-learner outputs.
+7. **SHAP-driven model pruning** — Use SHAP to identify which of the 59 models actually contribute. Remove dead weight to reduce overfitting risk.
+8. **Dropout-based ensemble** — Train 1 model with high dropout (0.4), generate 10 stochastic predictions from the same checkpoint. Cheap diversity.
 
 ### Useful references
 
