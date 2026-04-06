@@ -455,20 +455,9 @@ class DLRM(nn.Module):
         )
         self.genome_gate = nn.Linear(D, D)  # sigmoid gate to blend genome with item_embed fallback
 
-        # GDCN: gated cross layers (DCN-V2 + sigmoid gate)
+        # Field-level self-attention (replaces GDCN cross layers)
         cross_dim = 7 * D  # user, item, user_hist(DIN), item_hist(DIN), dense, genre, genome
-        self.cross_w1 = nn.Linear(cross_dim, cross_dim, bias=False)
-        self.cross_b1 = nn.Parameter(torch.zeros(cross_dim))
-        self.cross_g1 = nn.Linear(cross_dim, cross_dim)
-        self.cross_w2 = nn.Linear(cross_dim, cross_dim, bias=False)
-        self.cross_b2 = nn.Parameter(torch.zeros(cross_dim))
-        self.cross_g2 = nn.Linear(cross_dim, cross_dim)
-        self.cross_w3 = nn.Linear(cross_dim, cross_dim, bias=False)
-        self.cross_b3 = nn.Parameter(torch.zeros(cross_dim))
-        self.cross_g3 = nn.Linear(cross_dim, cross_dim)
-        self.cross_w4 = nn.Linear(cross_dim, cross_dim, bias=False)
-        self.cross_b4 = nn.Parameter(torch.zeros(cross_dim))
-        self.cross_g4 = nn.Linear(cross_dim, cross_dim)
+        self.field_attn = nn.MultiheadAttention(D, num_heads=1, batch_first=True, dropout=0.1)
 
         # Two-stream MLPs (FinalMLP-style)
         # User stream: user_e + user_hist_e + dense_e = 3*D
@@ -514,7 +503,8 @@ class DLRM(nn.Module):
         item_e = nn.functional.dropout(self.item_embed(movie_id), 0.1, self.training)
 
         # --- User-side: causal self-attention + DIN ---
-        hist_item_e = self.hist_embed(history)                         # (B, L, D)
+        raw_hist_item_e = self.hist_embed(history)                     # (B, L, D) — save raw
+        hist_item_e = raw_hist_item_e
         hist_rat_e = self.rating_proj(hist_ratings.unsqueeze(-1))      # (B, L, D)
         # Causal self-attention on item embeddings
         Q = self.hist_q(hist_item_e)                                   # (B, L, D)
@@ -529,8 +519,8 @@ class DLRM(nn.Module):
         causal_scores = causal_scores + causal_mask.unsqueeze(0)
         causal_scores = causal_scores.masked_fill(pad_mask, -1e4)
         causal_weights = torch.softmax(causal_scores, dim=-1)
-        hist_item_e = torch.bmm(causal_weights, V)                    # (B, L, D) — contextual
-        # DIN on contextual embeddings
+        hist_item_e = torch.bmm(causal_weights, V) + raw_hist_item_e   # (B, L, D) — contextual + residual
+        # DIN on contextual+residual embeddings
         hist_e_raw = torch.cat([hist_item_e, hist_rat_e], dim=-1)     # (B, L, 2D)
         target_e = torch.cat([item_e, item_e], dim=-1)                # (B, 2D) — no rating for target
         target_exp = target_e.unsqueeze(1).expand_as(hist_e_raw)      # (B, L, 2D)
@@ -560,25 +550,10 @@ class DLRM(nn.Module):
         gate = torch.sigmoid(self.genome_gate(genome_e))                  # (B, D)
         genome_field = gate * genome_e + (1 - gate) * item_e.detach()     # blend genome with item fallback
 
-        # Concatenate all embeddings
-        x0 = torch.cat([user_e, item_e, user_hist_e, item_hist_e, dense_e, genre_e, genome_field], dim=-1)  # (B, 7*D)
-
-        # Gated cross layer 1
-        cross1 = x0 * (self.cross_w1(x0) + self.cross_b1)
-        gate1 = torch.sigmoid(self.cross_g1(x0))
-        x1 = gate1 * cross1 + (1 - gate1) * x0
-        # Gated cross layer 2
-        cross2 = x0 * (self.cross_w2(x1) + self.cross_b2)
-        gate2 = torch.sigmoid(self.cross_g2(x1))
-        x2 = gate2 * cross2 + (1 - gate2) * x1
-        # Gated cross layer 3
-        cross3 = x0 * (self.cross_w3(x2) + self.cross_b3)
-        gate3 = torch.sigmoid(self.cross_g3(x2))
-        x3 = gate3 * cross3 + (1 - gate3) * x2
-        # Gated cross layer 4
-        cross4 = x0 * (self.cross_w4(x3) + self.cross_b4)
-        gate4 = torch.sigmoid(self.cross_g4(x3))
-        x4 = gate4 * cross4 + (1 - gate4) * x3
+        # Stack 7 fields as sequence and apply field-level self-attention
+        fields = torch.stack([user_e, item_e, user_hist_e, item_hist_e, dense_e, genre_e, genome_field], dim=1)  # (B, 7, D)
+        attn_out, _ = self.field_attn(fields, fields, fields)  # (B, 7, D)
+        x4 = (fields + attn_out).reshape(fields.size(0), -1)  # (B, 7*D) — residual + flatten
 
         # Two-stream processing
         user_stream_out = self.user_stream(torch.cat([user_e, user_hist_e, dense_e], dim=-1))
