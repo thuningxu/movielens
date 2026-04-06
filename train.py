@@ -41,7 +41,7 @@ log = logging.getLogger("train")
 # ─── Configuration ──────────────────────────────────────────────────
 DATASET = os.environ.get("DATASET", "ml-25m")
 BATCH_SIZE = 16384
-LR = 8e-5
+LR = 1e-4
 WEIGHT_DECAY = 5e-5
 EMBED_DIM = 28
 HISTORY_LEN = 100
@@ -271,6 +271,21 @@ else:
         genome_matrix=genome_matrix, has_genome=has_genome,
     )
     log.info(f"Features cached to {_cache_path.name}")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# RECENCY FILTER — drop oldest 20% of real ratings (features already computed from full data)
+# ═══════════════════════════════════════════════════════════════════
+
+RECENCY_FRAC = 0.8
+real_mask = train_df["rating"] > 0
+real_ratings = train_df[real_mask].sort_values("timestamp")
+cutoff = int(len(real_ratings) * (1 - RECENCY_FRAC))
+keep_real = real_ratings.iloc[cutoff:].index
+keep_neg = train_df[~real_mask].index
+train_df = train_df.loc[keep_real.union(keep_neg)].reset_index(drop=True)
+n_dropped = int(real_mask.sum()) - len(keep_real)
+log.info(f"Recency filter: kept {RECENCY_FRAC:.0%} of real ratings, dropped {n_dropped} oldest")
 
 
 # ═══════════════════════════════════════════════════════════════════
