@@ -653,8 +653,29 @@ Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedb
 
 ### What to try next (backlog for future sessions)
 
-> Current: single model 0.821, ensemble 0.854. Target: push higher on both fronts.
-> Single model improvements feed into ensemble — a better base model lifts ALL 59 variants.
+> Current: single model 0.822, ensemble 0.858. Target: 0.87.
+> Single model improvements feed into ensemble — a better base model lifts ALL variants.
+> Curriculum neg sampling TRIED (10 trials, +0.0006 max) — not the breakthrough hoped for.
+> Stacker feature engineering WORKED (+0.003, metadata features help HistGBM).
+
+#### NEW: Simplification hypothesis (apr06 discussion)
+The model may be stuck in a local minimum due to over-parameterization. Evidence:
+- Mean pool (no attention) gets 0.819 (only -0.003 from full model)
+- Removing causal SA is neutral (0.820 vs 0.821)
+- 500 architecture experiments all converge to same ~0.821-0.822
+- A simpler model might find a sharper, higher optimum
+
+**Simplification experiment plan (10 trials):**
+1. Strip to MINIMAL model: user/item embed + DIN (no causal SA) + bottom MLP + genre + genome → simple concat → top MLP. No field attention, no two-stream, no bilinear.
+2. Tune the minimal model aggressively (LR, WD, dropout, dim sweep)
+3. Add components back ONE AT A TIME, measure each contribution
+4. If minimal model matches ~0.820, it's a better base for exploration (fewer params, cleaner gradients)
+5. Generate ensemble variants from simplified model (different inductive bias = more diversity)
+
+#### NEW: Inter-rating timing features (low priority, 2-3 trials)
+- Burstiness: std/mean of inter-rating time gaps per user
+- Recent activity acceleration: gap trend (are gaps getting shorter or longer?)
+- NOT raw activity rate (already tried, neutral)
 
 #### Single model ideas (not yet tried or undertried)
 
