@@ -42,7 +42,7 @@ log = logging.getLogger("train")
 DATASET = os.environ.get("DATASET", "ml-25m")
 BATCH_SIZE = 16384
 LR = 1e-4
-WEIGHT_DECAY = 5e-5
+WEIGHT_DECAY = 1e-4
 EMBED_DIM = 28
 HISTORY_LEN = 100
 NUM_DENSE = 17  # 1 timestamp + 5 user hist bins + 1 user count + 5 item hist bins + 1 item count + 1 ug_dot + 1 year + 1 genre_count + 1 movie_age
@@ -470,25 +470,18 @@ class DLRM(nn.Module):
         )
         self.genome_gate = nn.Linear(D, D)  # sigmoid gate to blend genome with item_embed fallback
 
-        # Field-level self-attention (replaces GDCN cross layers)
+        # Squeeze-and-Excitation: learn per-field importance weights
         cross_dim = 7 * D  # user, item, user_hist(DIN), item_hist(DIN), dense, genre, genome
-        self.field_attn = nn.MultiheadAttention(D, num_heads=1, batch_first=True, dropout=0.1)
-
-        # Two-stream MLPs (FinalMLP-style)
-        # User stream: user_e + user_hist_e + dense_e = 3*D
-        self.user_stream = nn.Sequential(
-            nn.Linear(3 * D, 256), nn.ReLU(), nn.Dropout(0.2),
-            nn.Linear(256, 64), nn.ReLU(),
-        )
-        # Item stream: item_e + item_hist_e + genre_e + genome_e = 4*D
-        self.item_stream = nn.Sequential(
-            nn.Linear(4 * D, 256), nn.ReLU(), nn.Dropout(0.2),
-            nn.Linear(256, 64), nn.ReLU(),
+        self.se = nn.Sequential(
+            nn.Linear(7, 7 * 4),
+            nn.ReLU(),
+            nn.Linear(7 * 4, 7),
+            nn.Sigmoid(),
         )
 
-        # Top MLP: cross-network + streams + bilinear
+        # Top MLP: SE-reweighted fields → prediction
         self.top_mlp = nn.Sequential(
-            nn.Linear(cross_dim + 64 + 64 + 64, 256),
+            nn.Linear(cross_dim, 256),
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(256, 128),
@@ -565,21 +558,14 @@ class DLRM(nn.Module):
         gate = torch.sigmoid(self.genome_gate(genome_e))                  # (B, D)
         genome_field = gate * genome_e + (1 - gate) * item_e.detach()     # blend genome with item fallback
 
-        # Stack 7 fields as sequence and apply field-level self-attention
+        # Squeeze-and-Excitation: learn per-field importance weights
         fields = torch.stack([user_e, item_e, user_hist_e, item_hist_e, dense_e, genre_e, genome_field], dim=1)  # (B, 7, D)
-        attn_out, _ = self.field_attn(fields, fields, fields)  # (B, 7, D)
-        x4 = (fields + attn_out).reshape(fields.size(0), -1)  # (B, 7*D) — residual + flatten
+        se_input = fields.mean(dim=2)               # (B, 7) — global avg pool per field
+        se_weights = self.se(se_input).unsqueeze(-1) # (B, 7, 1) — learned importance
+        fields = fields * se_weights                  # reweight fields
+        x0 = fields.reshape(fields.size(0), -1)      # (B, 7*D) — flatten
 
-        # Two-stream processing
-        user_stream_out = self.user_stream(torch.cat([user_e, user_hist_e, dense_e], dim=-1))
-        item_stream_out = self.item_stream(torch.cat([item_e, item_hist_e, genre_e, genome_field], dim=-1))
-
-        # Bilinear interaction between streams
-        bilinear = user_stream_out * item_stream_out  # element-wise product (B, 64)
-
-        # Combine cross-network + streams + bilinear
-        combined = torch.cat([x4, user_stream_out, item_stream_out, bilinear], dim=-1)
-        return self.top_mlp(combined).squeeze(-1)
+        return self.top_mlp(x0).squeeze(-1)
 
 
 model = DLRM().to(DEVICE)
