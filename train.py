@@ -38,17 +38,34 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
 log = logging.getLogger("train")
 
+# ─── Helpers ────────────────────────────────────────────────────────
+
+def _env_flag(name, default):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
 # ─── Configuration ──────────────────────────────────────────────────
 DATASET = os.environ.get("DATASET", "ml-25m")
-BATCH_SIZE = 16384
-LR = 1e-4
-WEIGHT_DECAY = 1e-4
-EMBED_DIM = 28
-HISTORY_LEN = 100
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "16384"))
+LR = float(os.environ.get("LR", "1e-4"))
+WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "1e-4"))
+EMBED_DIM = int(os.environ.get("EMBED_DIM", "28"))
+HISTORY_LEN = int(os.environ.get("HISTORY_LEN", "100"))
 NUM_DENSE = 17  # 1 timestamp + 5 user hist bins + 1 user count + 5 item hist bins + 1 item count + 1 ug_dot + 1 year + 1 genre_count + 1 movie_age
-NEG_RATIO = 1  # random unrated negatives per positive in training data
+NEG_RATIO = int(os.environ.get("NEG_RATIO", "1"))  # random unrated negatives per positive in training data
 EVAL_EVERY = 1
-PATIENCE = 3
+PATIENCE = int(os.environ.get("PATIENCE", "3"))
+ACCUM_STEPS = int(os.environ.get("ACCUM_STEPS", "4"))
+RECENCY_FRAC = float(os.environ.get("RECENCY_FRAC", "0.8"))
+USER_HIST_MODE = os.environ.get("USER_HIST_MODE", "din")  # din | mean | rating
+ITEM_HIST_MODE = os.environ.get("ITEM_HIST_MODE", "din")  # din | mean | off
+USE_CAUSAL_SA = _env_flag("USE_CAUSAL_SA", True)
+USE_TORCH_COMPILE = _env_flag("USE_TORCH_COMPILE", True)
+SAVE_EVAL_PRED_PATH = os.environ.get("SAVE_EVAL_PRED_PATH")
+VARIANT_NAME = os.environ.get("VARIANT_NAME", "baseline")
 
 # ─── Device ─────────────────────────────────────────────────────────
 torch.manual_seed(SEED)
@@ -62,7 +79,11 @@ else:
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 torch.set_float32_matmul_precision('high')  # enable TF32 tensor cores
-log.info(f"Device: {DEVICE}")
+log.info(
+    f"Device: {DEVICE} | Variant: {VARIANT_NAME} | "
+    f"user_hist={USER_HIST_MODE} | item_hist={ITEM_HIST_MODE} | "
+    f"causal_sa={USE_CAUSAL_SA} | dim={EMBED_DIM}"
+)
 
 # ─── Load Data ──────────────────────────────────────────────────────
 total_start = time.time()
@@ -277,7 +298,6 @@ else:
 # RECENCY FILTER — drop oldest 20% of real ratings (features already computed from full data)
 # ═══════════════════════════════════════════════════════════════════
 
-RECENCY_FRAC = 0.8
 real_mask = train_df["rating"] > 0
 real_ratings = train_df[real_mask].sort_values("timestamp")
 cutoff = int(len(real_ratings) * (1 - RECENCY_FRAC))
@@ -388,7 +408,7 @@ n_eval = len(_eval_users)
 log.info(f"Eval set: {_n_val_pos} pos + {len(_val_hard_neg)} hard neg + {_n_val_pos} easy neg = {n_eval} total")
 
 
-def run_eval():
+def run_eval(return_scores=False):
     """Evaluate AUC on validation set."""
     model.eval()
     eval_batch = BATCH_SIZE * 2
@@ -408,7 +428,10 @@ def run_eval():
             all_scores.append(torch.sigmoid(logits).cpu().numpy())
 
     scores = np.concatenate(all_scores)
-    return evaluate(_eval_labels, scores)
+    metrics = evaluate(_eval_labels, scores)
+    if return_scores:
+        return metrics, scores
+    return metrics
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -424,6 +447,10 @@ class DLRM(nn.Module):
         self.item_embed = nn.Embedding(num_items, D)
         self.hist_embed = nn.Embedding(num_items + 1, D, padding_idx=PAD_IDX)
         self.rater_embed = nn.Embedding(num_users + 1, D, padding_idx=USER_PAD_IDX)
+        self.zero_item_hist = ITEM_HIST_MODE == "off"
+        self.use_causal_sa = USE_CAUSAL_SA
+        self.user_hist_mode = USER_HIST_MODE
+        self.item_hist_mode = ITEM_HIST_MODE
 
         # Rating projection: scalar rating → D-dim vector
         self.rating_proj = nn.Linear(1, D)
@@ -509,46 +536,65 @@ class DLRM(nn.Module):
                 genres, item_hist, item_hist_ratings, genome_raw, has_genome_mask):
         user_e = nn.functional.dropout(self.user_embed(user_id), 0.1, self.training)
         item_e = nn.functional.dropout(self.item_embed(movie_id), 0.1, self.training)
+        hist_mask = (history != PAD_IDX).unsqueeze(-1)
+        item_hist_mask = (item_hist != USER_PAD_IDX).unsqueeze(-1)
 
         # --- User-side: causal self-attention + DIN ---
         raw_hist_item_e = self.hist_embed(history)                     # (B, L, D) — save raw
         hist_item_e = raw_hist_item_e
         hist_rat_e = self.rating_proj(hist_ratings.unsqueeze(-1))      # (B, L, D)
-        # Causal self-attention on item embeddings
-        Q = self.hist_q(hist_item_e)                                   # (B, L, D)
-        K = self.hist_k(hist_item_e)                                   # (B, L, D)
-        V = self.hist_v(hist_item_e)                                   # (B, L, D)
-        scale = Q.size(-1) ** 0.5
-        causal_scores = torch.bmm(Q, K.transpose(1, 2)) / scale       # (B, L, L)
-        # Causal mask + padding
-        L = history.size(1)
-        causal_mask = torch.triu(torch.full((L, L), -1e4, device=history.device), diagonal=1)
-        pad_mask = (history == PAD_IDX).unsqueeze(1).expand(-1, L, -1) # (B, L, L)
-        causal_scores = causal_scores + causal_mask.unsqueeze(0)
-        causal_scores = causal_scores.masked_fill(pad_mask, -1e4)
-        causal_weights = torch.softmax(causal_scores, dim=-1)
-        hist_item_e = torch.bmm(causal_weights, V) + raw_hist_item_e   # (B, L, D) — contextual + residual
-        # DIN on contextual+residual embeddings
-        hist_e_raw = torch.cat([hist_item_e, hist_rat_e], dim=-1)     # (B, L, 2D)
-        target_e = torch.cat([item_e, item_e], dim=-1)                # (B, 2D) — no rating for target
-        target_exp = target_e.unsqueeze(1).expand_as(hist_e_raw)      # (B, L, 2D)
-        attn_in = torch.cat([hist_e_raw, target_exp, hist_e_raw * target_exp], dim=-1)
-        attn_w = self.din_attn(attn_in).squeeze(-1)                   # (B, L)
-        attn_w = attn_w.masked_fill(history == PAD_IDX, -1e4)
-        attn_w = torch.softmax(attn_w, dim=-1).unsqueeze(-1)          # (B, L, 1)
-        user_hist_e = (hist_item_e * attn_w).sum(dim=1)               # (B, D)
+        if self.use_causal_sa:
+            Q = self.hist_q(hist_item_e)                                   # (B, L, D)
+            K = self.hist_k(hist_item_e)                                   # (B, L, D)
+            V = self.hist_v(hist_item_e)                                   # (B, L, D)
+            scale = Q.size(-1) ** 0.5
+            causal_scores = torch.bmm(Q, K.transpose(1, 2)) / scale       # (B, L, L)
+            L = history.size(1)
+            causal_mask = torch.triu(torch.full((L, L), -1e4, device=history.device), diagonal=1)
+            pad_mask = (history == PAD_IDX).unsqueeze(1).expand(-1, L, -1)
+            causal_scores = causal_scores + causal_mask.unsqueeze(0)
+            causal_scores = causal_scores.masked_fill(pad_mask, -1e4)
+            causal_weights = torch.softmax(causal_scores, dim=-1)
+            hist_item_e = torch.bmm(causal_weights, V) + raw_hist_item_e
+
+        if self.user_hist_mode == "din":
+            hist_e_raw = torch.cat([hist_item_e, hist_rat_e], dim=-1)     # (B, L, 2D)
+            target_e = torch.cat([item_e, item_e], dim=-1)                # (B, 2D) — no rating for target
+            target_exp = target_e.unsqueeze(1).expand_as(hist_e_raw)      # (B, L, 2D)
+            attn_in = torch.cat([hist_e_raw, target_exp, hist_e_raw * target_exp], dim=-1)
+            attn_w = self.din_attn(attn_in).squeeze(-1)                   # (B, L)
+            attn_w = attn_w.masked_fill(history == PAD_IDX, -1e4)
+            attn_w = torch.softmax(attn_w, dim=-1).unsqueeze(-1)          # (B, L, 1)
+            user_hist_e = (hist_item_e * attn_w).sum(dim=1)               # (B, D)
+        elif self.user_hist_mode == "mean":
+            denom = hist_mask.sum(dim=1).clamp_min(1)
+            user_hist_e = (hist_item_e * hist_mask).sum(dim=1) / denom
+        elif self.user_hist_mode == "rating":
+            rating_weights = hist_ratings.unsqueeze(-1) * hist_mask
+            denom = rating_weights.sum(dim=1).clamp_min(1e-6)
+            user_hist_e = (hist_item_e * rating_weights).sum(dim=1) / denom
+        else:
+            raise ValueError(f"Unknown USER_HIST_MODE: {self.user_hist_mode}")
 
         # --- Item-side DIN: attention over users who rated this item ---
         rater_e = nn.functional.dropout(self.rater_embed(item_hist), 0.1, self.training)  # (B, IL, D)
-        rater_rat_e = self.rating_proj(item_hist_ratings.unsqueeze(-1)) # (B, IL, D)
-        rater_e_raw = torch.cat([rater_e, rater_rat_e], dim=-1)       # (B, IL, 2D)
-        query_e = torch.cat([user_e, user_e], dim=-1)                 # (B, 2D)
-        query_exp = query_e.unsqueeze(1).expand_as(rater_e_raw)       # (B, IL, 2D)
-        item_attn_in = torch.cat([rater_e_raw, query_exp, rater_e_raw * query_exp], dim=-1)
-        item_attn_w = self.item_din_attn(item_attn_in).squeeze(-1)    # (B, IL)
-        item_attn_w = item_attn_w.masked_fill(item_hist == USER_PAD_IDX, -1e4)
-        item_attn_w = torch.softmax(item_attn_w, dim=-1).unsqueeze(-1)
-        item_hist_e = (rater_e * item_attn_w).sum(dim=1)              # (B, D)
+        if self.item_hist_mode == "din":
+            rater_rat_e = self.rating_proj(item_hist_ratings.unsqueeze(-1)) # (B, IL, D)
+            rater_e_raw = torch.cat([rater_e, rater_rat_e], dim=-1)       # (B, IL, 2D)
+            query_e = torch.cat([user_e, user_e], dim=-1)                 # (B, 2D)
+            query_exp = query_e.unsqueeze(1).expand_as(rater_e_raw)       # (B, IL, 2D)
+            item_attn_in = torch.cat([rater_e_raw, query_exp, rater_e_raw * query_exp], dim=-1)
+            item_attn_w = self.item_din_attn(item_attn_in).squeeze(-1)    # (B, IL)
+            item_attn_w = item_attn_w.masked_fill(item_hist == USER_PAD_IDX, -1e4)
+            item_attn_w = torch.softmax(item_attn_w, dim=-1).unsqueeze(-1)
+            item_hist_e = (rater_e * item_attn_w).sum(dim=1)              # (B, D)
+        elif self.item_hist_mode == "mean":
+            denom = item_hist_mask.sum(dim=1).clamp_min(1)
+            item_hist_e = (rater_e * item_hist_mask).sum(dim=1) / denom
+        elif self.item_hist_mode == "off":
+            item_hist_e = torch.zeros_like(item_e)
+        else:
+            raise ValueError(f"Unknown ITEM_HIST_MODE: {self.item_hist_mode}")
 
         dense_e = self.bottom_mlp(dense)
         genre_e = self.genre_proj(genres)
@@ -573,7 +619,7 @@ num_params = sum(p.numel() for p in model.parameters())
 log.info(f"Parameters: {num_params / 1e6:.1f}M | Genres: {num_genres}")
 
 # Compile model for CUDA graphs / kernel fusion
-if DEVICE.type == "cuda":
+if DEVICE.type == "cuda" and USE_TORCH_COMPILE:
     model = torch.compile(model)
 
 
@@ -585,7 +631,6 @@ optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECA
 criterion = nn.BCEWithLogitsLoss()
 use_amp = DEVICE.type == "cuda"
 scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-ACCUM_STEPS = 4
 
 training_start = time.time()
 peak_memory_mb = 0.0
@@ -669,7 +714,23 @@ if best_state is not None:
     model.load_state_dict(best_state)
     log.info(f"Restored best model (AUC: {best_auc:.4f})")
 
-metrics = run_eval()
+metrics, final_scores = run_eval(return_scores=True)
 total_seconds = time.time() - total_start
+
+if SAVE_EVAL_PRED_PATH:
+    pred_path = Path(SAVE_EVAL_PRED_PATH)
+    pred_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        pred_path,
+        labels=_eval_labels.astype(np.float32),
+        scores=final_scores.astype(np.float32),
+        variant=np.array(VARIANT_NAME),
+        dataset=np.array(DATASET),
+        user_hist_mode=np.array(USER_HIST_MODE),
+        item_hist_mode=np.array(ITEM_HIST_MODE),
+        embed_dim=np.array(EMBED_DIM),
+        recency_frac=np.array(RECENCY_FRAC, dtype=np.float32),
+    )
+    log.info(f"Saved eval predictions to {pred_path}")
 
 print_summary(metrics, training_seconds, total_seconds, peak_memory_mb, num_params, stats)
