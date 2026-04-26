@@ -175,7 +175,13 @@ def load_data(dataset_name="ml-1m", val_frac=0.1, test_frac=0.1):
     }
 
 
-def load_data_hybrid(dataset_name="ml-1m", val_frac=0.1, test_frac=0.1, neg_ratio=4):
+def load_data_hybrid(
+    dataset_name="ml-1m",
+    val_frac=0.1,
+    test_frac=0.1,
+    neg_ratio=4,
+    train_neg_mode="global",
+):
     """
     Load a MovieLens dataset for hybrid engagement prediction.
 
@@ -234,6 +240,9 @@ def load_data_hybrid(dataset_name="ml-1m", val_frac=0.1, test_frac=0.1, neg_rati
     num_pos = int(train["label"].sum())
     num_neg_to_add = num_pos * neg_ratio
     rng = np.random.RandomState(42)
+    train_pos = train[train["label"] == 1]
+    if train_neg_mode not in {"global", "anchor_pos", "anchor_pos_catalog"}:
+        raise ValueError(f"Unknown train_neg_mode: {train_neg_mode}")
 
     # Build sparse indicator matrix for fast collision detection
     from scipy.sparse import csr_matrix
@@ -249,11 +258,24 @@ def load_data_hybrid(dataset_name="ml-1m", val_frac=0.1, test_frac=0.1, neg_rati
     del _rows, _cols
 
     train_users = train["userId"].unique()
-    neg_users = rng.choice(train_users, size=num_neg_to_add)
+    if train_neg_mode in {"anchor_pos", "anchor_pos_catalog"}:
+        anchor_idx = rng.randint(0, len(train_pos), size=num_neg_to_add)
+        anchor_rows = train_pos.iloc[anchor_idx]
+        neg_users = anchor_rows["userId"].values.astype(np.int64)
+        neg_timestamps = anchor_rows["timestamp"].values.astype(np.int64)
+    else:
+        neg_users = rng.choice(train_users, size=num_neg_to_add)
+        neg_timestamps = np.full(num_neg_to_add, int(train["timestamp"].median()), dtype=np.int64)
     neg_items = rng.randint(0, num_items_count, size=num_neg_to_add)
+    if train_neg_mode == "anchor_pos_catalog":
+        item_first_seen = np.full(num_items_count, int(train["timestamp"].max()), dtype=np.int64)
+        first_seen_series = train.groupby("movieId")["timestamp"].min()
+        item_first_seen[first_seen_series.index.values.astype(np.int64)] = first_seen_series.values.astype(np.int64)
     # Rejection-resample collisions using sparse matrix lookup
     for attempt in range(10):
         is_rated = np.array(rated_matrix[neg_users, neg_items]).flatten().astype(bool)
+        if train_neg_mode == "anchor_pos_catalog":
+            is_rated |= item_first_seen[neg_items] > neg_timestamps
         n_bad = is_rated.sum()
         if n_bad == 0:
             break
@@ -263,7 +285,7 @@ def load_data_hybrid(dataset_name="ml-1m", val_frac=0.1, test_frac=0.1, neg_rati
         "userId": neg_users,
         "movieId": neg_items,
         "rating": 0.0,
-        "timestamp": int(train["timestamp"].median()),
+        "timestamp": neg_timestamps,
         "label": 0,
     })
     train = pd.concat([train, neg_df], ignore_index=True)

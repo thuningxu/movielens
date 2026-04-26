@@ -66,7 +66,7 @@ Top MLP: 196 → 256 → 128 → 64 → 1 (with dropout 0.2)
 Loss: BCEWithLogitsLoss with label smoothing 0.1
 Optimizer: Adam, LR=7e-5, weight_decay=1e-4
 AMP: fp16, torch.compile, TF32 tensor cores
-Training: batch=16384, grad accum 2× (effective 33K), NEG_RATIO=1, RECENCY_FRAC=0.8, sub-epoch eval ~3×, patience=3
+Training: batch=16384, grad accum 2× (effective 33K), NEG_RATIO=1, TRAIN_NEG_MODE=anchor_pos_catalog, RECENCY_FRAC=0.8, sub-epoch eval ~3×, patience=3
 Params/VRAM: printed at runtime; historical runs fit comfortably on a 24 GB L4
 ```
 
@@ -82,7 +82,8 @@ See `program.md` for the full list. The most important:
 4. **Tag genome works with learned compression, not PCA.** PCA-32 failed (0.798). Learned 3-layer bottleneck MLP succeeds (0.814). The sigmoid gate gracefully handles 78% missing data.
 5. **NEG_RATIO is the hidden lever.** Reducing from 4→1 gave +0.005 AUC — the biggest HP-only gain. Fewer random negatives = cleaner signal focused on hard negatives.
 6. **HP combinations stack.** NEG_RATIO + WD + ACCUM_STEPS + LR each contributed incrementally for +0.006 total.
-7. **Field attention > GDCN.** 1-head MHA across 7 fields with residual slightly beats 4 gated cross layers (0.8207 vs 0.8201). Simpler and fewer parameters.
-8. **Diverse ensemble is the breakthrough path.** 59 architecturally diverse models ensembled via HistGBM stacking: 0.854. Key: low prediction correlation between partners, not high individual AUC. GBM captures non-linear model complementarity that LogReg misses.
-9. **10-trial HP sweeps per idea.** Never test an architecture idea once and discard. The NEG_RATIO breakthrough came from systematic HP sweep after the "ceiling" was declared.
-10. **HistGBM >> LogReg for stacking.** LogReg: 0.836, MLP: 0.850, HistGBM: 0.854. Non-linear stacking is critical when models have diverse error patterns.
+7. **Time-valid easy negatives matter.** Replacing synthetic median-timestamp train negatives with anchored positive-event timestamps and catalog-valid sampled items improved the checked-in baseline to ~0.8238 on `ml-25m`.
+8. **Field attention > GDCN.** 1-head MHA across 7 fields with residual slightly beats 4 gated cross layers (0.8207 vs 0.8201). Simpler and fewer parameters.
+9. **Diverse ensemble is the breakthrough path.** 59 architecturally diverse models ensembled via HistGBM stacking: 0.854. Key: low prediction correlation between partners, not high individual AUC. GBM captures non-linear model complementarity that LogReg misses.
+10. **10-trial HP sweeps per idea.** Never test an architecture idea once and discard. The NEG_RATIO breakthrough came from systematic HP sweep after the "ceiling" was declared.
+11. **HistGBM >> LogReg for stacking.** LogReg: 0.836, MLP: 0.850, HistGBM: 0.854. Non-linear stacking is critical when models have diverse error patterns.

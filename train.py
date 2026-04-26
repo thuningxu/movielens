@@ -60,12 +60,16 @@ EVAL_EVERY = 1
 PATIENCE = int(os.environ.get("PATIENCE", "3"))
 ACCUM_STEPS = int(os.environ.get("ACCUM_STEPS", "2"))
 RECENCY_FRAC = float(os.environ.get("RECENCY_FRAC", "0.8"))
+TRAIN_NEG_MODE = os.environ.get("TRAIN_NEG_MODE", "anchor_pos_catalog")  # global | anchor_pos | anchor_pos_catalog
 USER_HIST_MODE = os.environ.get("USER_HIST_MODE", "din")  # din | mean | rating
 ITEM_HIST_MODE = os.environ.get("ITEM_HIST_MODE", "din")  # din | mean | off
 USE_CAUSAL_SA = _env_flag("USE_CAUSAL_SA", True)
 USE_TORCH_COMPILE = _env_flag("USE_TORCH_COMPILE", True)
 SAVE_EVAL_PRED_PATH = os.environ.get("SAVE_EVAL_PRED_PATH")
 VARIANT_NAME = os.environ.get("VARIANT_NAME", "baseline")
+
+if TRAIN_NEG_MODE not in {"global", "anchor_pos", "anchor_pos_catalog"}:
+    raise ValueError(f"Unknown TRAIN_NEG_MODE: {TRAIN_NEG_MODE}")
 
 # ─── Device ─────────────────────────────────────────────────────────
 torch.manual_seed(SEED)
@@ -82,12 +86,12 @@ torch.set_float32_matmul_precision('high')  # enable TF32 tensor cores
 log.info(
     f"Device: {DEVICE} | Variant: {VARIANT_NAME} | "
     f"user_hist={USER_HIST_MODE} | item_hist={ITEM_HIST_MODE} | "
-    f"causal_sa={USE_CAUSAL_SA} | dim={EMBED_DIM}"
+    f"causal_sa={USE_CAUSAL_SA} | dim={EMBED_DIM} | train_neg={TRAIN_NEG_MODE}"
 )
 
 # ─── Load Data ──────────────────────────────────────────────────────
 total_start = time.time()
-data = load_data_hybrid(DATASET, neg_ratio=NEG_RATIO)
+data = load_data_hybrid(DATASET, neg_ratio=NEG_RATIO, train_neg_mode=TRAIN_NEG_MODE)
 train_df, val_df = data["train"], data["val"]
 movies_df, stats = data["movies"], data["stats"]
 user_all_items = data["user_all_items"]
@@ -728,6 +732,7 @@ if SAVE_EVAL_PRED_PATH:
         dataset=np.array(DATASET),
         user_hist_mode=np.array(USER_HIST_MODE),
         item_hist_mode=np.array(ITEM_HIST_MODE),
+        train_neg_mode=np.array(TRAIN_NEG_MODE),
         embed_dim=np.array(EMBED_DIM),
         recency_frac=np.array(RECENCY_FRAC, dtype=np.float32),
     )
