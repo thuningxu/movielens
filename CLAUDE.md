@@ -66,7 +66,7 @@ Top MLP: 196 → 256 → 128 → 64 → 1 (with dropout 0.2)
 Loss: BCEWithLogitsLoss with label smoothing 0.1
 Optimizer: Adam, LR=7e-5, weight_decay=1e-4
 AMP: fp16, torch.compile, TF32 tensor cores
-Training: batch=16384, grad accum 2× (effective 33K), NEG_RATIO=1, TRAIN_NEG_MODE=anchor_pos_catalog, RECENCY_FRAC=0.8, sub-epoch eval ~3×, patience=3
+Training: batch=16384, grad accum 2× (effective 33K), NEG_RATIO=1, TRAIN_NEG_MODE=anchor_pos_catalog, USER_HIST_CONTEXT=causal_masked, RECENCY_FRAC=0.8, sub-epoch eval ~3×, patience=3
 Params/VRAM: printed at runtime; historical runs fit comfortably on a 24 GB L4
 ```
 
