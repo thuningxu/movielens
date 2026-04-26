@@ -47,6 +47,14 @@ def _env_flag(name, default):
     return value.lower() in {"1", "true", "yes", "on"}
 
 
+def _masked_softmax(scores, valid_mask, dim=-1):
+    masked_scores = scores.masked_fill(~valid_mask, -1e4)
+    weights = torch.softmax(masked_scores, dim=dim)
+    weights = weights * valid_mask.to(weights.dtype)
+    denom = weights.sum(dim=dim, keepdim=True).clamp_min(1e-8)
+    return weights / denom
+
+
 # ─── Configuration ──────────────────────────────────────────────────
 DATASET = os.environ.get("DATASET", "ml-25m")
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "16384"))
@@ -54,6 +62,7 @@ LR = float(os.environ.get("LR", "7e-5"))
 WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "1e-4"))
 EMBED_DIM = int(os.environ.get("EMBED_DIM", "28"))
 HISTORY_LEN = int(os.environ.get("HISTORY_LEN", "100"))
+ITEM_HIST_LEN = int(os.environ.get("ITEM_HIST_LEN", "30"))
 NUM_DENSE = 17  # 1 timestamp + 5 user hist bins + 1 user count + 5 item hist bins + 1 item count + 1 ug_dot + 1 year + 1 genre_count + 1 movie_age
 NEG_RATIO = int(os.environ.get("NEG_RATIO", "1"))  # random unrated negatives per positive in training data
 EVAL_EVERY = 1
@@ -63,6 +72,8 @@ RECENCY_FRAC = float(os.environ.get("RECENCY_FRAC", "0.8"))
 TRAIN_NEG_MODE = os.environ.get("TRAIN_NEG_MODE", "anchor_pos_catalog")  # global | anchor_pos | anchor_pos_catalog
 USER_HIST_MODE = os.environ.get("USER_HIST_MODE", "din")  # din | mean | rating
 ITEM_HIST_MODE = os.environ.get("ITEM_HIST_MODE", "din")  # din | mean | off
+USER_HIST_CONTEXT = os.environ.get("USER_HIST_CONTEXT", "static")  # static | causal_masked
+ITEM_HIST_CONTEXT = os.environ.get("ITEM_HIST_CONTEXT", "static")  # static | causal_masked
 USE_CAUSAL_SA = _env_flag("USE_CAUSAL_SA", True)
 USE_TORCH_COMPILE = _env_flag("USE_TORCH_COMPILE", True)
 SAVE_EVAL_PRED_PATH = os.environ.get("SAVE_EVAL_PRED_PATH")
@@ -70,6 +81,10 @@ VARIANT_NAME = os.environ.get("VARIANT_NAME", "baseline")
 
 if TRAIN_NEG_MODE not in {"global", "anchor_pos", "anchor_pos_catalog"}:
     raise ValueError(f"Unknown TRAIN_NEG_MODE: {TRAIN_NEG_MODE}")
+if USER_HIST_CONTEXT not in {"static", "causal_masked"}:
+    raise ValueError(f"Unknown USER_HIST_CONTEXT: {USER_HIST_CONTEXT}")
+if ITEM_HIST_CONTEXT not in {"static", "causal_masked"}:
+    raise ValueError(f"Unknown ITEM_HIST_CONTEXT: {ITEM_HIST_CONTEXT}")
 
 # ─── Device ─────────────────────────────────────────────────────────
 torch.manual_seed(SEED)
@@ -86,7 +101,9 @@ torch.set_float32_matmul_precision('high')  # enable TF32 tensor cores
 log.info(
     f"Device: {DEVICE} | Variant: {VARIANT_NAME} | "
     f"user_hist={USER_HIST_MODE} | item_hist={ITEM_HIST_MODE} | "
-    f"causal_sa={USE_CAUSAL_SA} | dim={EMBED_DIM} | train_neg={TRAIN_NEG_MODE}"
+    f"user_ctx={USER_HIST_CONTEXT} | item_ctx={ITEM_HIST_CONTEXT} | "
+    f"causal_sa={USE_CAUSAL_SA} | dim={EMBED_DIM} | item_hist_len={ITEM_HIST_LEN} | "
+    f"train_neg={TRAIN_NEG_MODE}"
 )
 
 # ─── Load Data ──────────────────────────────────────────────────────
@@ -107,8 +124,10 @@ log.info(f"Dataset: {DATASET} | Users: {num_users} | Items: {num_items} | "
 
 import hashlib, json
 _cache_key = hashlib.md5(json.dumps({
+    "feature_version": 2,
     "dataset": DATASET, "neg_ratio": NEG_RATIO,
-    "history_len": HISTORY_LEN, "num_users": num_users, "num_items": num_items,
+    "history_len": HISTORY_LEN, "item_hist_len": ITEM_HIST_LEN,
+    "num_users": num_users, "num_items": num_items,
 }).encode()).hexdigest()[:12]
 _cache_path = Path(__file__).parent / "data" / f"features_{_cache_key}.npz"
 
@@ -123,8 +142,10 @@ if _cache_path.exists():
     item_count_norm = _cache["item_count_norm"]
     user_histories = _cache["user_histories"]
     user_hist_ratings = _cache["user_hist_ratings"]
+    user_hist_timestamps = _cache["user_hist_timestamps"]
     item_histories = _cache["item_histories"]
     item_hist_ratings = _cache["item_hist_ratings"]
+    item_hist_timestamps = _cache["item_hist_timestamps"]
     user_genre_affinity = _cache["user_genre_affinity"]
     ts_min = float(_cache["ts_min"])
     ts_range = float(_cache["ts_range"])
@@ -177,14 +198,15 @@ else:
     # 3. User/item history sequences (vectorized)
     PAD_IDX = num_items
     USER_PAD_IDX = num_users
-    ITEM_HIST_LEN = 30
 
     def _build_history_arrays(ids, targets, ratings, timestamps, num_entities, pad_idx, max_len):
         sort_idx = np.lexsort((timestamps, ids))
         s_ids, s_targets = ids[sort_idx], targets[sort_idx]
         s_ratings = ratings[sort_idx].astype(np.float32) / 5.0
+        s_timestamps = timestamps[sort_idx].astype(np.int32)
         hist = np.full((num_entities, max_len), pad_idx, dtype=np.int64)
         hist_rat = np.zeros((num_entities, max_len), dtype=np.float32)
+        hist_ts = np.zeros((num_entities, max_len), dtype=np.int32)
         boundaries = np.where(np.diff(s_ids) != 0)[0] + 1
         starts = np.concatenate([[0], boundaries])
         ends = np.concatenate([boundaries, [len(s_ids)]])
@@ -194,12 +216,13 @@ else:
             length = min(e - s, max_len)
             hist[eid, -length:] = s_targets[e - length:e]
             hist_rat[eid, -length:] = s_ratings[e - length:e]
-        return hist, hist_rat
+            hist_ts[eid, -length:] = s_timestamps[e - length:e]
+        return hist, hist_rat, hist_ts
 
     _rt_ts = real_train["timestamp"].values
-    user_histories, user_hist_ratings = _build_history_arrays(
+    user_histories, user_hist_ratings, user_hist_timestamps = _build_history_arrays(
         _rt_uids, _rt_mids, _rt_ratings, _rt_ts, num_users, PAD_IDX, HISTORY_LEN)
-    item_histories, item_hist_ratings = _build_history_arrays(
+    item_histories, item_hist_ratings, item_hist_timestamps = _build_history_arrays(
         _rt_mids, _rt_uids, _rt_ratings, _rt_ts, num_items, USER_PAD_IDX, ITEM_HIST_LEN)
 
     # 4. User-genre affinity
@@ -289,8 +312,9 @@ else:
         movie_genres=movie_genres, user_hist_bins=user_hist_bins,
         item_hist_bins=item_hist_bins, user_count_norm=user_count_norm,
         item_count_norm=item_count_norm, user_histories=user_histories,
-        user_hist_ratings=user_hist_ratings, item_histories=item_histories,
-        item_hist_ratings=item_hist_ratings, user_genre_affinity=user_genre_affinity,
+        user_hist_ratings=user_hist_ratings, user_hist_timestamps=user_hist_timestamps,
+        item_histories=item_histories, item_hist_ratings=item_hist_ratings,
+        item_hist_timestamps=item_hist_timestamps, user_genre_affinity=user_genre_affinity,
         ts_min=np.array(ts_min), ts_range=np.array(ts_range),
         movie_year=movie_year, movie_genre_count=movie_genre_count,
         genome_matrix=genome_matrix, has_genome=has_genome,
@@ -319,8 +343,10 @@ log.info(f"Recency filter: kept {RECENCY_FRAC:.0%} of real ratings, dropped {n_d
 # Compact lookup tables on GPU (indexed by user/item ID, not per-sample)
 _user_histories_gpu = torch.from_numpy(user_histories).to(DEVICE)       # (num_users, L)
 _user_hist_ratings_gpu = torch.from_numpy(user_hist_ratings).to(DEVICE) # (num_users, L)
+_user_hist_ts_gpu = torch.from_numpy(user_hist_timestamps).to(DEVICE)   # (num_users, L)
 _item_histories_gpu = torch.from_numpy(item_histories).to(DEVICE)       # (num_items, IL)
 _item_hist_ratings_gpu = torch.from_numpy(item_hist_ratings).to(DEVICE) # (num_items, IL)
+_item_hist_ts_gpu = torch.from_numpy(item_hist_timestamps).to(DEVICE)   # (num_items, IL)
 _movie_genres_gpu = torch.from_numpy(movie_genres).to(DEVICE)           # (num_items, G)
 _genome_gpu = torch.from_numpy(genome_matrix).to(DEVICE)               # (num_items, GENOME_DIM)
 _has_genome_gpu = torch.from_numpy(has_genome).to(DEVICE)              # (num_items,)
@@ -330,6 +356,7 @@ def _build_gpu_tensors(df):
     uids = df["userId"].values.astype(np.int64)
     mids = df["movieId"].values.astype(np.int64)
     labels = df["label"].values.astype(np.float32)
+    sample_ts = df["timestamp"].values.astype(np.int32)
     ts_norm = ((df["timestamp"].values - ts_min) / ts_range).astype(np.float32)
     ug_dot = np.sum(user_genre_affinity[uids] * movie_genres[mids], axis=1).astype(np.float32)
     movie_age = ts_norm - movie_year[mids]
@@ -345,10 +372,11 @@ def _build_gpu_tensors(df):
         torch.from_numpy(mids).to(DEVICE),
         torch.from_numpy(dense).to(DEVICE),
         torch.from_numpy(labels).to(DEVICE),
+        torch.from_numpy(sample_ts).to(DEVICE),
     )
 
 log.info("Precomputing training tensors on GPU...")
-train_uids, train_mids, train_dense, train_labels = _build_gpu_tensors(train_df)
+train_uids, train_mids, train_dense, train_labels, train_ts = _build_gpu_tensors(train_df)
 n_train = len(train_labels)
 n_batches_per_epoch = n_train // BATCH_SIZE
 
@@ -402,7 +430,7 @@ _eval_labels = np.concatenate([
 ])
 
 log.info("Precomputing eval tensors on GPU...")
-_eval_uids_t, _eval_mids_t, _eval_dense_t, _ = _build_gpu_tensors(
+_eval_uids_t, _eval_mids_t, _eval_dense_t, _, _eval_ts_t = _build_gpu_tensors(
     pd.DataFrame({
         "userId": _eval_users, "movieId": _eval_items,
         "timestamp": _eval_ts, "label": _eval_labels,
@@ -424,9 +452,9 @@ def run_eval(return_scores=False):
             m = _eval_mids_t[start:end]
             logits = model(
                 u, m, _eval_dense_t[start:end],
-                _user_histories_gpu[u], _user_hist_ratings_gpu[u],
+                _user_histories_gpu[u], _user_hist_ratings_gpu[u], _user_hist_ts_gpu[u], _eval_ts_t[start:end],
                 _movie_genres_gpu[m],
-                _item_histories_gpu[m], _item_hist_ratings_gpu[m],
+                _item_histories_gpu[m], _item_hist_ratings_gpu[m], _item_hist_ts_gpu[m],
                 _genome_gpu[m], _has_genome_gpu[m],
             )
             all_scores.append(torch.sigmoid(logits).cpu().numpy())
@@ -536,12 +564,18 @@ class DLRM(nn.Module):
                 if m.padding_idx is not None:
                     nn.init.zeros_(m.weight[m.padding_idx])
 
-    def forward(self, user_id, movie_id, dense, history, hist_ratings,
-                genres, item_hist, item_hist_ratings, genome_raw, has_genome_mask):
+    def forward(self, user_id, movie_id, dense, history, hist_ratings, hist_timestamps, sample_timestamps,
+                genres, item_hist, item_hist_ratings, item_hist_timestamps, genome_raw, has_genome_mask):
         user_e = nn.functional.dropout(self.user_embed(user_id), 0.1, self.training)
         item_e = nn.functional.dropout(self.item_embed(movie_id), 0.1, self.training)
-        hist_mask = (history != PAD_IDX).unsqueeze(-1)
-        item_hist_mask = (item_hist != USER_PAD_IDX).unsqueeze(-1)
+        hist_valid = history != PAD_IDX
+        if USER_HIST_CONTEXT == "causal_masked":
+            hist_valid = hist_valid & (hist_timestamps < sample_timestamps.unsqueeze(1))
+        item_hist_valid = item_hist != USER_PAD_IDX
+        if ITEM_HIST_CONTEXT == "causal_masked":
+            item_hist_valid = item_hist_valid & (item_hist_timestamps < sample_timestamps.unsqueeze(1))
+        hist_mask = hist_valid.unsqueeze(-1)
+        item_hist_mask = item_hist_valid.unsqueeze(-1)
 
         # --- User-side: causal self-attention + DIN ---
         raw_hist_item_e = self.hist_embed(history)                     # (B, L, D) — save raw
@@ -554,11 +588,9 @@ class DLRM(nn.Module):
             scale = Q.size(-1) ** 0.5
             causal_scores = torch.bmm(Q, K.transpose(1, 2)) / scale       # (B, L, L)
             L = history.size(1)
-            causal_mask = torch.triu(torch.full((L, L), -1e4, device=history.device), diagonal=1)
-            pad_mask = (history == PAD_IDX).unsqueeze(1).expand(-1, L, -1)
-            causal_scores = causal_scores + causal_mask.unsqueeze(0)
-            causal_scores = causal_scores.masked_fill(pad_mask, -1e4)
-            causal_weights = torch.softmax(causal_scores, dim=-1)
+            causal_valid = torch.tril(torch.ones((L, L), device=history.device, dtype=torch.bool))
+            key_valid = hist_valid.unsqueeze(1).expand(-1, L, -1)
+            causal_weights = _masked_softmax(causal_scores, causal_valid.unsqueeze(0) & key_valid, dim=-1)
             hist_item_e = torch.bmm(causal_weights, V) + raw_hist_item_e
 
         if self.user_hist_mode == "din":
@@ -567,8 +599,7 @@ class DLRM(nn.Module):
             target_exp = target_e.unsqueeze(1).expand_as(hist_e_raw)      # (B, L, 2D)
             attn_in = torch.cat([hist_e_raw, target_exp, hist_e_raw * target_exp], dim=-1)
             attn_w = self.din_attn(attn_in).squeeze(-1)                   # (B, L)
-            attn_w = attn_w.masked_fill(history == PAD_IDX, -1e4)
-            attn_w = torch.softmax(attn_w, dim=-1).unsqueeze(-1)          # (B, L, 1)
+            attn_w = _masked_softmax(attn_w, hist_valid, dim=-1).unsqueeze(-1)
             user_hist_e = (hist_item_e * attn_w).sum(dim=1)               # (B, D)
         elif self.user_hist_mode == "mean":
             denom = hist_mask.sum(dim=1).clamp_min(1)
@@ -589,8 +620,7 @@ class DLRM(nn.Module):
             query_exp = query_e.unsqueeze(1).expand_as(rater_e_raw)       # (B, IL, 2D)
             item_attn_in = torch.cat([rater_e_raw, query_exp, rater_e_raw * query_exp], dim=-1)
             item_attn_w = self.item_din_attn(item_attn_in).squeeze(-1)    # (B, IL)
-            item_attn_w = item_attn_w.masked_fill(item_hist == USER_PAD_IDX, -1e4)
-            item_attn_w = torch.softmax(item_attn_w, dim=-1).unsqueeze(-1)
+            item_attn_w = _masked_softmax(item_attn_w, item_hist_valid, dim=-1).unsqueeze(-1)
             item_hist_e = (rater_e * item_attn_w).sum(dim=1)              # (B, D)
         elif self.item_hist_mode == "mean":
             denom = item_hist_mask.sum(dim=1).clamp_min(1)
@@ -661,8 +691,10 @@ while True:
             logits = model(
                 u_batch, m_batch, train_dense[idx],
                 _user_histories_gpu[u_batch], _user_hist_ratings_gpu[u_batch],
+                _user_hist_ts_gpu[u_batch], train_ts[idx],
                 _movie_genres_gpu[m_batch],
                 _item_histories_gpu[m_batch], _item_hist_ratings_gpu[m_batch],
+                _item_hist_ts_gpu[m_batch],
                 _genome_gpu[m_batch], _has_genome_gpu[m_batch],
             )
             # Label smoothing: soft targets
@@ -732,8 +764,11 @@ if SAVE_EVAL_PRED_PATH:
         dataset=np.array(DATASET),
         user_hist_mode=np.array(USER_HIST_MODE),
         item_hist_mode=np.array(ITEM_HIST_MODE),
+        user_hist_context=np.array(USER_HIST_CONTEXT),
+        item_hist_context=np.array(ITEM_HIST_CONTEXT),
         train_neg_mode=np.array(TRAIN_NEG_MODE),
         embed_dim=np.array(EMBED_DIM),
+        item_hist_len=np.array(ITEM_HIST_LEN),
         recency_frac=np.array(RECENCY_FRAC, dtype=np.float32),
     )
     log.info(f"Saved eval predictions to {pred_path}")
