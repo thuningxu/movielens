@@ -50,7 +50,7 @@ def _env_flag(name, default):
 # ─── Configuration ──────────────────────────────────────────────────
 DATASET = os.environ.get("DATASET", "ml-25m")
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "16384"))
-LR = float(os.environ.get("LR", "8e-5"))
+LR = float(os.environ.get("LR", "7e-5"))
 WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "1e-4"))
 EMBED_DIM = int(os.environ.get("EMBED_DIM", "28"))
 HISTORY_LEN = int(os.environ.get("HISTORY_LEN", "100"))
