@@ -8,6 +8,23 @@ Autonomous experimentation loop for improving pointwise recommendation (AUC) on 
 - Older references below to `2x NVIDIA L4`, parallel agents, or simultaneous worktrees are historical logs, not the current operating protocol.
 - Treat `train.py` as the source of truth for the checked-in baseline. Historical bests remain **0.821 single-model** and **0.854 ensemble** until they are re-run on this machine.
 
+## Current autonomous loop (single GPU, 3 roles)
+
+Use three roles every cycle, but serialize GPU usage:
+
+1. **Researcher** proposes one concrete idea family, not a grab bag of unrelated tweaks.
+2. **Critic** attacks the idea against repo history and current code, then either tightens it or vetoes it in favor of a stronger underexplored family.
+3. **MLE** implements the surviving idea behind clean config flags, smoke tests it, then runs the real `ml-25m` evaluation sweep on the single GPU.
+
+Operating rules:
+
+- One idea family at a time.
+- One GPU job at a time.
+- Every serious idea gets up to **10 trials** (initial implementation plus targeted HP sweeps) before being declared dead, unless it fails fast and clearly.
+- `ml-100k` is for crash detection only. Keep/discard decisions come from `ml-25m`.
+- Judge families, not single lucky runs. Keep only if there is either a clear `>= +0.001` win over the true current baseline, or a credible ridge of nearby configs at `>= +0.0007`.
+- Default first-class underexplored families are: missingness-aware genome fusion, causal-consistent history construction, and explicit recency/data-conditioning. Do not recycle historically dead families under new names.
+
 ## Setup
 
 To set up a new experiment, work with the user to:
@@ -29,7 +46,7 @@ Once you get confirmation, kick off the experimentation.
 Each experiment runs on the single available CUDA GPU. Do not launch concurrent training jobs, smoke tests, or stacker runs on this machine. The current checked-in `train.py` uses early stopping with patience=3 evals and sub-epoch evaluation roughly 3x/epoch, but the code is the source of truth. Launch it as:
 
 ```bash
-DATASET=ml-25m uv run python train.py > run.log 2>&1
+DATASET=ml-25m uv run python train.py 2>&1 | tee run.log
 ```
 
 **Dataset selection** via the `DATASET` env var:
@@ -112,16 +129,18 @@ The experiment runs on a dedicated branch (e.g. `autoresearch/mar31`).
 
 LOOP FOREVER:
 
-1. Pick an experiment idea from the backlog (or invent a new one).
-2. Modify `train.py` with the experimental idea.
-3. git commit.
-4. Smoke test: `DATASET=ml-100k uv run python train.py` — check it doesn't crash.
-5. Real run: `DATASET=ml-25m uv run python train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context).
-6. Read results: `grep "^val_auc:\|^peak_memory_mb:" run.log`
-7. If grep is empty, the run crashed. Run `tail -n 50 run.log` to read the stack trace and attempt a fix. If you can't fix it after a few attempts, give up on this idea.
-8. Record results in `results.tsv` (NOTE: do not commit results.tsv, leave it untracked by git).
-9. If val_auc improved: keep the commit, `git push` to upstream.
-10. If val_auc is equal or worse: `git reset --hard HEAD~1` to discard.
+1. Pick one idea family from the backlog (or invent a new one).
+2. Researcher proposes the family and the likely high-value sweep surface.
+3. Critic attacks it using repo history and current code; narrow or replace the idea before touching the GPU.
+4. MLE modifies `train.py` with the experimental idea, keeping the baseline path intact behind config flags when practical.
+5. git commit.
+6. Smoke test: `DATASET=ml-100k uv run python train.py` — check it doesn't crash.
+7. Real run(s): `DATASET=ml-25m uv run python train.py 2>&1 | tee run.log`. Preserve every run log on disk while the full family sweep runs serially on the single GPU.
+8. Read results: `grep "^val_auc:\|^peak_memory_mb:" run.log`
+9. If grep is empty, the run crashed. Run `tail -n 50 run.log` to read the stack trace and attempt a fix. If you can't fix it after a few attempts, give up on this idea.
+10. Record results in `results.tsv` (NOTE: do not commit results.tsv, leave it untracked by git).
+11. Keep or discard the **family**, not just the first run. If the family shows a real improvement signal, keep the best commit and `git push` to upstream.
+12. If the family is a dead end, discard only the experiment commit(s) you just made. Use `git reset --hard HEAD~1` only when the last commit is your own throwaway experiment and the worktree is otherwise clean; otherwise revert the specific edit safely.
 
 The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate.
 
@@ -663,7 +682,7 @@ The next two sections document an older 2-GPU workflow. Keep them as historical 
 ### What to try next (backlog for future sessions)
 
 > Historical checked-in bests: single model 0.821, ensemble 0.854.
-> A later exploratory note below mentions 0.8223 from recency tuning, but it was not committed. Reproduce it before treating it as the current baseline.
+> Restart update (2026-04-25): the checked-in SE baseline on this branch now reproduces at **0.82254** on `ml-25m` with `RECENCY_FRAC=0.8`, `LR=8e-5`, and `WEIGHT_DECAY=1e-4`.
 > Single model improvements feed into ensemble — a better base model lifts ALL variants.
 > Curriculum neg sampling TRIED (10 trials, +0.0006 max) — not the breakthrough hoped for.
 > Stacker feature engineering WORKED (+0.003, metadata features help HistGBM).
@@ -696,7 +715,7 @@ The model may be stuck in a local minimum due to over-parameterization. Evidence
 4. **Recency as feature, not data split** — Add recency_decay = exp(-lambda * time_gap) as a dense feature instead of filtering training data. Lets the model learn to weight recent data more.
 
 **Medium priority (discussed, partially explored):**
-5. **Single-model recency tuning** — Exploratory note: `RECENCY_FRAC=0.8 + LR=1e-4` reportedly gave 0.8223, but it was not committed. Needs a clean rerun plus a 10-trial sweep with WD/ACCUM/PATIENCE variations.
+5. **Single-model HP ridge around the checked-in SE baseline** — `RECENCY_FRAC=0.8`, `LR=8e-5`, `WEIGHT_DECAY=1e-4` now reproduces at 0.82254 on `ml-25m`. Keep sweeping nearby `LR`/`WD`/`PATIENCE`/`ACCUM` settings, but treat `RECENCY_FRAC=0.8` as the current anchor rather than an unverified note.
 6. **Collaborative filtering features** — Pre-compute ALS/SVD on implicit feedback (all ratings = positive), add top-K latent factors as dense features. Different from the SVD that was tried before (which was on explicit ratings).
 7. **User cluster embeddings** — Soft-cluster users by history similarity (K-means on user_genre_affinity), use cluster ID as a sparse feature. Adds collaborative signal without the overhead of full GNN.
 8. **Replace genre projection with small transformer** (user-suggested) — Model genre interactions (Action+Sci-Fi means different things than either alone). Pushed back due to only 20 genres, but worth 1 trial.
