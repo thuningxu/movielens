@@ -14,14 +14,17 @@ See `program.md` for full experiment history (~500 experiments). See `README.md`
 ## Commands
 
 ```bash
+# Sync the repo-local environment
+uv sync
+
 # Quick smoke test (ml-100k, ~seconds) — only for crash detection, NOT for AUC comparison
-DATASET=ml-100k python3 train.py
+DATASET=ml-100k uv run python train.py
 
 # Standard experiment (ml-25m on the current CUDA GPU; runtime is hardware-dependent)
-DATASET=ml-25m python3 train.py
+DATASET=ml-25m uv run python train.py
 
 # Full experiment run (redirected, for autoresearch loop)
-DATASET=ml-25m python3 train.py > run.log 2>&1
+DATASET=ml-25m uv run python train.py > run.log 2>&1
 
 # Check results
 grep "^val_auc:\|^peak_memory_mb:" run.log
@@ -39,6 +42,7 @@ grep "^val_auc:\|^peak_memory_mb:" run.log
 - **Metric**: val_auc (higher is better).
 - **Label**: rating >= 4 → positive (1), rating < 4 or random unrated → negative (0).
 - **Device**: Single CUDA GPU machine. Auto-detects CUDA/CPU.
+- **Environment**: Use the repo-local `uv` environment (`uv sync`, then `uv run ...`).
 - **Training termination**: Early stopping (patience=3 evals, sub-epoch eval 3x/epoch), no fixed time budget.
 - **Datasets**: `ml-100k` (smoke test only), `ml-1m` (fast iteration), `ml-10m` (medium), `ml-25m` (default, full scale). Selected via `DATASET` env var.
 - **Reproducibility**: Deterministic training (SEED=42). Run-to-run variance <0.001 AUC.

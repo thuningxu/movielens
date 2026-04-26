@@ -17,9 +17,10 @@ To set up a new experiment, work with the user to:
 3. **Read the in-scope files**: Read these files for full context:
    - `prepare.py` — fixed: data download/loading, train/val/test splits, AUC evaluation, constants. Do not modify.
    - `train.py` — the file you modify. Feature engineering, model architecture, optimizer, training loop.
-4. **Verify dependencies**: Run `python3 -c "import torch; print(torch.cuda.is_available(), torch.cuda.device_count(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu')"` to confirm CUDA is available and only one GPU is visible.
-5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
-6. **Confirm and go**: Confirm setup looks good.
+4. **Sync the environment**: Run `uv sync` to create/update the repo-local environment from `pyproject.toml` and `uv.lock`.
+5. **Verify dependencies**: Run `uv run python -c "import torch; print(torch.cuda.is_available(), torch.cuda.device_count(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu')"` to confirm CUDA is available and only one GPU is visible.
+6. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
+7. **Confirm and go**: Confirm setup looks good.
 
 Once you get confirmation, kick off the experimentation.
 
@@ -28,7 +29,7 @@ Once you get confirmation, kick off the experimentation.
 Each experiment runs on the single available CUDA GPU. Do not launch concurrent training jobs, smoke tests, or stacker runs on this machine. The current checked-in `train.py` uses early stopping with patience=3 evals and sub-epoch evaluation roughly 3x/epoch, but the code is the source of truth. Launch it as:
 
 ```bash
-DATASET=ml-25m python3 train.py > run.log 2>&1
+DATASET=ml-25m uv run python train.py > run.log 2>&1
 ```
 
 **Dataset selection** via the `DATASET` env var:
@@ -114,8 +115,8 @@ LOOP FOREVER:
 1. Pick an experiment idea from the backlog (or invent a new one).
 2. Modify `train.py` with the experimental idea.
 3. git commit.
-4. Smoke test: `DATASET=ml-100k python3 train.py` — check it doesn't crash.
-5. Real run: `DATASET=ml-25m python3 train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context).
+4. Smoke test: `DATASET=ml-100k uv run python train.py` — check it doesn't crash.
+5. Real run: `DATASET=ml-25m uv run python train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context).
 6. Read results: `grep "^val_auc:\|^peak_memory_mb:" run.log`
 7. If grep is empty, the run crashed. Run `tail -n 50 run.log` to read the stack trace and attempt a fix. If you can't fix it after a few attempts, give up on this idea.
 8. Record results in `results.tsv` (NOTE: do not commit results.tsv, leave it untracked by git).
