@@ -2,7 +2,9 @@
 
 Predict whether a user will rate a movie >= 4 stars (positive engagement). Hybrid task with hard negatives (rated < 4) and easy negatives (random unrated). ~500 experiments on ml-25m.
 
-**Single model: val_auc = 0.821** | **Ensemble (59 models): val_auc = 0.854** | NVIDIA L4 GPU
+**Best historical single model: val_auc = 0.821** | **Best historical ensemble (59 models): val_auc = 0.854**
+
+The checked-in `train.py` is the restart baseline and may differ from the best historical single-model architecture summarized below. Treat the code as the source of truth for the current implementation, and treat this README as a summary of the best historical results.
 
 ## AUC Progress
 
@@ -29,7 +31,9 @@ xychart-beta
 | Apr 5 | 0.836 | ~450 | LogReg ensemble expanded to 60 models |
 | **Apr 5** | **0.854** | **~500** | **HistGBM stacking of 59 diverse models** |
 
-## Model Architecture
+## Best Historical Single-Model Architecture
+
+This section describes the best historical single-model variant from the Apr 4-5 experiments, not necessarily the exact checked-in `train.py`.
 
 ```mermaid
 graph TD
@@ -165,7 +169,7 @@ Stacking method comparison:
 - Simple average: 0.823
 
 Top ensemble members (by contribution):
-- `fieldattn` (0.821) — current best single model
+- `fieldattn` (0.821) — best historical single model
 - `meanpool` (0.819) — no attention, mean pooling history (correlation 0.944)
 - `ratingpool` (0.819) — rating-weighted mean pooling (correlation ~0.94)
 - `noitemdin` (0.821) — no item-side DIN

@@ -2,16 +2,22 @@
 
 Autonomous experimentation loop for improving pointwise recommendation (AUC) on MovieLens.
 
+## Current operating mode (2026-04-25)
+
+- This repository now runs on a single-GPU machine. Run at most one training job at a time.
+- Older references below to `2x NVIDIA L4`, parallel agents, or simultaneous worktrees are historical logs, not the current operating protocol.
+- Treat `train.py` as the source of truth for the checked-in baseline. Historical bests remain **0.821 single-model** and **0.854 ensemble** until they are re-run on this machine.
+
 ## Setup
 
 To set up a new experiment, work with the user to:
 
-1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar31`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
+1. **Agree on a run tag**: propose a tag based on today's date (e.g. `apr25`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
 2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current main.
 3. **Read the in-scope files**: Read these files for full context:
    - `prepare.py` — fixed: data download/loading, train/val/test splits, AUC evaluation, constants. Do not modify.
    - `train.py` — the file you modify. Feature engineering, model architecture, optimizer, training loop.
-4. **Verify dependencies**: Run `python3 -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"` to confirm CUDA is available.
+4. **Verify dependencies**: Run `python3 -c "import torch; print(torch.cuda.is_available(), torch.cuda.device_count(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu')"` to confirm CUDA is available and only one GPU is visible.
 5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
 6. **Confirm and go**: Confirm setup looks good.
 
@@ -19,7 +25,7 @@ Once you get confirmation, kick off the experimentation.
 
 ## Experimentation
 
-Each experiment runs on NVIDIA L4 GPU (CUDA). Training terminates via early stopping (patience=2 evals, sub-epoch eval 2x/epoch), not a fixed time budget. Launch it as:
+Each experiment runs on the single available CUDA GPU. Do not launch concurrent training jobs, smoke tests, or stacker runs on this machine. The current checked-in `train.py` uses early stopping with patience=3 evals and sub-epoch evaluation roughly 3x/epoch, but the code is the source of truth. Launch it as:
 
 ```bash
 DATASET=ml-25m python3 train.py > run.log 2>&1
@@ -28,8 +34,8 @@ DATASET=ml-25m python3 train.py > run.log 2>&1
 **Dataset selection** via the `DATASET` env var:
 - `ml-100k` — 100K ratings, for quick smoke testing of code changes (~seconds)
 - `ml-1m` — 1M ratings, fast iteration (~minutes)
-- `ml-10m` — 10M ratings, medium scale (~5-15 minutes on L4)
-- `ml-25m` — 25M ratings, **default for experimentation** (~5-10 minutes on L4)
+- `ml-10m` — 10M ratings, medium scale (runtime depends on the current GPU)
+- `ml-25m` — 25M ratings, **default for experimentation** (runtime depends on the current GPU)
 
 Use `ml-100k` to quickly validate that code changes don't crash, then `ml-25m` for real metric comparison.
 
@@ -43,7 +49,7 @@ Use `ml-100k` to quickly validate that code changes don't crash, then `ml-25m` f
 
 **The goal is simple: get the highest val_auc.** Training terminates via early stopping, so you don't need to worry about time budgets. Everything is fair game: change the feature engineering, the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing.
 
-**Memory** is a soft constraint. The NVIDIA L4 has 24 GB VRAM. Some increase is acceptable for meaningful AUC gains, but it should not OOM.
+**Memory** is a soft constraint. Stay within the VRAM budget of the single available GPU. Historical runs fit on a 24 GB L4, but re-check peak memory on the current machine.
 
 **Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude.
 
@@ -134,7 +140,7 @@ Three formulations were tried. AUC is NOT comparable across them — different t
 |-------------|----------|----------|------|-----------|
 | Explicit | rating >= 4 | rating < 4 | BCE | ~0.69 (ml-100k) |
 | Implicit | any rating | random unrated | BPR | ~0.84 (ml-1m) |
-| **Hybrid (current)** | rating >= 4 | rated < 4 (hard) + random unrated (easy) | BCE | ~0.79 (ml-1m), ~0.74 (ml-10m), **0.806 (ml-25m)** |
+| **Hybrid (current)** | rating >= 4 | rated < 4 (hard) + random unrated (easy) | BCE | ~0.79 (ml-1m), ~0.74 (ml-10m), **up to 0.821 historical single-model on ml-25m** |
 
 The hybrid formulation is the current setup. It predicts "will user engage positively?" — suitable for front-page recommendation where you need calibrated probabilities and a threshold.
 
@@ -381,7 +387,7 @@ Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedb
 
 15. **SVD/MF predictions interfere with end-to-end learning.** SVD dot product (0.779) and full SVD factors (0.802) both hurt. The pre-computed collaborative signal conflicts with the jointly trained embeddings rather than complementing them.
 
-### What to try next (on GPU, ml-25m, baseline 0.806)
+### Historical apr03 backlog (on GPU, ml-25m, baseline 0.806 at the time)
 
 > After ~130 experiments across 4 sessions, the model appears near-saturated on MovieLens data.
 > Most remaining ideas are high-risk/low-probability. External data would likely be needed for significant gains.
@@ -411,6 +417,8 @@ Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedb
 - ~~External data~~ — Still untried; only clear path to genuinely new content signal
 
 ---
+
+The next two sections document an older 2-GPU workflow. Keep them as historical experiment logs only; do not follow them on the current single-GPU machine.
 
 ### Experiment log (autoresearch/apr03c) — ml-25m, multi-agent setup
 
@@ -653,7 +661,8 @@ Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedb
 
 ### What to try next (backlog for future sessions)
 
-> Current: single model 0.822, ensemble 0.858. Target: 0.87.
+> Historical checked-in bests: single model 0.821, ensemble 0.854.
+> A later exploratory note below mentions 0.8223 from recency tuning, but it was not committed. Reproduce it before treating it as the current baseline.
 > Single model improvements feed into ensemble — a better base model lifts ALL variants.
 > Curriculum neg sampling TRIED (10 trials, +0.0006 max) — not the breakthrough hoped for.
 > Stacker feature engineering WORKED (+0.003, metadata features help HistGBM).
@@ -686,7 +695,7 @@ The model may be stuck in a local minimum due to over-parameterization. Evidence
 4. **Recency as feature, not data split** — Add recency_decay = exp(-lambda * time_gap) as a dense feature instead of filtering training data. Lets the model learn to weight recent data more.
 
 **Medium priority (discussed, partially explored):**
-5. **Single-model recency tuning** — RECENCY_FRAC=0.8 + LR=1e-4 gave 0.8223 (new single-model best, not committed). Needs full 10-trial sweep with WD/ACCUM/PATIENCE variations.
+5. **Single-model recency tuning** — Exploratory note: `RECENCY_FRAC=0.8 + LR=1e-4` reportedly gave 0.8223, but it was not committed. Needs a clean rerun plus a 10-trial sweep with WD/ACCUM/PATIENCE variations.
 6. **Collaborative filtering features** — Pre-compute ALS/SVD on implicit feedback (all ratings = positive), add top-K latent factors as dense features. Different from the SVD that was tried before (which was on explicit ratings).
 7. **User cluster embeddings** — Soft-cluster users by history similarity (K-means on user_genre_affinity), use cluster ID as a sparse feature. Adds collaborative signal without the overhead of full GNN.
 8. **Replace genre projection with small transformer** (user-suggested) — Model genre interactions (Action+Sci-Fi means different things than either alone). Pushed back due to only 20 genres, but worth 1 trial.
