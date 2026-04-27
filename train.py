@@ -76,6 +76,8 @@ USER_HIST_MODE = os.environ.get("USER_HIST_MODE", "rating")  # din | mean | rati
 ITEM_HIST_MODE = os.environ.get("ITEM_HIST_MODE", "din")  # din | mean | off
 USER_HIST_CONTEXT = os.environ.get("USER_HIST_CONTEXT", "causal_masked")  # static | causal_masked
 ITEM_HIST_CONTEXT = os.environ.get("ITEM_HIST_CONTEXT", "causal_masked")  # static | causal_masked
+GENOME_FUSION_MODE = os.environ.get("GENOME_FUSION_MODE", "legacy")  # legacy | mask_only
+USER_GENOME = os.environ.get("USER_GENOME", "off")  # off | scalar_dot
 USE_CAUSAL_SA = _env_flag("USE_CAUSAL_SA", True)
 USE_TORCH_COMPILE = _env_flag("USE_TORCH_COMPILE", True)
 
@@ -85,6 +87,10 @@ if USER_HIST_CONTEXT not in {"static", "causal_masked"}:
     raise ValueError(f"Unknown USER_HIST_CONTEXT: {USER_HIST_CONTEXT}")
 if ITEM_HIST_CONTEXT not in {"static", "causal_masked"}:
     raise ValueError(f"Unknown ITEM_HIST_CONTEXT: {ITEM_HIST_CONTEXT}")
+if GENOME_FUSION_MODE not in {"legacy", "mask_only"}:
+    raise ValueError(f"Unknown GENOME_FUSION_MODE: {GENOME_FUSION_MODE}")
+if USER_GENOME not in {"off", "scalar_dot"}:
+    raise ValueError(f"Unknown USER_GENOME: {USER_GENOME}")
 
 # ─── Device ─────────────────────────────────────────────────────────
 torch.manual_seed(SEED)
@@ -104,7 +110,8 @@ log.info(
     f"user_ctx={USER_HIST_CONTEXT} | item_ctx={ITEM_HIST_CONTEXT} | "
     f"causal_sa={USE_CAUSAL_SA} | dim={EMBED_DIM} | item_hist_len={ITEM_HIST_LEN} | "
     f"train_neg={TRAIN_NEG_MODE} | post_recency_resample={POST_RECENCY_NEG_RESAMPLE} "
-    f"| easy_neg_per_pos={POST_RECENCY_EASY_NEG_PER_POS:.2f}"
+    f"| easy_neg_per_pos={POST_RECENCY_EASY_NEG_PER_POS:.2f} "
+    f"| genome_fusion={GENOME_FUSION_MODE} | user_genome={USER_GENOME}"
 )
 
 # ─── Load Data ──────────────────────────────────────────────────────
@@ -125,7 +132,7 @@ log.info(f"Dataset: {DATASET} | Users: {num_users} | Items: {num_items} | "
 
 import hashlib, json
 _cache_key = hashlib.md5(json.dumps({
-    "feature_version": 2,
+    "feature_version": 5,
     "dataset": DATASET, "neg_ratio": NEG_RATIO,
     "history_len": HISTORY_LEN, "item_hist_len": ITEM_HIST_LEN,
     "num_users": num_users, "num_items": num_items,
@@ -154,6 +161,8 @@ if _cache_path.exists():
     movie_genre_count = _cache["movie_genre_count"]
     genome_matrix = _cache["genome_matrix"]
     has_genome = _cache["has_genome"]
+    user_genome = _cache["user_genome"]
+    has_user_genome = _cache["has_user_genome"]
     GENOME_DIM = genome_matrix.shape[1]
     PAD_IDX = num_items
     USER_PAD_IDX = num_users
@@ -308,6 +317,28 @@ else:
         has_genome = np.zeros(num_items, dtype=np.float32)
     GENOME_DIM = genome_matrix.shape[1]
 
+    # 9. Per-user genome profile: mean of genome relevance vectors over user's high-rated genome-having items.
+    log.info("Computing user genome profiles...")
+    user_genome = np.zeros((num_users, GENOME_DIM), dtype=np.float32)
+    _ug_count = np.zeros(num_users, dtype=np.float32)
+    _hr_mask = (real_train["rating"].values >= 4.0)
+    _hr_uids = real_train["userId"].values[_hr_mask].astype(np.int64)
+    _hr_mids = real_train["movieId"].values[_hr_mask].astype(np.int64)
+    _has_g = has_genome[_hr_mids] > 0
+    _hr_uids = _hr_uids[_has_g]
+    _hr_mids = _hr_mids[_has_g]
+    _chunk = 500_000
+    for i in range(0, len(_hr_uids), _chunk):
+        u_chunk = _hr_uids[i:i + _chunk]
+        m_chunk = _hr_mids[i:i + _chunk]
+        np.add.at(user_genome, u_chunk, genome_matrix[m_chunk])
+        np.add.at(_ug_count, u_chunk, 1.0)
+    _has_ug = _ug_count > 0
+    user_genome[_has_ug] /= _ug_count[_has_ug, None]
+    has_user_genome = _has_ug.astype(np.float32)
+    log.info(f"User genome: {int(_has_ug.sum())}/{num_users} users with profile ({_has_ug.mean()*100:.1f}%)")
+    del _hr_mask, _hr_uids, _hr_mids, _has_g, _has_ug, _ug_count
+
     # Save cache
     np.savez_compressed(_cache_path,
         movie_genres=movie_genres, user_hist_bins=user_hist_bins,
@@ -319,6 +350,7 @@ else:
         ts_min=np.array(ts_min), ts_range=np.array(ts_range),
         movie_year=movie_year, movie_genre_count=movie_genre_count,
         genome_matrix=genome_matrix, has_genome=has_genome,
+        user_genome=user_genome, has_user_genome=has_user_genome,
     )
     log.info(f"Features cached to {_cache_path.name}")
 
@@ -400,6 +432,8 @@ _item_hist_ts_gpu = torch.from_numpy(item_hist_timestamps).to(DEVICE)   # (num_i
 _movie_genres_gpu = torch.from_numpy(movie_genres).to(DEVICE)           # (num_items, G)
 _genome_gpu = torch.from_numpy(genome_matrix).to(DEVICE)               # (num_items, GENOME_DIM)
 _has_genome_gpu = torch.from_numpy(has_genome).to(DEVICE)              # (num_items,)
+_user_genome_gpu = torch.from_numpy(user_genome).to(DEVICE).half()     # (num_users, GENOME_DIM) fp16
+_has_user_genome_gpu = torch.from_numpy(has_user_genome).to(DEVICE)    # (num_users,)
 
 def _build_gpu_tensors(df):
     """Precompute per-sample features on GPU. Histories/genres looked up at training time."""
@@ -506,6 +540,7 @@ def run_eval():
                 _movie_genres_gpu[m],
                 _item_histories_gpu[m], _item_hist_ratings_gpu[m], _item_hist_ts_gpu[m],
                 _genome_gpu[m], _has_genome_gpu[m],
+                _user_genome_gpu[u], _has_user_genome_gpu[u],
             )
             all_scores.append(torch.sigmoid(logits).cpu().numpy())
 
@@ -574,7 +609,17 @@ class DLRM(nn.Module):
             nn.Dropout(0.1),
             nn.Linear(64, D),
         )
-        self.genome_gate = nn.Linear(D, D)  # sigmoid gate to blend genome with item_embed fallback
+        # sigmoid gate to blend genome with item_embed fallback
+        self.genome_fusion_mode = GENOME_FUSION_MODE
+        if GENOME_FUSION_MODE == "legacy":
+            self.genome_gate = nn.Linear(D, D)
+        elif GENOME_FUSION_MODE == "mask_only":
+            self.genome_gate = nn.Linear(1, D)
+
+        # User × item content alignment scalar → small projection added to genome_field.
+        self.user_genome_mode = USER_GENOME
+        if USER_GENOME == "scalar_dot":
+            self.ug_dot_proj = nn.Linear(1, D)
 
         # Squeeze-and-Excitation: learn per-field importance weights
         cross_dim = 7 * D  # user, item, user_hist(DIN), item_hist(DIN), dense, genre, genome
@@ -612,7 +657,8 @@ class DLRM(nn.Module):
                     nn.init.zeros_(m.weight[m.padding_idx])
 
     def forward(self, user_id, movie_id, dense, history, hist_ratings, hist_timestamps, sample_timestamps,
-                genres, item_hist, item_hist_ratings, item_hist_timestamps, genome_raw, has_genome_mask):
+                genres, item_hist, item_hist_ratings, item_hist_timestamps, genome_raw, has_genome_mask,
+                user_genome_raw=None, has_user_genome_mask=None):
         user_e = nn.functional.dropout(self.user_embed(user_id), 0.1, self.training)
         item_e = nn.functional.dropout(self.item_embed(movie_id), 0.1, self.training)
         hist_valid = history != PAD_IDX
@@ -682,8 +728,21 @@ class DLRM(nn.Module):
 
         # Tag genome: learned compression with gating
         genome_e = self.genome_proj(genome_raw)                           # (B, D)
-        gate = torch.sigmoid(self.genome_gate(genome_e))                  # (B, D)
+        if self.genome_fusion_mode == "legacy":
+            gate_input = genome_e
+        elif self.genome_fusion_mode == "mask_only":
+            gate_input = has_genome_mask.unsqueeze(-1)                    # (B, 1)
+        gate = torch.sigmoid(self.genome_gate(gate_input))                # (B, D)
         genome_field = gate * genome_e + (1 - gate) * item_e.detach()     # blend genome with item fallback
+
+        # User × item content alignment: dot(user_genome, item_genome) / GENOME_DIM
+        # → Linear(1, D) → added to genome_field. Bounded magnitude, minimal capacity.
+        if self.user_genome_mode == "scalar_dot":
+            ug_raw = user_genome_raw.float()
+            dot = (ug_raw * genome_raw).sum(dim=-1, keepdim=True) / GENOME_DIM  # (B, 1)
+            valid = has_user_genome_mask.unsqueeze(-1) * has_genome_mask.unsqueeze(-1)
+            dot = dot * valid
+            genome_field = genome_field + self.ug_dot_proj(dot)           # (B, D)
 
         # Squeeze-and-Excitation: learn per-field importance weights
         fields = torch.stack([user_e, item_e, user_hist_e, item_hist_e, dense_e, genre_e, genome_field], dim=1)  # (B, 7, D)
@@ -743,6 +802,7 @@ while True:
                 _item_histories_gpu[m_batch], _item_hist_ratings_gpu[m_batch],
                 _item_hist_ts_gpu[m_batch],
                 _genome_gpu[m_batch], _has_genome_gpu[m_batch],
+                _user_genome_gpu[u_batch], _has_user_genome_gpu[u_batch],
             )
             # Label smoothing: soft targets
             smooth_labels = train_labels[idx] * 0.9 + 0.05
