@@ -2,7 +2,7 @@
 
 Predict whether a user will rate a movie >= 4 stars (positive engagement). Hybrid task with hard negatives (rated < 4) and easy negatives (random unrated). ~500 experiments on ml-25m.
 
-**Best historical single model: val_auc = 0.821** | **Best historical ensemble (59 models): val_auc = 0.854**
+**Best historical single model: val_auc = 0.821**
 
 The checked-in `train.py` is the restart baseline and may differ from the best historical single-model architecture summarized below. Treat the code as the source of truth for the current implementation, and treat this README as a summary of the best historical results.
 
@@ -11,11 +11,10 @@ The checked-in `train.py` is the restart baseline and may differ from the best h
 ```mermaid
 %%{init: {'theme': 'default'}}%%
 xychart-beta
-    title "AUC Improvement Over Time (~500 experiments)"
-    x-axis ["apr01", "apr01", "apr01", "apr01", "apr02", "apr02", "apr02", "apr02", "apr03c", "apr03c", "apr03e", "apr03e", "apr03e", "apr03e", "apr04", "apr04", "apr05", "apr05"]
-    y-axis "val_auc" 0.76 --> 0.86
-    line "Single Model" [0.770, 0.781, 0.793, 0.799, 0.802, 0.804, 0.806, 0.806, 0.811, 0.814, 0.817, 0.820, 0.821, 0.821, 0.821, 0.821, 0.821, 0.821]
-    line "Ensemble" [0.770, 0.781, 0.793, 0.799, 0.802, 0.804, 0.806, 0.806, 0.811, 0.814, 0.817, 0.820, 0.821, 0.821, 0.824, 0.824, 0.836, 0.854]
+    title "AUC Improvement Over Time (~250 single-model experiments)"
+    x-axis ["apr01", "apr01", "apr01", "apr01", "apr02", "apr02", "apr02", "apr02", "apr03c", "apr03c", "apr03e", "apr03e", "apr03e", "apr03e", "apr04"]
+    y-axis "val_auc" 0.76 --> 0.83
+    line "Single Model" [0.770, 0.781, 0.793, 0.799, 0.802, 0.804, 0.806, 0.806, 0.811, 0.814, 0.817, 0.820, 0.821, 0.821, 0.821]
 ```
 
 ### Key milestones
@@ -26,10 +25,7 @@ xychart-beta
 | Apr 1 | 0.799 | ~30 | HISTORY_LEN=100, 3 GDCN layers, causal self-attention |
 | Apr 2 | 0.806 | ~120 | Rating histograms, 4 GDCN layers, embed_dim=28 |
 | Apr 3 | 0.814 | ~170 | Tag genome with learned bottleneck compression |
-| Apr 4 | 0.821 | ~250 | NEG_RATIO=1, WD=5e-5, ACCUM=4, LR=8e-5 |
-| Apr 4-5 | 0.824 | ~350 | LogReg ensemble (22 diverse model variants) |
-| Apr 5 | 0.836 | ~450 | LogReg ensemble expanded to 60 models |
-| **Apr 5** | **0.854** | **~500** | **HistGBM stacking of 59 diverse models** |
+| **Apr 4** | **0.821** | **~250** | **NEG_RATIO=1, WD=5e-5, ACCUM=4, LR=8e-5** |
 
 ## Best Historical Single-Model Architecture
 
@@ -155,25 +151,3 @@ graph TD
 \*\* **Tag genome gating:** 78% of movies lack genome data. The sigmoid gate learns to fall back to `item_e` when genome features are zeros. PCA compression failed (0.798); the learned 3-layer bottleneck MLP succeeds (0.811→0.814).
 
 \*\*\* **Field attention replaces GDCN:** 1-head multi-head attention across 7 feature fields with additive residual. Simpler than 4 gated cross layers, slightly better AUC (0.8207 vs 0.8201).
-
-## Ensemble
-
-The best results come from ensembling architecturally diverse models. Key insight: models need **low prediction correlation** to provide complementary signal.
-
-**Best ensemble: 0.8534 AUC** (HistGBM stacking, 59 models, 3-fold CV)
-
-Stacking method comparison:
-- HistGBM (iter=300, depth=6, lr=0.2): **0.854**
-- MLP (2-layer, 128 hidden): 0.850
-- LogReg (C=0.5): 0.836
-- Simple average: 0.823
-
-Top ensemble members (by contribution):
-- `fieldattn` (0.821) — best historical single model
-- `meanpool` (0.819) — no attention, mean pooling history (correlation 0.944)
-- `ratingpool` (0.819) — rating-weighted mean pooling (correlation ~0.94)
-- `noitemdin` (0.821) — no item-side DIN
-- `nostream` (0.818) — no two-stream separation
-- `dim16` (0.818) — embed_dim=16, much smaller model
-
-Models with >0.97 prediction correlation with fieldattn (GDCN, nogenome) add little ensemble value. The most valuable partners are those with fundamentally different inductive biases.

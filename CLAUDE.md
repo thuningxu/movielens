@@ -7,7 +7,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Research repo for movie recommendation on MovieLens. Uses a hybrid engagement prediction task: predict whether a user will rate a movie >= 4 stars, with both "watched but didn't like" (hard negatives) and "random unrated" (easy negatives) as label=0. Output is a calibrated probability via BCE loss, suitable for front-page recommendation with a threshold.
 
 Best historical single-model AUC: **0.821 on ml-25m** (deterministic, SEED=42).
-Best historical ensemble AUC: **0.854 on ml-25m** (HistGBM stacking of 59 diverse model variants, 3-fold CV validated).
 The checked-in `train.py` is the restart baseline and is not the exact historical field-attention/two-stream model. Treat `train.py` as the source of truth for the current baseline and `program.md` as the experiment history.
 See `program.md` for full experiment history (~500 experiments). See `README.md` for AUC progress chart.
 
@@ -84,6 +83,4 @@ See `program.md` for the full list. The most important:
 6. **HP combinations stack.** NEG_RATIO + WD + ACCUM_STEPS + LR each contributed incrementally for +0.006 total.
 7. **Time-valid easy negatives matter.** Replacing synthetic median-timestamp train negatives with anchored positive-event timestamps and catalog-valid sampled items improved the checked-in baseline to ~0.8238 on `ml-25m`.
 8. **Field attention > GDCN.** 1-head MHA across 7 fields with residual slightly beats 4 gated cross layers (0.8207 vs 0.8201). Simpler and fewer parameters.
-9. **Diverse ensemble is the breakthrough path.** 59 architecturally diverse models ensembled via HistGBM stacking: 0.854. Key: low prediction correlation between partners, not high individual AUC. GBM captures non-linear model complementarity that LogReg misses.
-10. **10-trial HP sweeps per idea.** Never test an architecture idea once and discard. The NEG_RATIO breakthrough came from systematic HP sweep after the "ceiling" was declared.
-11. **HistGBM >> LogReg for stacking.** LogReg: 0.836, MLP: 0.850, HistGBM: 0.854. Non-linear stacking is critical when models have diverse error patterns.
+9. **10-trial HP sweeps per idea.** Never test an architecture idea once and discard. The NEG_RATIO breakthrough came from systematic HP sweep after the "ceiling" was declared.

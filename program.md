@@ -6,7 +6,7 @@ Autonomous experimentation loop for improving pointwise recommendation (AUC) on 
 
 - This repository now runs on a single-GPU machine. Run at most one training job at a time.
 - Older references below to `2x NVIDIA L4`, parallel agents, or simultaneous worktrees are historical logs, not the current operating protocol.
-- Treat `train.py` as the source of truth for the checked-in baseline. Historical bests remain **0.821 single-model** and **0.854 ensemble** until they are re-run on this machine.
+- Treat `train.py` as the source of truth for the checked-in baseline. Historical best remains **0.821 single-model** until re-run on this machine.
 
 ## Current autonomous loop (single GPU, 3 roles)
 
@@ -43,7 +43,7 @@ Once you get confirmation, kick off the experimentation.
 
 ## Experimentation
 
-Each experiment runs on the single available CUDA GPU. Do not launch concurrent training jobs, smoke tests, or stacker runs on this machine. The current checked-in `train.py` uses early stopping with patience=3 evals and sub-epoch evaluation roughly 3x/epoch, but the code is the source of truth. Launch it as:
+Each experiment runs on the single available CUDA GPU. Do not launch concurrent training jobs or smoke tests on this machine. The current checked-in `train.py` uses early stopping with patience=3 evals and sub-epoch evaluation roughly 3x/epoch, but the code is the source of truth. Launch it as:
 
 ```bash
 DATASET=ml-25m uv run python train.py 2>&1 | tee run.log
@@ -418,7 +418,7 @@ Reference: LightFM achieves ~0.86 (BPR) / ~0.90 (WARP) on ml-100k implicit feedb
 - xDeepFM CIN 2-layer — 0.790 (explicit crosses overfit badly)
 - Trained LightGCN BPR embeddings — crash (sparse matmul too slow on 25m)
 - Poly-1 loss — 0.806 (neutral)
-- Snapshot ensemble (avg top-2 weights) — 0.806 (2nd best too weak)
+- Snapshot averaging (avg top-2 weights) — 0.806 (2nd best too weak)
 - Asymmetric loss pos_weight=2.0 — 0.805 (neutral)
 - R-Drop KL regularization — 0.806 (neutral; 2x slower)
 - Embedding mixup alpha=0.2 — 0.806 (neutral; 2x slower)
@@ -546,7 +546,7 @@ The next two sections document an older 2-GPU workflow. Keep them as historical 
 #### Experiment results
 
 **apr03d (6 experiments, all ≤0.8139):**
-- Cross-network projection, genome-gated DIN, ensemble, attention pooling — all neutral/worse
+- Cross-network projection, genome-gated DIN, attention pooling — all neutral/worse
 
 ---
 
@@ -573,22 +573,19 @@ The next two sections document an older 2-GPU workflow. Keep them as historical 
 
 **Critic-driven findings:**
 - The Critic pre-screened and killed 2 proposals (embed_dim=32 and temporal decay) that would have wasted GPU time based on prior failures
-- Ensemble test proved genome model has no complementary error pattern with non-genome variant
 - Attention pooling is strictly worse than MLP bottleneck for genome compression
 - Honest assessment: 0.820 is not achievable without external data. Realistic ceiling is ~0.815.
 
 **Key learnings (apr03d):**
 16. **The Critic role saves GPU time.** Pre-screening killed embed_dim=32 (failed 4x) and temporal decay (failed 2x) before wasting runs. Validated prior experiment conclusions hold.
-17. **Ensembling a model with its ablation provides no complementarity.** The genome model strictly subsumes the non-genome model — errors are correlated, not diverse.
-18. **MLP bottleneck > attention for genome compression.** Softmax over 1128 dims spreads too thin. Fixed bottleneck (256→64→D) forces useful compression.
-19. **0.8138 appears to be near the ceiling for MovieLens-25m with this task formulation.** After 175+ experiments, all architectural/training changes are neutral (±0.002). Only genuinely new data (tag genome) moved the needle.
+17. **MLP bottleneck > attention for genome compression.** Softmax over 1128 dims spreads too thin. Fixed bottleneck (256→64→D) forces useful compression.
+18. **0.8138 appears to be near the ceiling for MovieLens-25m with this task formulation.** After 175+ experiments, all architectural/training changes are neutral (±0.002). Only genuinely new data (tag genome) moved the needle.
 
 ---
 
-### Experiment log (autoresearch/apr04) — ml-25m, architecture + ensemble
+### Experiment log (autoresearch/apr04) — ml-25m, architecture sweep
 
-> **0.8210 single model → 0.8242 ensemble. ~200 experiments.**
-> Target: 0.84. Key breakthrough: diverse architecture ensemble.
+> **0.8210 single model. ~200 experiments.**
 
 **Kept single-model improvements** (building on 0.8201):
 
@@ -596,22 +593,6 @@ The next two sections document an older 2-GPU workflow. Keep them as historical 
 |---|-----------|-----|-------|
 | 1 | Replace GDCN with 1-head field attention, WD=3e-5 | 0.8207 | +0.001 |
 | 2 | History residual (raw + contextual), WD=5e-5 | 0.8210 | +0.000 |
-
-**Ensemble results:**
-
-| Ensemble | Method | AUC |
-|----------|--------|-----|
-| Best 3-model (fieldattn+meanpool+gdcn) | Simple average | 0.8228 |
-| Best 5-model (fieldattn+ratingpool+nostream+noitemdin+dim16) | Simple average | 0.8234 |
-| Best 22-model | LogReg stacking (5-fold CV, C=0.0005) | **0.8242** |
-| Best 5-model rank-based | Rank averaging | 0.8236 |
-
-**Ensemble members trained (22 variants):**
-- fieldattn (0.821), gdcn (0.819), meanpool (0.819), nogenome (0.807)
-- ratingpool (0.819), dinonly (0.818), neg3 (0.814), dim16 (0.818), nostream (0.818)
-- hist30 (0.821), noitemdin (0.821), minimal (0.806), gdcn_slow (0.817), film (0.817)
-- revhist (0.821), hist10 (0.820), dim56 (0.818)
-- mf (0.780), widedeep (0.816), itemonly (0.818), neg0 (0.759), regression (0.812)
 
 **Discarded architecture ideas (~200 experiments, all ≤0.8210 single model):**
 - SASRec transformer (10 trials): 0.803-0.813 (strictly worse than causal SA + DIN)
@@ -630,23 +611,20 @@ The next two sections document an older 2-GPU workflow. Keep them as historical 
 - Cosine annealing, warmup, SWA: all neutral
 - Separate LR for embeddings/MLPs: all worse
 - Data augmentation (masking, noise, dropout): all neutral
-- Different seeds, ensemble of same architecture: negligible variance
+- Different seeds: negligible variance
 - 90/5/5 split: not comparable (different eval set)
 
 **Key learnings (apr04):**
 24. **Field attention is a slight improvement over GDCN.** 1-head MHA across 7 fields beats 4 gated cross layers (0.8207 vs 0.8201). Simpler, fewer params, slightly better.
-25. **Diverse ensemble is the breakthrough.** +0.003 from single model. The key is architectural diversity (low prediction correlation), not number of models. Mean pool (0.944 corr) >> GDCN (0.979 corr) as ensemble partner.
-26. **SASRec/transformers are worse than DIN.** 10 trials of transformer-based sequence models all regressed -0.01 to -0.02. The lightweight causal SA + DIN combination is better suited to this task.
-27. **GRU/DIEN is worse than causal SA.** Sequential processing loses to parallel attention on this data.
-28. **The single-model architecture is saturated.** After 200 architecture experiments at 0.8210, no modification improves. The model topology is well-matched to MovieLens features.
-29. **Ensemble beats single model when diversity is high.** Models with different inductive biases (mean pool, no DIN, small dims) contribute more than similar-architecture variants.
+25. **SASRec/transformers are worse than DIN.** 10 trials of transformer-based sequence models all regressed -0.01 to -0.02. The lightweight causal SA + DIN combination is better suited to this task.
+26. **GRU/DIEN is worse than causal SA.** Sequential processing loses to parallel attention on this data.
+27. **The single-model architecture is saturated.** After 200 architecture experiments at 0.8210, no modification improves. The model topology is well-matched to MovieLens features.
 
 ---
 
-### Experiment log (autoresearch/apr05) — ml-25m, recency + ensemble expansion
+### Experiment log (autoresearch/apr05) — ml-25m, single-model exploration
 
-> **Ensemble expanded from 0.8242 to 0.8339 via recency-diverse models. ~20 experiments.**
-> Key discovery: models trained on different time slices provide massive ensemble diversity.
+> **No further single-model improvement over 0.8210. ~20 experiments.**
 
 **Single-model results (no improvement over 0.8210):**
 - Temporal features (hour/day): hurt (0.816)
@@ -655,37 +633,11 @@ The next two sections document an older 2-GPU workflow. Keep them as historical 
 - Asymmetric DIN: 0.820 (closest, not significant)
 - 2-layer field attention, deeper bottom MLP, higher LR: all worse
 
-**Recency-diverse models for ensemble:**
-- recent50 (train on recent 50% only): 0.815-0.823 (varies by implementation)
-- recent40/60/70/80: 0.814-0.817 (less data = lower individual AUC)
-- old50: 0.793 (old data is very noisy for recent prediction)
-- recent50_meanpool: 0.815 (mean pool variant)
-- recent50_noitemdin: 0.815
-
-**Ensemble expansion:**
-
-| Ensemble | Method | AUC | Models |
-|----------|--------|-----|--------|
-| apr04 baseline | LogReg 22 models | 0.8242 | Architecture-diverse |
-| + recency variants | LogReg 40 models | 0.8339 | + 18 recency/diversity |
-| + more variants | LogReg 60 models | 0.8364 | + 20 extreme variants |
-| **HistGBM stacking** | **HistGBM 59 models** | **0.8534** | Non-linear stacking |
-| MLP stacking | MLP 59 models | 0.8495 | 2-layer neural stacking |
-
-**Key learnings (apr05):**
-30. **Recency-diverse models are the best ensemble partners.** Models trained on different time slices make different errors because user preferences drift. Even weak individual models (0.81) contribute to ensemble via low correlation.
-31. **The ensemble path has more headroom than single-model.** Going from 22→40 models gave +0.010 AUC. Each maximally-diverse variant adds ~0.001-0.002 to the ensemble.
-32. **Old ratings are noisy for recent prediction.** Training on only recent data sometimes gives higher single-model AUC, but the effect depends on feature engineering (which uses full history).
-33. **HistGBM >> LogReg for stacking.** Non-linear stacking (HistGBM: 0.854) massively outperforms linear (LogReg: 0.836) on 59 diverse models. GBM learns which model to trust for which samples. 3-fold CV validated.
-34. **59 diverse models span the full architecture space.** Variants include: field attention, GDCN, mean pool, DIN-only, no-DIN, small/large embeddings, different NEG_RATIO (0-8), recency filters (25-90%), label noise, pure MF, wide&deep, regression loss, shuffled history, etc.
-
 ### What to try next (backlog for future sessions)
 
-> Historical checked-in bests: single model 0.821, ensemble 0.854.
+> Historical checked-in best: single model 0.821.
 > Restart update (2026-04-26): the checked-in SE baseline on this branch now reproduces at **0.82628** on `ml-25m` with `RECENCY_FRAC=0.8`, `LR=7e-5`, `WEIGHT_DECAY=1e-4`, `ACCUM_STEPS=2`, `TRAIN_NEG_MODE=anchor_pos_catalog`, `POST_RECENCY_NEG_RESAMPLE=1`, `POST_RECENCY_EASY_NEG_PER_POS=0.75`, `USER_HIST_MODE=rating`, `USER_HIST_CONTEXT=causal_masked`, and `ITEM_HIST_CONTEXT=causal_masked`.
-> Single model improvements feed into ensemble — a better base model lifts ALL variants.
 > Curriculum neg sampling TRIED (10 trials, +0.0006 max) — not the breakthrough hoped for.
-> Stacker feature engineering WORKED (+0.003, metadata features help HistGBM).
 
 #### NEW: Simplification hypothesis (apr06 discussion)
 The model may be stuck in a local minimum due to over-parameterization. Evidence:
@@ -699,7 +651,6 @@ The model may be stuck in a local minimum due to over-parameterization. Evidence
 2. Tune the minimal model aggressively (LR, WD, dropout, dim sweep)
 3. Add components back ONE AT A TIME, measure each contribution
 4. If minimal model matches ~0.820, it's a better base for exploration (fewer params, cleaner gradients)
-5. Generate ensemble variants from simplified model (different inductive bias = more diversity)
 
 #### NEW: Inter-rating timing features (low priority, 2-3 trials)
 - Burstiness: std/mean of inter-rating time gaps per user
@@ -724,20 +675,6 @@ The model may be stuck in a local minimum due to over-parameterization. Evidence
 9. **HSTU architecture** — Hierarchical sequential transduction (Meta, ICML 2024). Complete model rewrite. Prior SASRec attempt failed, but HSTU is fundamentally different (hierarchical, not flat).
 10. **External data** — IMDB plot summaries via links.csv → IMDB API. Poster images. Not in MovieLens but the only clear path to genuinely new content signal.
 11. **PinSage** — GraphSAGE with random walk sampling on user-item bipartite graph. LightGCN failed (sparse matmul too slow), but PinSage uses sampling which scales better.
-
-#### Ensemble ideas (not yet tried)
-
-**High priority:**
-1. **Rebuild ensemble on improved single model** — If single model goes from 0.821→0.823, retrain all 59 variants from the new base and re-stack. Could push ensemble from 0.854→0.86+.
-2. **HistGBM hyperparameter optimization** — Current best was iter=300, depth=6, lr=0.2. Full GridSearchCV might find better. Also try XGBoost, LightGBM, CatBoost.
-3. **Train more recency variants** — KEEP_FRAC=0.15, 0.35, 0.45, 0.55, 0.65, 0.85, 0.95. Each adds ensemble diversity.
-4. **Curriculum-trained models for ensemble** — If curriculum neg sampling works (#1 above), train 5 variants with different curriculum schedules.
-
-**Medium priority:**
-5. **Factorization machine on ensemble predictions** — FM on (pred_i, pred_j) pairs captures interaction effects that LogReg/GBM may miss.
-6. **Two-stage stacking** — First stage: 5 LogReg meta-learners on subsets of models. Second stage: GBM on the 5 meta-learner outputs.
-7. **SHAP-driven model pruning** — Use SHAP to identify which of the 59 models actually contribute. Remove dead weight to reduce overfitting risk.
-8. **Dropout-based ensemble** — Train 1 model with high dropout (0.4), generate 10 stochastic predictions from the same checkpoint. Cheap diversity.
 
 ### Useful references
 

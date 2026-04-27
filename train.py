@@ -78,8 +78,6 @@ USER_HIST_CONTEXT = os.environ.get("USER_HIST_CONTEXT", "causal_masked")  # stat
 ITEM_HIST_CONTEXT = os.environ.get("ITEM_HIST_CONTEXT", "causal_masked")  # static | causal_masked
 USE_CAUSAL_SA = _env_flag("USE_CAUSAL_SA", True)
 USE_TORCH_COMPILE = _env_flag("USE_TORCH_COMPILE", True)
-SAVE_EVAL_PRED_PATH = os.environ.get("SAVE_EVAL_PRED_PATH")
-VARIANT_NAME = os.environ.get("VARIANT_NAME", "baseline")
 
 if TRAIN_NEG_MODE not in {"global", "anchor_pos", "anchor_pos_catalog"}:
     raise ValueError(f"Unknown TRAIN_NEG_MODE: {TRAIN_NEG_MODE}")
@@ -101,7 +99,7 @@ torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 torch.set_float32_matmul_precision('high')  # enable TF32 tensor cores
 log.info(
-    f"Device: {DEVICE} | Variant: {VARIANT_NAME} | "
+    f"Device: {DEVICE} | "
     f"user_hist={USER_HIST_MODE} | item_hist={ITEM_HIST_MODE} | "
     f"user_ctx={USER_HIST_CONTEXT} | item_ctx={ITEM_HIST_CONTEXT} | "
     f"causal_sa={USE_CAUSAL_SA} | dim={EMBED_DIM} | item_hist_len={ITEM_HIST_LEN} | "
@@ -492,7 +490,7 @@ n_eval = len(_eval_users)
 log.info(f"Eval set: {_n_val_pos} pos + {len(_val_hard_neg)} hard neg + {_n_val_pos} easy neg = {n_eval} total")
 
 
-def run_eval(return_scores=False):
+def run_eval():
     """Evaluate AUC on validation set."""
     model.eval()
     eval_batch = BATCH_SIZE * 2
@@ -512,10 +510,7 @@ def run_eval(return_scores=False):
             all_scores.append(torch.sigmoid(logits).cpu().numpy())
 
     scores = np.concatenate(all_scores)
-    metrics = evaluate(_eval_labels, scores)
-    if return_scores:
-        return metrics, scores
-    return metrics
+    return evaluate(_eval_labels, scores)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -802,29 +797,7 @@ if best_state is not None:
     model.load_state_dict(best_state)
     log.info(f"Restored best model (AUC: {best_auc:.4f})")
 
-metrics, final_scores = run_eval(return_scores=True)
+metrics = run_eval()
 total_seconds = time.time() - total_start
-
-if SAVE_EVAL_PRED_PATH:
-    pred_path = Path(SAVE_EVAL_PRED_PATH)
-    pred_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        pred_path,
-        labels=_eval_labels.astype(np.float32),
-        scores=final_scores.astype(np.float32),
-        variant=np.array(VARIANT_NAME),
-        dataset=np.array(DATASET),
-        user_hist_mode=np.array(USER_HIST_MODE),
-        item_hist_mode=np.array(ITEM_HIST_MODE),
-        user_hist_context=np.array(USER_HIST_CONTEXT),
-        item_hist_context=np.array(ITEM_HIST_CONTEXT),
-        train_neg_mode=np.array(TRAIN_NEG_MODE),
-        post_recency_neg_resample=np.array(POST_RECENCY_NEG_RESAMPLE),
-        post_recency_easy_neg_per_pos=np.array(POST_RECENCY_EASY_NEG_PER_POS, dtype=np.float32),
-        embed_dim=np.array(EMBED_DIM),
-        item_hist_len=np.array(ITEM_HIST_LEN),
-        recency_frac=np.array(RECENCY_FRAC, dtype=np.float32),
-    )
-    log.info(f"Saved eval predictions to {pred_path}")
 
 print_summary(metrics, training_seconds, total_seconds, peak_memory_mb, num_params, stats)
