@@ -70,6 +70,8 @@ PATIENCE = int(os.environ.get("PATIENCE", "3"))
 ACCUM_STEPS = int(os.environ.get("ACCUM_STEPS", "2"))
 RECENCY_FRAC = float(os.environ.get("RECENCY_FRAC", "0.8"))
 TRAIN_NEG_MODE = os.environ.get("TRAIN_NEG_MODE", "anchor_pos_catalog")  # global | anchor_pos | anchor_pos_catalog
+POST_RECENCY_NEG_RESAMPLE = _env_flag("POST_RECENCY_NEG_RESAMPLE", False)
+POST_RECENCY_EASY_NEG_PER_POS = float(os.environ.get("POST_RECENCY_EASY_NEG_PER_POS", "1.25"))
 USER_HIST_MODE = os.environ.get("USER_HIST_MODE", "rating")  # din | mean | rating
 ITEM_HIST_MODE = os.environ.get("ITEM_HIST_MODE", "din")  # din | mean | off
 USER_HIST_CONTEXT = os.environ.get("USER_HIST_CONTEXT", "causal_masked")  # static | causal_masked
@@ -103,7 +105,8 @@ log.info(
     f"user_hist={USER_HIST_MODE} | item_hist={ITEM_HIST_MODE} | "
     f"user_ctx={USER_HIST_CONTEXT} | item_ctx={ITEM_HIST_CONTEXT} | "
     f"causal_sa={USE_CAUSAL_SA} | dim={EMBED_DIM} | item_hist_len={ITEM_HIST_LEN} | "
-    f"train_neg={TRAIN_NEG_MODE}"
+    f"train_neg={TRAIN_NEG_MODE} | post_recency_resample={POST_RECENCY_NEG_RESAMPLE} "
+    f"| easy_neg_per_pos={POST_RECENCY_EASY_NEG_PER_POS:.2f}"
 )
 
 # ─── Load Data ──────────────────────────────────────────────────────
@@ -326,6 +329,7 @@ else:
 # RECENCY FILTER — drop oldest 20% of real ratings (features already computed from full data)
 # ═══════════════════════════════════════════════════════════════════
 
+full_real_train = train_df[train_df["rating"] > 0].copy()
 real_mask = train_df["rating"] > 0
 real_ratings = train_df[real_mask].sort_values("timestamp")
 cutoff = int(len(real_ratings) * (1 - RECENCY_FRAC))
@@ -334,6 +338,54 @@ keep_neg = train_df[~real_mask].index
 train_df = train_df.loc[keep_real.union(keep_neg)].reset_index(drop=True)
 n_dropped = int(real_mask.sum()) - len(keep_real)
 log.info(f"Recency filter: kept {RECENCY_FRAC:.0%} of real ratings, dropped {n_dropped} oldest")
+
+if POST_RECENCY_NEG_RESAMPLE:
+    kept_real_train = train_df[train_df["rating"] > 0].reset_index(drop=True)
+    kept_pos = kept_real_train[kept_real_train["label"] == 1].reset_index(drop=True)
+    old_easy_neg = int((train_df["rating"] == 0).sum())
+    num_easy_neg = int(round(len(kept_pos) * POST_RECENCY_EASY_NEG_PER_POS))
+    if len(kept_pos) == 0 or num_easy_neg == 0:
+        train_df = kept_real_train.copy()
+        log.info("Post-recency neg resample: no kept positives; dropped existing easy negatives")
+    else:
+        from scipy.sparse import csr_matrix
+
+        rng = np.random.RandomState(SEED)
+        full_rows = full_real_train["userId"].values.astype(np.int64)
+        full_cols = full_real_train["movieId"].values.astype(np.int64)
+        rated_matrix = csr_matrix(
+            (np.ones(len(full_rows), dtype=bool), (full_rows, full_cols)),
+            shape=(num_users, num_items),
+        )
+        item_first_seen = np.full(num_items, int(full_real_train["timestamp"].max()), dtype=np.int64)
+        first_seen_series = full_real_train.groupby("movieId")["timestamp"].min()
+        item_first_seen[first_seen_series.index.values.astype(np.int64)] = first_seen_series.values.astype(np.int64)
+
+        anchor_idx = rng.randint(0, len(kept_pos), size=num_easy_neg)
+        anchor_rows = kept_pos.iloc[anchor_idx]
+        neg_users = anchor_rows["userId"].values.astype(np.int64)
+        neg_timestamps = anchor_rows["timestamp"].values.astype(np.int64)
+        neg_items = rng.randint(0, num_items, size=num_easy_neg)
+        for _ in range(10):
+            is_rated = np.array(rated_matrix[neg_users, neg_items]).flatten().astype(bool)
+            is_rated |= item_first_seen[neg_items] > neg_timestamps
+            n_bad = int(is_rated.sum())
+            if n_bad == 0:
+                break
+            neg_items[is_rated] = rng.randint(0, num_items, size=n_bad)
+
+        new_easy_neg = pd.DataFrame({
+            "userId": neg_users,
+            "movieId": neg_items,
+            "rating": 0.0,
+            "timestamp": neg_timestamps,
+            "label": 0,
+        })
+        train_df = pd.concat([kept_real_train, new_easy_neg], ignore_index=True)
+        log.info(
+            f"Post-recency neg resample: replaced {old_easy_neg} easy neg with {num_easy_neg} "
+            f"({POST_RECENCY_EASY_NEG_PER_POS:.2f} per kept positive)"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -767,6 +819,8 @@ if SAVE_EVAL_PRED_PATH:
         user_hist_context=np.array(USER_HIST_CONTEXT),
         item_hist_context=np.array(ITEM_HIST_CONTEXT),
         train_neg_mode=np.array(TRAIN_NEG_MODE),
+        post_recency_neg_resample=np.array(POST_RECENCY_NEG_RESAMPLE),
+        post_recency_easy_neg_per_pos=np.array(POST_RECENCY_EASY_NEG_PER_POS, dtype=np.float32),
         embed_dim=np.array(EMBED_DIM),
         item_hist_len=np.array(ITEM_HIST_LEN),
         recency_frac=np.array(RECENCY_FRAC, dtype=np.float32),
