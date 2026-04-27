@@ -636,7 +636,8 @@ The next two sections document an older 2-GPU workflow. Keep them as historical 
 ### What to try next (backlog for future sessions)
 
 > Historical checked-in best: single model 0.821.
-> Restart update (2026-04-26): the checked-in SE baseline on this branch now reproduces at **0.82628** on `ml-25m` with `RECENCY_FRAC=0.8`, `LR=7e-5`, `WEIGHT_DECAY=1e-4`, `ACCUM_STEPS=2`, `TRAIN_NEG_MODE=anchor_pos_catalog`, `POST_RECENCY_NEG_RESAMPLE=1`, `POST_RECENCY_EASY_NEG_PER_POS=0.75`, `USER_HIST_MODE=rating`, `USER_HIST_CONTEXT=causal_masked`, and `ITEM_HIST_CONTEXT=causal_masked`.
+> Restart update (2026-04-27): the checked-in baseline on this branch now reproduces at **0.82722** on `ml-25m` with `RECENCY_FRAC=0.8`, `LR=7e-5`, `WEIGHT_DECAY=5e-5`, `ACCUM_STEPS=2`, `TRAIN_NEG_MODE=anchor_pos_catalog`, `POST_RECENCY_NEG_RESAMPLE=1`, `POST_RECENCY_EASY_NEG_PER_POS=0.75`, `USER_HIST_MODE=rating`, `USER_HIST_CONTEXT=causal_masked`, `ITEM_HIST_CONTEXT=causal_masked`, `USER_GENOME=scalar_dot`, and `USER_GENOME_TARGET=genome_field`.
+> Cycle 8 win (apr27): adding a per-user content profile (mean of genome vectors over user's high-rated genome-having items) and feeding `dot(user_genome, item_genome) / GENOME_DIM → Linear(1, 28)` into the genome_field gave +0.000944 over the prior 0.82628 baseline at WD=5e-5. Stacking with mask-aware genome gate hurt (-0.0003 at the same WD), so kept the legacy gate. 9-trial sweep around the surviving config produced 7 configs in the +0.0007 to +0.0009 ridge.
 > Curriculum neg sampling TRIED (10 trials, +0.0006 max) — not the breakthrough hoped for.
 
 #### NEW: Simplification hypothesis (apr06 discussion)

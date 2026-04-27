@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Research repo for movie recommendation on MovieLens. Uses a hybrid engagement prediction task: predict whether a user will rate a movie >= 4 stars, with both "watched but didn't like" (hard negatives) and "random unrated" (easy negatives) as label=0. Output is a calibrated probability via BCE loss, suitable for front-page recommendation with a threshold.
 
-Best historical single-model AUC: **0.821 on ml-25m** (deterministic, SEED=42).
+Best historical single-model AUC: **0.821 on ml-25m** (deterministic, SEED=42). The current restart baseline now reproduces at **0.8272**.
 The checked-in `train.py` is the restart baseline and is not the exact historical field-attention/two-stream model. Treat `train.py` as the source of truth for the current baseline and `program.md` as the experiment history.
 See `program.md` for full experiment history (~500 experiments). See `README.md` for AUC progress chart.
 
@@ -49,6 +49,8 @@ grep "^val_auc:\|^peak_memory_mb:" run.log
 
 ## Current checked-in baseline (train.py)
 
+Reproduces at **val_auc = 0.827224 on ml-25m** (deterministic, SEED=42).
+
 ```
 Features:
   - Sparse: userId, movieId (embeddings, dim=28, with dropout 0.1)
@@ -56,14 +58,19 @@ Features:
   - User history: last 100 items + ratings → causal self-attention + residual → rating-weighted pooling over causal prefix → dim=28
   - Item history: last 30 raters + ratings → item-side DIN (target-user-aware) over causal prefix → dim=28
   - Tag genome: 1128-dim relevance scores → bottleneck MLP (1128→256→64→28) → sigmoid gate with detached item_e fallback for missing data → dim=28
+  - User genome profile: per-user mean of genome relevance vectors over their high-rated genome-having items
   - Dense: timestamp, user rating histogram (5-bin), user count, item rating histogram (5-bin), item count, ug_dot (1), year (1), genre_count (1), movie_age (1) → bottom MLP → dim=28
+
+User × item content alignment (USER_GENOME=scalar_dot, USER_GENOME_TARGET=genome_field):
+  - dot(user_genome, target_genome) / GENOME_DIM → Linear(1, 28) → added to genome_field
+  - Bounded magnitude, only ~28 new params; cycle-8 lift: +0.000944 over the legacy baseline
 
 Interaction: squeeze-and-excitation field reweighting across 7 fields, then flatten to 7×28 = 196
 
 Top MLP: 196 → 256 → 128 → 64 → 1 (with dropout 0.2)
 
 Loss: BCEWithLogitsLoss with label smoothing 0.1
-Optimizer: Adam, LR=7e-5, weight_decay=1e-4
+Optimizer: Adam, LR=7e-5, weight_decay=5e-5
 AMP: fp16, torch.compile, TF32 tensor cores
 Training: batch=16384, grad accum 2× (effective 33K), NEG_RATIO=1, TRAIN_NEG_MODE=anchor_pos_catalog, POST_RECENCY_NEG_RESAMPLE=1, POST_RECENCY_EASY_NEG_PER_POS=0.75, USER_HIST_MODE=rating, USER_HIST_CONTEXT=causal_masked, ITEM_HIST_CONTEXT=causal_masked, RECENCY_FRAC=0.8, sub-epoch eval ~3×, patience=3
 Params/VRAM: printed at runtime; historical runs fit comfortably on a 24 GB L4
