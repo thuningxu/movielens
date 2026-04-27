@@ -709,6 +709,12 @@ The model may be stuck in a local minimum due to over-parameterization. Evidence
 - Post-fix: aux signal is fully NULL across all 14 valid trials (weights 0.05 to 10.0, MSE and BCE, with/without detach, with/without USER_GENOME path).
 - Verdict: dead. The aux gradient signal genuinely doesn't shape user_embed in a way that helps BCE.
 
+**Cycle 9: Per-position genome content alignment in user-history rating-pool** — 6 trials.
+- Mechanism: `sim_w = 1 + GENOME_SIM_SCALE * dot(genome[hist_item], genome[target]) / GENOME_DIM`, multiplied onto rating_weights before normalization. No new params; pad-row zero-extension on `_genome_gpu` to handle PAD_IDX safely; fp16 gather + einsum to bound memory.
+- Scales swept ∈ {1, 5, 10, 20, 50}, plus one variant with USER_GENOME=off. All within ±0.000035 of baseline.
+- Wall-clock 1.7× baseline (above Critic 1.3× kill threshold) — disqualifying even if signal existed.
+- Verdict: dead. The per-position content gate is redundant with what `hist_embed` (end-to-end content learning) + the existing rating-pool aggregation already capture.
+
 ### Key learnings (apr27)
 
 35. **The genome-alignment channel is information-bottlenecked at one scalar.** Multiple aggregation methods (mean, weighted, dislike, item-rater) all collapse to the same scalar dot signal. Two scalars conflict; element-wise vector overflows.
