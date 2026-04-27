@@ -736,13 +736,14 @@ class DLRM(nn.Module):
         genome_field = gate * genome_e + (1 - gate) * item_e.detach()     # blend genome with item fallback
 
         # User × item content alignment: dot(user_genome, item_genome) / GENOME_DIM
-        # → Linear(1, D) → added to genome_field. Bounded magnitude, minimal capacity.
+        # → Linear(1, D) → added to dense_e. Bounded magnitude, minimal capacity.
+        # Routed to dense_e (not genome_field) to avoid contention with mask_only gate.
         if self.user_genome_mode == "scalar_dot":
             ug_raw = user_genome_raw.float()
             dot = (ug_raw * genome_raw).sum(dim=-1, keepdim=True) / GENOME_DIM  # (B, 1)
             valid = has_user_genome_mask.unsqueeze(-1) * has_genome_mask.unsqueeze(-1)
             dot = dot * valid
-            genome_field = genome_field + self.ug_dot_proj(dot)           # (B, D)
+            dense_e = dense_e + self.ug_dot_proj(dot)                     # (B, D)
 
         # Squeeze-and-Excitation: learn per-field importance weights
         fields = torch.stack([user_e, item_e, user_hist_e, item_hist_e, dense_e, genre_e, genome_field], dim=1)  # (B, 7, D)
