@@ -8,3 +8,4 @@ ensemble_preds/
 ensemble_logs/
 tmp_preds/
 tmp_logs/
+artifacts/
