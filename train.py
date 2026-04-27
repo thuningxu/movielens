@@ -78,6 +78,7 @@ USER_HIST_CONTEXT = os.environ.get("USER_HIST_CONTEXT", "causal_masked")  # stat
 ITEM_HIST_CONTEXT = os.environ.get("ITEM_HIST_CONTEXT", "causal_masked")  # static | causal_masked
 GENOME_FUSION_MODE = os.environ.get("GENOME_FUSION_MODE", "legacy")  # legacy | mask_only
 USER_GENOME = os.environ.get("USER_GENOME", "off")  # off | scalar_dot
+USER_GENOME_TARGET = os.environ.get("USER_GENOME_TARGET", "dense_e")  # dense_e | genome_field
 USE_CAUSAL_SA = _env_flag("USE_CAUSAL_SA", True)
 USE_TORCH_COMPILE = _env_flag("USE_TORCH_COMPILE", True)
 
@@ -91,6 +92,8 @@ if GENOME_FUSION_MODE not in {"legacy", "mask_only"}:
     raise ValueError(f"Unknown GENOME_FUSION_MODE: {GENOME_FUSION_MODE}")
 if USER_GENOME not in {"off", "scalar_dot"}:
     raise ValueError(f"Unknown USER_GENOME: {USER_GENOME}")
+if USER_GENOME_TARGET not in {"dense_e", "genome_field"}:
+    raise ValueError(f"Unknown USER_GENOME_TARGET: {USER_GENOME_TARGET}")
 
 # ─── Device ─────────────────────────────────────────────────────────
 torch.manual_seed(SEED)
@@ -616,8 +619,9 @@ class DLRM(nn.Module):
         elif GENOME_FUSION_MODE == "mask_only":
             self.genome_gate = nn.Linear(1, D)
 
-        # User × item content alignment scalar → small projection added to genome_field.
+        # User × item content alignment scalar → small projection.
         self.user_genome_mode = USER_GENOME
+        self.user_genome_target = USER_GENOME_TARGET
         if USER_GENOME == "scalar_dot":
             self.ug_dot_proj = nn.Linear(1, D)
 
@@ -736,14 +740,16 @@ class DLRM(nn.Module):
         genome_field = gate * genome_e + (1 - gate) * item_e.detach()     # blend genome with item fallback
 
         # User × item content alignment: dot(user_genome, item_genome) / GENOME_DIM
-        # → Linear(1, D) → added to dense_e. Bounded magnitude, minimal capacity.
-        # Routed to dense_e (not genome_field) to avoid contention with mask_only gate.
+        # → Linear(1, D) → added to either dense_e or genome_field (per USER_GENOME_TARGET).
         if self.user_genome_mode == "scalar_dot":
             ug_raw = user_genome_raw.float()
             dot = (ug_raw * genome_raw).sum(dim=-1, keepdim=True) / GENOME_DIM  # (B, 1)
             valid = has_user_genome_mask.unsqueeze(-1) * has_genome_mask.unsqueeze(-1)
-            dot = dot * valid
-            dense_e = dense_e + self.ug_dot_proj(dot)                     # (B, D)
+            ug_field = self.ug_dot_proj(dot * valid)                      # (B, D)
+            if self.user_genome_target == "dense_e":
+                dense_e = dense_e + ug_field
+            else:  # genome_field
+                genome_field = genome_field + ug_field
 
         # Squeeze-and-Excitation: learn per-field importance weights
         fields = torch.stack([user_e, item_e, user_hist_e, item_hist_e, dense_e, genre_e, genome_field], dim=1)  # (B, 7, D)
