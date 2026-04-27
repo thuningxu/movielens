@@ -682,7 +682,7 @@ The next two sections document an older 2-GPU workflow. Keep them as historical 
 ### What to try next (backlog for future sessions)
 
 > Historical checked-in bests: single model 0.821, ensemble 0.854.
-> Restart update (2026-04-26): the checked-in SE baseline on this branch now reproduces at **0.82542** on `ml-25m` with `RECENCY_FRAC=0.8`, `LR=7e-5`, `WEIGHT_DECAY=1e-4`, `ACCUM_STEPS=2`, `TRAIN_NEG_MODE=anchor_pos_catalog`, and `USER_HIST_CONTEXT=causal_masked`.
+> Restart update (2026-04-26): the checked-in SE baseline on this branch now reproduces at **0.82552** on `ml-25m` with `RECENCY_FRAC=0.8`, `LR=7e-5`, `WEIGHT_DECAY=1e-4`, `ACCUM_STEPS=2`, `TRAIN_NEG_MODE=anchor_pos_catalog`, `USER_HIST_MODE=rating`, `USER_HIST_CONTEXT=causal_masked`, and `ITEM_HIST_CONTEXT=causal_masked`.
 > Single model improvements feed into ensemble — a better base model lifts ALL variants.
 > Curriculum neg sampling TRIED (10 trials, +0.0006 max) — not the breakthrough hoped for.
 > Stacker feature engineering WORKED (+0.003, metadata features help HistGBM).
@@ -715,7 +715,7 @@ The model may be stuck in a local minimum due to over-parameterization. Evidence
 4. **Recency as feature, not data split** — Add recency_decay = exp(-lambda * time_gap) as a dense feature instead of filtering training data. Lets the model learn to weight recent data more.
 
 **Medium priority (discussed, partially explored):**
-5. **Single-model HP ridge around the checked-in SE baseline** — `RECENCY_FRAC=0.8`, `LR=7e-5`, `WEIGHT_DECAY=1e-4`, `ACCUM_STEPS=2`, `TRAIN_NEG_MODE=anchor_pos_catalog`, `USER_HIST_CONTEXT=causal_masked` now reproduces at 0.82542 on `ml-25m`. Keep sweeping nearby `LR`/`WD`/`PATIENCE`/`ACCUM` settings, but treat this causal-masked setting as the current anchor.
+5. **Single-model HP ridge around the checked-in SE baseline** — `RECENCY_FRAC=0.8`, `LR=7e-5`, `WEIGHT_DECAY=1e-4`, `ACCUM_STEPS=2`, `TRAIN_NEG_MODE=anchor_pos_catalog`, `USER_HIST_MODE=rating`, `USER_HIST_CONTEXT=causal_masked`, `ITEM_HIST_CONTEXT=causal_masked` now reproduces at 0.82552 on `ml-25m`. Keep sweeping nearby `LR`/`WD`/`PATIENCE`/`ACCUM` settings, but treat this causal-masked setting as the current anchor.
 6. **Collaborative filtering features** — Pre-compute ALS/SVD on implicit feedback (all ratings = positive), add top-K latent factors as dense features. Different from the SVD that was tried before (which was on explicit ratings).
 7. **User cluster embeddings** — Soft-cluster users by history similarity (K-means on user_genre_affinity), use cluster ID as a sparse feature. Adds collaborative signal without the overhead of full GNN.
 8. **Replace genre projection with small transformer** (user-suggested) — Model genre interactions (Action+Sci-Fi means different things than either alone). Pushed back due to only 20 genres, but worth 1 trial.

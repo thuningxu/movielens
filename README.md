@@ -133,7 +133,7 @@ graph TD
 
     subgraph "Training"
         LOGIT --> LOSS["BCEWithLogitsLoss<br/>label smoothing 0.1"]
-        LOSS --> OPT["Adam, LR=7e-5<br/>weight_decay=1e-4<br/>AMP fp16, grad accum 2×<br/>batch=16384, eff. 33K<br/>NEG_RATIO=1, TRAIN_NEG_MODE=anchor_pos_catalog<br/>USER_HIST_CONTEXT=causal_masked<br/>patience=3, eval 3×/epoch"]
+        LOSS --> OPT["Adam, LR=7e-5<br/>weight_decay=1e-4<br/>AMP fp16, grad accum 2×<br/>batch=16384, eff. 33K<br/>NEG_RATIO=1, TRAIN_NEG_MODE=anchor_pos_catalog<br/>USER_HIST_MODE=rating<br/>USER_HIST_CONTEXT=causal_masked<br/>ITEM_HIST_CONTEXT=causal_masked<br/>patience=3, eval 3×/epoch"]
     end
 
     style Inputs fill:#e1f5fe

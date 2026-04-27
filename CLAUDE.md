@@ -54,8 +54,8 @@ grep "^val_auc:\|^peak_memory_mb:" run.log
 Features:
   - Sparse: userId, movieId (embeddings, dim=28, with dropout 0.1)
   - Genre: multi-hot → linear projection → dim=28
-  - User history: last 100 items + ratings → causal self-attention + residual → DIN (target-aware) → dim=28
-  - Item history: last 30 raters + ratings → item-side DIN (target-user-aware) → dim=28
+  - User history: last 100 items + ratings → causal self-attention + residual → rating-weighted pooling over causal prefix → dim=28
+  - Item history: last 30 raters + ratings → item-side DIN (target-user-aware) over causal prefix → dim=28
   - Tag genome: 1128-dim relevance scores → bottleneck MLP (1128→256→64→28) → sigmoid gate with detached item_e fallback for missing data → dim=28
   - Dense: timestamp, user rating histogram (5-bin), user count, item rating histogram (5-bin), item count, ug_dot (1), year (1), genre_count (1), movie_age (1) → bottom MLP → dim=28
 
@@ -66,7 +66,7 @@ Top MLP: 196 → 256 → 128 → 64 → 1 (with dropout 0.2)
 Loss: BCEWithLogitsLoss with label smoothing 0.1
 Optimizer: Adam, LR=7e-5, weight_decay=1e-4
 AMP: fp16, torch.compile, TF32 tensor cores
-Training: batch=16384, grad accum 2× (effective 33K), NEG_RATIO=1, TRAIN_NEG_MODE=anchor_pos_catalog, USER_HIST_CONTEXT=causal_masked, RECENCY_FRAC=0.8, sub-epoch eval ~3×, patience=3
+Training: batch=16384, grad accum 2× (effective 33K), NEG_RATIO=1, TRAIN_NEG_MODE=anchor_pos_catalog, USER_HIST_MODE=rating, USER_HIST_CONTEXT=causal_masked, ITEM_HIST_CONTEXT=causal_masked, RECENCY_FRAC=0.8, sub-epoch eval ~3×, patience=3
 Params/VRAM: printed at runtime; historical runs fit comfortably on a 24 GB L4
 ```
 
