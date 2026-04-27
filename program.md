@@ -677,6 +677,47 @@ The model may be stuck in a local minimum due to over-parameterization. Evidence
 10. **External data** — IMDB plot summaries via links.csv → IMDB API. Poster images. Not in MovieLens but the only clear path to genuinely new content signal.
 11. **PinSage** — GraphSAGE with random walk sampling on user-item bipartite graph. LightGCN failed (sparse matmul too slow), but PinSage uses sampling which scales better.
 
+### Experiment log (autoresearch/apr27) — ml-25m, post-cycle-8 follow-up
+
+> **No keep this branch. ~63 trials across 8 cycles. Baseline held at 0.827224.**
+> Goal: find further single-model improvements on top of cycle-8's user-genome scalar_dot win.
+
+**Cycles 1-5: Variations on the user-genome content-alignment channel** (each 2-3 trials, all dead/sub-threshold):
+- C1 rating-and-recency-weighted user_genome aggregation: dead. The 1-d scalar dot in `ug_dot_proj` is an information bottleneck — different aggregation methods (mean, rating-weighted, recency-weighted) all collapse to similar dot products in the GENOME_DIM-d space.
+- C2 elemwise / shared-weight `genome_proj`: dead. `Linear(1128, D)` overfit catastrophically (-0.0175); shared-weight gave gradient conflict on `genome_proj` (-0.0009).
+- C3 implicit-feedback CF SVD as scalar dot dense feature: dead. Self-leak fixed via dropped-recency source, but signal still redundant with end-to-end embeddings (same finding as apr02b's SVD-32 attempt).
+- C4 user_dislike_genome (mean over rating<4 items): dead. Standalone gives ~+0.001 same as like-channel; combined with like channel actively HURTS (-0.0015) due to redundancy + path contention.
+- C5 item_rater_genome (per-item mean of `user_genome` over high-rating raters): dead. Same pattern as C4 — standalone equivalent to like-only, combined hurts.
+
+**Pattern across C1-C5**: any second scalar-dot signal added to `genome_field` actively hurts. The genome-alignment channel is hard-saturated at one scalar of capacity. Different aggregations are equivalent; combinations conflict.
+
+**Cycle 6: Field-pair bilinear interactions (architectural redesign)** — 12 trials.
+- 21 explicit pair scalars from upper triangle of 7×7 fields, gated, concatenated to top_mlp input.
+- All trials in [-0.001, -0.0002] band. Best -0.000156 at WD=8e-5.
+- Verdict: dead. The top_mlp's first Linear (196→256) already learns implicit pair interactions from the flatten path; explicit pair scalars don't add complementary signal.
+
+**Cycle 7: HSTU-style gated unified block on user history** — 20 trials.
+- Replaces the 1-head causal SA + DIN with a `Linear(D, 4D) → split [U,V,Q,K] → gate*attn(QK)V → LN_post + residual` block.
+- Key insight: `tokens=item_only` works (-0.0001), `tokens=rating_aug` crashes (-0.0014) because the rating signal already enters DIN's input concat — adding it to attention tokens creates path contention.
+- Best config: WD=1.5e-4, dropout=0, item_only tokens, sigmoid gate, silu U → +0.000599. **Ridge of 8 configs in [+0.0005, +0.0006] band.**
+- Wall-clock: 1.5× baseline (Critic kill threshold was 1.3×).
+- Verdict: sub-threshold. Doesn't clear +0.0007 ridge tripwire; wall-clock disqualifying.
+
+**Cycle 8: Multi-task auxiliary user-genome reconstruction loss** — 20 trials (15 valid post RNG-fix).
+- Aux head: `user_embed (clean) → Linear(D, 1128) → predict user_genome[u]`. Aux loss MSE or BCE-per-tag on the 78%-coverage targets.
+- **Critical bug discovered mid-cycle**: `nn.Linear.__init__` calls `reset_parameters()` (kaiming) at construction, drawing global RNG. Even with the aux head registered LAST in the model, those construction-time RNG draws shifted state for `_init_weights()`'s xavier inits on **other** modules — making AUX_W=1e-10 (effectively zero contribution) regress AUC by -0.0016. Fix: use bare `nn.Parameter(torch.zeros(...))` instead of `nn.Linear`.
+- Post-fix: aux signal is fully NULL across all 14 valid trials (weights 0.05 to 10.0, MSE and BCE, with/without detach, with/without USER_GENOME path).
+- Verdict: dead. The aux gradient signal genuinely doesn't shape user_embed in a way that helps BCE.
+
+### Key learnings (apr27)
+
+35. **The genome-alignment channel is information-bottlenecked at one scalar.** Multiple aggregation methods (mean, weighted, dislike, item-rater) all collapse to the same scalar dot signal. Two scalars conflict; element-wise vector overflows.
+36. **Field-pair interactions are implicit in `top_mlp` first Linear.** Explicit pair scalars don't add value because the 196→256 Linear already mixes all 196 cross-features.
+37. **HSTU-style gated attention on user history works at +0.000599 ridge but is wall-clock-limited.** The signal is real but the 1.5× compute cost disqualifies it from being a single-model keep. (Could revisit if wall-clock becomes secondary.)
+38. **`nn.Linear.__init__` draws RNG at construction**, polluting downstream xavier inits even when modules are registered last. Use `nn.Parameter(torch.zeros(...))` for new heads when off-state byte-equivalence matters.
+39. **Validators should test off-state byte-equivalence with `flag=ε` (tiny but >0)**, not just `flag=0`. The `flag=0` skips construction entirely; `flag=ε` exercises the construction path.
+40. **The 0.8272 baseline is near-saturated** for content-alignment additions, field-interaction redesigns, and label-prediction aux losses. Future progress likely requires either bigger architectural shifts (full HSTU rewrite, transformer encoder) or external data.
+
 ### Useful references
 
 - BARS benchmark (Zhu et al., SIGIR 2022) — different task (tag CTR) but good training practices and model zoo
