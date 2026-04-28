@@ -19,7 +19,7 @@ import time
 import numpy as np
 
 # Fix all random seeds for reproducibility
-SEED = 42
+SEED = int(os.environ.get("SEED", "42"))
 np.random.seed(SEED)
 import pandas as pd
 import torch
@@ -81,6 +81,13 @@ USER_GENOME = os.environ.get("USER_GENOME", "scalar_dot")  # off | scalar_dot
 USER_GENOME_TARGET = os.environ.get("USER_GENOME_TARGET", "genome_field")  # dense_e | genome_field
 USE_CAUSAL_SA = _env_flag("USE_CAUSAL_SA", True)
 USE_TORCH_COMPILE = _env_flag("USE_TORCH_COMPILE", True)
+EMBED_DROPOUT = float(os.environ.get("EMBED_DROPOUT", "0.1"))
+MLP_DROPOUT = float(os.environ.get("MLP_DROPOUT", "0.2"))
+LABEL_SMOOTH = float(os.environ.get("LABEL_SMOOTH", "0.05"))
+GRAD_CLIP = float(os.environ.get("GRAD_CLIP", "0.0"))
+WARMUP_STEPS = int(os.environ.get("WARMUP_STEPS", "0"))
+GENOME_BOTTLENECK_HIDDEN = os.environ.get("GENOME_BOTTLENECK_HIDDEN", "256,64")
+GENOME_BOTTLENECK_DROPOUT = float(os.environ.get("GENOME_BOTTLENECK_DROPOUT", "0.1"))
 
 if TRAIN_NEG_MODE not in {"global", "anchor_pos", "anchor_pos_catalog"}:
     raise ValueError(f"Unknown TRAIN_NEG_MODE: {TRAIN_NEG_MODE}")
@@ -604,14 +611,16 @@ class DLRM(nn.Module):
         )
 
         # Tag genome: learned bottleneck compression 1128 → D with gating
-        self.genome_proj = nn.Sequential(
-            nn.Linear(GENOME_DIM, 256),
-            nn.ReLU(),
-            nn.Linear(256, 64),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(64, D),
-        )
+        _genome_hidden_dims = [int(h) for h in GENOME_BOTTLENECK_HIDDEN.split(",") if h.strip()]
+        _genome_layers = []
+        _prev_dim = GENOME_DIM
+        for _h in _genome_hidden_dims:
+            _genome_layers.append(nn.Linear(_prev_dim, _h))
+            _genome_layers.append(nn.ReLU())
+            _prev_dim = _h
+        _genome_layers.append(nn.Dropout(GENOME_BOTTLENECK_DROPOUT))
+        _genome_layers.append(nn.Linear(_prev_dim, D))
+        self.genome_proj = nn.Sequential(*_genome_layers)
         # sigmoid gate to blend genome with item_embed fallback
         self.genome_fusion_mode = GENOME_FUSION_MODE
         if GENOME_FUSION_MODE == "legacy":
@@ -638,10 +647,10 @@ class DLRM(nn.Module):
         self.top_mlp = nn.Sequential(
             nn.Linear(cross_dim, 256),
             nn.ReLU(),
-            nn.Dropout(0.2),
+            nn.Dropout(MLP_DROPOUT),
             nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Dropout(0.2),
+            nn.Dropout(MLP_DROPOUT),
             nn.Linear(128, 64),
             nn.ReLU(),
             nn.Linear(64, 1),
@@ -663,8 +672,8 @@ class DLRM(nn.Module):
     def forward(self, user_id, movie_id, dense, history, hist_ratings, hist_timestamps, sample_timestamps,
                 genres, item_hist, item_hist_ratings, item_hist_timestamps, genome_raw, has_genome_mask,
                 user_genome_raw=None, has_user_genome_mask=None):
-        user_e = nn.functional.dropout(self.user_embed(user_id), 0.1, self.training)
-        item_e = nn.functional.dropout(self.item_embed(movie_id), 0.1, self.training)
+        user_e = nn.functional.dropout(self.user_embed(user_id), EMBED_DROPOUT, self.training)
+        item_e = nn.functional.dropout(self.item_embed(movie_id), EMBED_DROPOUT, self.training)
         hist_valid = history != PAD_IDX
         if USER_HIST_CONTEXT == "causal_masked":
             hist_valid = hist_valid & (hist_timestamps < sample_timestamps.unsqueeze(1))
@@ -709,7 +718,7 @@ class DLRM(nn.Module):
             raise ValueError(f"Unknown USER_HIST_MODE: {self.user_hist_mode}")
 
         # --- Item-side DIN: attention over users who rated this item ---
-        rater_e = nn.functional.dropout(self.rater_embed(item_hist), 0.1, self.training)  # (B, IL, D)
+        rater_e = nn.functional.dropout(self.rater_embed(item_hist), EMBED_DROPOUT, self.training)  # (B, IL, D)
         if self.item_hist_mode == "din":
             rater_rat_e = self.rating_proj(item_hist_ratings.unsqueeze(-1)) # (B, IL, D)
             rater_e_raw = torch.cat([rater_e, rater_rat_e], dim=-1)       # (B, IL, 2D)
@@ -812,11 +821,23 @@ while True:
                 _user_genome_gpu[u_batch], _has_user_genome_gpu[u_batch],
             )
             # Label smoothing: soft targets
-            smooth_labels = train_labels[idx] * 0.9 + 0.05
+            smooth_labels = train_labels[idx] * (1.0 - 2 * LABEL_SMOOTH) + LABEL_SMOOTH
             loss = criterion(logits, smooth_labels)
 
         scaler.scale(loss / ACCUM_STEPS).backward()
         if (i + 1) % ACCUM_STEPS == 0:
+            if GRAD_CLIP > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            if WARMUP_STEPS > 0:
+                _opt_step = (i + 1) // ACCUM_STEPS + epoch * (n_batches_per_epoch // ACCUM_STEPS)
+                if _opt_step < WARMUP_STEPS:
+                    _scale = (_opt_step + 1) / WARMUP_STEPS
+                    for _pg in optimizer.param_groups:
+                        _pg["lr"] = LR * _scale
+                else:
+                    for _pg in optimizer.param_groups:
+                        _pg["lr"] = LR
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
