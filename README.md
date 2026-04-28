@@ -15,6 +15,62 @@ Apr27b's 100-trial HP sweep extracted +0.0017 from joint HP retuning, but that i
 
 This restart starts from the **simplest possible model — a single Linear head on concatenated features — with the same input features and prediction goals**, so future architectural choices can be motivated by clear ablations rather than 540 experiments of accumulated assumptions.
 
+## Architecture (current baseline)
+
+```mermaid
+graph TD
+    subgraph Inputs
+        UID["userId"]
+        MID["movieId"]
+        UHIST["User history<br/>(last 100 items + ratings)"]
+        IHIST["Item history<br/>(last 30 raters + ratings)"]
+        GENRE["Genre multi-hot (20)"]
+        DENSE["Dense (17)<br/>timestamp, rating histograms,<br/>counts, ug_dot, year,<br/>genre_count, movie_age"]
+        GENOME["Tag genome (1128)"]
+        UGENOME["User genome (1128)"]
+    end
+
+    subgraph "Embeddings (trainable)"
+        UID --> UE["user_embed<br/>dim=28"]
+        MID --> IE["item_embed<br/>dim=28"]
+    end
+
+    subgraph "Pooling (no params)"
+        UHIST --> UHP["mean-pool of item_embed<br/>over valid positions → 28"]
+        UHIST --> UHR["mean rating → 1"]
+        IHIST --> IHP["mean-pool of user_embed<br/>over valid raters → 28"]
+        IHIST --> IHR["mean rating → 1"]
+    end
+
+    subgraph "Projection"
+        GENRE --> GP["Linear(20, 28, bias=False)<br/>→ genre_e"]
+    end
+
+    UE --> CONCAT["concat<br/>(in_dim ≈ 2400 for ml-25m)"]
+    IE --> CONCAT
+    UHP --> CONCAT
+    UHR --> CONCAT
+    IHP --> CONCAT
+    IHR --> CONCAT
+    GP --> CONCAT
+    DENSE --> CONCAT
+    GENOME --> CONCAT
+    UGENOME --> CONCAT
+
+    CONCAT --> HEAD["Linear(in_dim, 1)"]
+    HEAD --> SIGMOID["sigmoid"]
+    SIGMOID --> PRED["P(engage)"]
+
+    LOSS["BCEWithLogitsLoss"]
+    HEAD -.-> LOSS
+
+    style Inputs fill:#e1f5fe
+    style HEAD fill:#fce4ec
+    style PRED fill:#c8e6c9
+```
+
+The "linear" naming refers to the prediction head — embeddings are still trainable (~6.1M params for ml-25m). The `genre_proj` is a single bias-free Linear that projects a 20-dim multi-hot into 28-dim; it has no nonlinearity. Total ~6.2M params; the head itself is ~2.4K params.
+
 ## Layout
 
 - **`prepare.py`** — Shared with legacy. Data download + time-based train/val/test splits + AUC evaluation. Do not modify (the evaluation harness is the ground truth metric).

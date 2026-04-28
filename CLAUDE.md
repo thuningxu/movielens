@@ -34,7 +34,7 @@ grep "^val_auc:\|^peak_memory_mb:" run.log
 - **`prepare.py`** — Shared with legacy. Data download/loading (all MovieLens sizes), `load_data_hybrid()`, time-based train/val/test splits, AUC evaluation, `print_summary()`. **Do not modify the evaluation harness.**
 - **`train.py`** — The current baseline + experimentation file. Same input features as legacy; model is `concat → Linear(in, 1) → sigmoid`. No hidden layer.
 - **`program.md`** — Fresh experiment log starting at the apr28 baseline.
-- **`legacy/`** — Frozen archive of the old project. `legacy/program.md` has ~540-experiment history. `legacy/CLAUDE.md` lists 16 critical learnings from that body of work — **read those before proposing any new architecture**.
+- **`legacy/`** — Archive of the prior project. Available for reference if useful, but don't feel obligated to inherit its conclusions.
 - **`results.tsv`** — Experiment log (untracked). Tab-separated: commit, val_auc, memory_mb, status, description.
 
 ## Key Details
@@ -44,7 +44,7 @@ grep "^val_auc:\|^peak_memory_mb:" run.log
 - **Device**: Single CUDA GPU. Auto-detects CUDA / MPS / CPU.
 - **Environment**: Use the repo-local `uv` env (`uv sync`, then `uv run ...`).
 - **Datasets**: `ml-100k` (smoke test only, no genome data), `ml-1m` (fast iteration), `ml-10m` (medium), `ml-25m` (default, has genome data).
-- **Reproducibility**: Deterministic at SEED=42. **Run-to-run variance at the same seed: <0.001 AUC. Seed-to-seed variance: σ ≈ 0.00078 (legacy learning #14).** Multi-seed verification is mandatory for any "win" claim.
+- **Reproducibility**: Deterministic at SEED=42. Run-to-run variance at the same seed is <0.001 AUC; seed-to-seed variance is larger and should be estimated empirically before declaring any win.
 - **Data**: auto-downloaded to `data/` on first use; not checked into git.
 - **Feature cache**: `data/features_<hash>.npz` is built on first run per (dataset, history-len) and reused afterward.
 
@@ -75,23 +75,9 @@ Training: batch=16384, sub-epoch eval 3×, patience=3 evals, max 20 epochs
 
 The "linear" naming refers to the prediction head — embeddings are still trainable (~6M params for ml-25m). The `genre_proj` is a single bias-free Linear that exists purely to project a high-dimensional one-hot into the same dim as the embeddings; it has no nonlinearity.
 
-## Critical learnings inherited from legacy/
-
-The legacy project (~540 experiments over apr01–apr28) produced 16 learnings that should still apply to this restart. See `legacy/CLAUDE.md` for the full list. The most important when proposing new architecture:
-
-1. **New information > more capacity.** Genuinely new feature signal helps; bigger MLPs / more heads / deeper layers all hurt without new information.
-2. **Richer features unlock more capacity.** Dimension and depth choices depend on feature richness — they're not independent knobs.
-3. **Training procedure changes rarely work.** LR schedules, warmup, multi-task, contrastive, BPR, focal — all tried; almost all failed.
-4. **Tag genome works with learned compression, not PCA.** Bottleneck MLP (1128→256→64→28) succeeded where PCA-32 failed.
-5. **NEG_RATIO=1 with anchor-pos-catalog negatives** was the biggest HP-only win in legacy (+0.005 AUC). The starting `train.py` defaults to this.
-11. **`nn.Linear.__init__` draws RNG at construction.** When adding a new module behind a feature flag, use `nn.Parameter(torch.zeros(...))` for gates that need byte-equivalent off-state. Validators should test with `flag=ε` (tiny but >0), not `flag=0`.
-14. **Seed variance ≈ 0.00078** across SEED ∈ {42–46}. Single-seed lifts of +0.0003-0.0005 are deeply in noise. Only multi-seed-confirmed lifts ≥ +0.0007 mean (with 5/5 positive) should be considered keeps.
-15. **Sub-noise single-knob lifts can stack.** Apr27b's 4 winning HP knobs were all individually sub-bar; together they cleared +0.0017 mean lift. Don't dismiss small consistent positives.
-
 ## Discipline
 
-- **Multi-seed verification is mandatory for any keep claim.** σ ≈ 0.00078; require 5-seed mean ≥ +0.0007, 5/5 positive, min lift ≥ -0.0003.
+- **Multi-seed verification is mandatory for any keep claim.** Estimate the seed-noise floor (e.g., 3-4 baseline seeds) before testing candidates; declare a win only when the lift is statistically distinguishable from that floor.
 - **Smoke-test on ml-100k for crashes only**, not for AUC. ml-100k has no genome data and is too small for the linear baseline to be informative.
 - **`prepare.py:evaluate()` is the ground truth.** Do not modify it.
-- **Trust the legacy learnings.** If you propose something the legacy explicitly tried and rejected (PCA genome, NEG_RATIO=4, multi-task aux losses, HSTU paper-faithful), justify why the restart changes the calculus.
 - **Keep `train.py` simple while it's small.** When the model grows past ~500 lines, split into `model.py` / `data.py` / `train.py`.
