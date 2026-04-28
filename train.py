@@ -2,15 +2,19 @@
 """
 Linear baseline for hybrid engagement prediction on MovieLens.
 
-Restart from scratch (apr28). Same input features and prediction goals as the
-legacy DLRM at legacy/train.py, but the model itself is a single Linear head:
+Restart from scratch (apr28). Same prediction goals and metric as the
+prior project at legacy/, but the model itself is a single Linear head:
 
-    concat(all features) -> Linear(in, 1) -> sigmoid
+    concat(features) -> Linear(in, 1) -> sigmoid
 
-No hidden layers, no attention, no MLP. The point is a clean low ceiling
-to build up from. See README.md and program.md for the broader plan.
+No hidden layers, no attention, no MLP. The features are also stripped
+to the bones: only raw IDs, raw history sequences, and pure content
+metadata (genres, tag genome, movie year, timestamp). All pre-computed
+user/item statistics (rating histograms, counts, user genome profiles,
+user-genre affinity) are out — those are aggregations the model can learn
+from raw data if they actually help.
 
-Label scheme (unchanged from legacy):
+Label scheme (unchanged):
   - 1: user rated >= 4 (watched and liked)
   - 0: user rated < 4 (hard negative) OR random unrated movie (easy negative)
 """
@@ -81,14 +85,14 @@ log.info(f"Dataset: {DATASET} | Users: {num_users} | Items: {num_items} | "
          f"Pos rate: {stats['pos_rate']:.2%}")
 
 # ─── Feature engineering (with disk cache) ─────────────────────────
-# Same feature set as the legacy DLRM:
-#   - genre multi-hot, rating histograms, user/item count
-#   - user/item history sequences (last K + ratings)
-#   - user-genre affinity, timestamp, year, genre count
-#   - tag genome (1128) + per-user genome profile (1128)
+# Bones-only feature set:
+#   - per movie: genre multi-hot, tag genome (1128), release year
+#   - per user: history sequence (last K items + ratings)
+#   - per item: history sequence (last K raters + ratings)
+#   - per sample: timestamp normalized
 
 _cache_key = hashlib.md5(json.dumps({
-    "feature_version": 5,                 # match legacy cache version
+    "feature_version": "restart-1",       # bones-only, separate from legacy
     "dataset": DATASET, "neg_ratio": NEG_RATIO,
     "history_len": HISTORY_LEN, "item_hist_len": ITEM_HIST_LEN,
     "num_users": num_users, "num_items": num_items,
@@ -100,23 +104,14 @@ if _cache_path.exists():
     _c = np.load(_cache_path, allow_pickle=True)
     movie_genres = _c["movie_genres"]
     num_genres = movie_genres.shape[1]
-    user_hist_bins = _c["user_hist_bins"]
-    item_hist_bins = _c["item_hist_bins"]
-    user_count_norm = _c["user_count_norm"]
-    item_count_norm = _c["item_count_norm"]
     user_histories = _c["user_histories"]
     user_hist_ratings = _c["user_hist_ratings"]
     item_histories = _c["item_histories"]
     item_hist_ratings = _c["item_hist_ratings"]
-    user_genre_affinity = _c["user_genre_affinity"]
     ts_min = float(_c["ts_min"])
     ts_range = float(_c["ts_range"])
     movie_year = _c["movie_year"]
-    movie_genre_count = _c["movie_genre_count"]
     genome_matrix = _c["genome_matrix"]
-    has_genome = _c["has_genome"]
-    user_genome = _c["user_genome"]
-    has_user_genome = _c["has_user_genome"]
     GENOME_DIM = genome_matrix.shape[1]
     del _c
 else:
@@ -138,24 +133,11 @@ else:
                 if g in genre_to_idx:
                     movie_genres[mid, genre_to_idx[g]] = 1.0
 
-    # Rating histograms (5-bin per user/item)
+    # User/item history sequences (raw, last K)
     _uids = real_train["userId"].values
     _mids = real_train["movieId"].values
     _ratings = real_train["rating"].values
-    _bins = np.clip((_ratings - 0.01) // 1, 0, 4).astype(np.intp)
-    user_hist_bins = np.zeros((num_users, 5), dtype=np.float32)
-    item_hist_bins = np.zeros((num_items, 5), dtype=np.float32)
-    np.add.at(user_hist_bins, (_uids, _bins), 1)
-    np.add.at(item_hist_bins, (_mids, _bins), 1)
-    user_count = user_hist_bins.sum(axis=1)
-    item_count = item_hist_bins.sum(axis=1)
-    user_hist_bins /= (user_count[:, None] + 1e-8)
-    item_hist_bins /= (item_count[:, None] + 1e-8)
-    user_count_norm = (user_count - user_count.mean()) / (user_count.std() + 1e-8)
-    item_count_norm = (item_count - item_count.mean()) / (item_count.std() + 1e-8)
-    del _bins
-
-    # User/item history sequences
+    _ts = real_train["timestamp"].values
     PAD_IDX = num_items
     USER_PAD_IDX = num_users
     def _build_history(ids, targets, ratings, timestamps, n_entities, pad_idx, max_len):
@@ -174,30 +156,17 @@ else:
             hist_rat[eid, -length:] = s_ratings[e - length:e]
         return hist, hist_rat
 
-    _ts = real_train["timestamp"].values
     user_histories, user_hist_ratings = _build_history(_uids, _mids, _ratings, _ts,
                                                        num_users, PAD_IDX, HISTORY_LEN)
     item_histories, item_hist_ratings = _build_history(_mids, _uids, _ratings, _ts,
                                                        num_items, USER_PAD_IDX, ITEM_HIST_LEN)
-
-    # User-genre affinity
-    user_genre_affinity = np.zeros((num_users, num_genres), dtype=np.float32)
-    user_genre_count = np.zeros((num_users, num_genres), dtype=np.float32)
-    _gi = movie_genres[_mids]
-    np.add.at(user_genre_affinity, _uids, _ratings[:, None].astype(np.float32) * _gi)
-    np.add.at(user_genre_count, _uids, _gi)
-    mask = user_genre_count > 0
-    user_genre_affinity[mask] /= user_genre_count[mask]
-    mu = user_genre_affinity[mask].mean()
-    sigma = user_genre_affinity[mask].std() + 1e-8
-    user_genre_affinity[mask] = (user_genre_affinity[mask] - mu) / sigma
-    del _uids, _mids, _ratings, _ts, _gi
+    del _uids, _mids, _ratings, _ts
 
     # Timestamp normalization
     ts_min = float(real_train["timestamp"].min())
     ts_range = float(real_train["timestamp"].max() - ts_min) + 1.0
 
-    # Movie release year
+    # Movie release year (parsed from title)
     movie_year = np.zeros(num_items, dtype=np.float32)
     for _, row in movies_df.iterrows():
         mid = int(row["movieId"])
@@ -210,10 +179,6 @@ else:
         median_year = np.median(valid_years)
         movie_year[movie_year == 0] = median_year
         movie_year = (movie_year - movie_year.mean()) / (movie_year.std() + 1e-8)
-
-    # Genre count per movie
-    movie_genre_count = movie_genres.sum(axis=1).astype(np.float32)
-    movie_genre_count = (movie_genre_count - movie_genre_count.mean()) / (movie_genre_count.std() + 1e-8)
 
     # Tag genome (1128 relevance scores per movie, ml-25m only — zeros otherwise)
     _genome_path = Path(__file__).parent / "data" / DATASET / "genome-scores.csv"
@@ -237,57 +202,29 @@ else:
             _gdf = pd.read_csv(_genome_path)
             _num_tags = int(_gdf["tagId"].max())
             genome_matrix = np.zeros((num_items, _num_tags), dtype=np.float32)
-            has_genome = np.zeros(num_items, dtype=np.float32)
             _gdf["mapped_mid"] = _gdf["movieId"].map(_movie_map)
             _gdf = _gdf.dropna(subset=["mapped_mid"])
             _gdf["mapped_mid"] = _gdf["mapped_mid"].astype(int)
+            _have = 0
             for mid, group in _gdf.groupby("mapped_mid"):
                 if mid < num_items:
                     tag_ids = group["tagId"].values.astype(int) - 1
                     genome_matrix[mid, tag_ids] = group["relevance"].values.astype(np.float32)
-                    has_genome[mid] = 1.0
-            log.info(f"Tag genome: {int(has_genome.sum())}/{num_items} movies "
-                     f"({has_genome.mean()*100:.1f}%)")
+                    _have += 1
+            log.info(f"Tag genome: {_have}/{num_items} movies ({100*_have/num_items:.1f}%)")
         else:
             genome_matrix = np.zeros((num_items, 1128), dtype=np.float32)
-            has_genome = np.zeros(num_items, dtype=np.float32)
     else:
         genome_matrix = np.zeros((num_items, 1128), dtype=np.float32)
-        has_genome = np.zeros(num_items, dtype=np.float32)
     GENOME_DIM = genome_matrix.shape[1]
 
-    # Per-user genome profile (mean of genome over user's high-rated genome-having items)
-    log.info("Computing user genome profiles...")
-    user_genome = np.zeros((num_users, GENOME_DIM), dtype=np.float32)
-    _ug_count = np.zeros(num_users, dtype=np.float32)
-    _hr = real_train["rating"].values >= 4.0
-    _hu = real_train["userId"].values[_hr].astype(np.int64)
-    _hm = real_train["movieId"].values[_hr].astype(np.int64)
-    _hg = has_genome[_hm] > 0
-    _hu = _hu[_hg]; _hm = _hm[_hg]
-    for i in range(0, len(_hu), 500_000):
-        u_chunk = _hu[i:i + 500_000]
-        m_chunk = _hm[i:i + 500_000]
-        np.add.at(user_genome, u_chunk, genome_matrix[m_chunk])
-        np.add.at(_ug_count, u_chunk, 1.0)
-    _has_ug = _ug_count > 0
-    user_genome[_has_ug] /= _ug_count[_has_ug, None]
-    has_user_genome = _has_ug.astype(np.float32)
-    del _hr, _hu, _hm, _hg, _has_ug, _ug_count
-
     np.savez_compressed(_cache_path,
-        movie_genres=movie_genres, user_hist_bins=user_hist_bins,
-        item_hist_bins=item_hist_bins, user_count_norm=user_count_norm,
-        item_count_norm=item_count_norm, user_histories=user_histories,
-        user_hist_ratings=user_hist_ratings,
-        user_hist_timestamps=np.zeros((num_users, HISTORY_LEN), dtype=np.int32),
+        movie_genres=movie_genres,
+        user_histories=user_histories, user_hist_ratings=user_hist_ratings,
         item_histories=item_histories, item_hist_ratings=item_hist_ratings,
-        item_hist_timestamps=np.zeros((num_items, ITEM_HIST_LEN), dtype=np.int32),
-        user_genre_affinity=user_genre_affinity,
         ts_min=np.array(ts_min), ts_range=np.array(ts_range),
-        movie_year=movie_year, movie_genre_count=movie_genre_count,
-        genome_matrix=genome_matrix, has_genome=has_genome,
-        user_genome=user_genome, has_user_genome=has_user_genome,
+        movie_year=movie_year,
+        genome_matrix=genome_matrix,
     )
     log.info(f"Features cached to {_cache_path.name}")
 
@@ -301,32 +238,23 @@ _item_hist_t = torch.from_numpy(item_histories).to(DEVICE)
 _item_hist_rat_t = torch.from_numpy(item_hist_ratings).to(DEVICE)
 _movie_genres_t = torch.from_numpy(movie_genres).to(DEVICE)
 _genome_t = torch.from_numpy(genome_matrix).to(DEVICE)
-_user_genome_t = torch.from_numpy(user_genome).to(DEVICE)
+_movie_year_t = torch.from_numpy(movie_year).to(DEVICE)
 
-# Per-sample dense features (computed once for train + eval)
+
+# Per-sample dense features (just timestamp; year is per-movie, looked up at forward time)
 def _build_sample_tensors(df):
     uids = df["userId"].values.astype(np.int64)
     mids = df["movieId"].values.astype(np.int64)
     labels = df["label"].values.astype(np.float32)
-    ts_norm = ((df["timestamp"].values - ts_min) / ts_range).astype(np.float32)
-    ug_dot = np.sum(user_genre_affinity[uids] * movie_genres[mids], axis=1).astype(np.float32)
-    movie_age = ts_norm - movie_year[mids]
-    dense = np.column_stack([
-        ts_norm,
-        user_hist_bins[uids], user_count_norm[uids],
-        item_hist_bins[mids], item_count_norm[mids],
-        ug_dot,
-        movie_year[mids], movie_genre_count[mids], movie_age,
-    ]).astype(np.float32)
+    ts_norm = ((df["timestamp"].values - ts_min) / ts_range).astype(np.float32).reshape(-1, 1)
     return (torch.from_numpy(uids).to(DEVICE),
             torch.from_numpy(mids).to(DEVICE),
-            torch.from_numpy(dense).to(DEVICE),
+            torch.from_numpy(ts_norm).to(DEVICE),
             torch.from_numpy(labels).to(DEVICE))
 
 log.info("Precomputing training tensors...")
-train_uids, train_mids, train_dense, train_labels = _build_sample_tensors(train_df)
+train_uids, train_mids, train_ts, train_labels = _build_sample_tensors(train_df)
 n_train = len(train_labels)
-DENSE_DIM = train_dense.shape[1]
 
 # ─── Eval set: val pos + val hard neg + sampled easy neg ──────────
 _val_pos_mask = val_df["label"] == 1
@@ -355,7 +283,7 @@ _eval_df = pd.DataFrame({
     "label": np.concatenate([np.ones(_n_val_pos), np.zeros(len(_val_hard_neg)), np.zeros(_n_val_pos)]),
 })
 log.info("Precomputing eval tensors...")
-eval_uids, eval_mids, eval_dense, eval_labels_t = _build_sample_tensors(_eval_df)
+eval_uids, eval_mids, eval_ts, eval_labels_t = _build_sample_tensors(_eval_df)
 n_eval = len(eval_uids)
 log.info(f"Eval set: {_n_val_pos} pos + {len(_val_hard_neg)} hard neg + {_n_val_pos} easy neg = {n_eval}")
 
@@ -365,26 +293,26 @@ log.info(f"Eval set: {_n_val_pos} pos + {len(_val_hard_neg)} hard neg + {_n_val_
 # ═══════════════════════════════════════════════════════════════════
 
 class LinearBaseline(nn.Module):
-    """concat(all features) -> Linear(in, 1) -> sigmoid."""
-    def __init__(self, num_users, num_items, num_genres, dense_dim, genome_dim, embed_dim):
+    """concat(features) -> Linear(in, 1) -> sigmoid."""
+    def __init__(self, num_users, num_items, num_genres, genome_dim, embed_dim):
         super().__init__()
         D = embed_dim
         # Embeddings (+1 row for PAD)
         self.user_embed = nn.Embedding(num_users + 1, D, padding_idx=num_users)
         self.item_embed = nn.Embedding(num_items + 1, D, padding_idx=num_items)
-        # Single Linear projection of genre multi-hot (no hidden layer; this is not an MLP)
+        # Single Linear projection of genre multi-hot (no hidden layer; no nonlinearity)
         self.genre_proj = nn.Linear(num_genres, D, bias=False)
         # Concat dim:
         #   user_e (D) + item_e (D)
         #   user_hist mean (D) + user_hist mean rating (1)
         #   item_hist mean (D) + item_hist mean rating (1)
         #   genre_proj (D)
-        #   dense (dense_dim)
-        #   genome (genome_dim) + user_genome (genome_dim)
-        self.in_dim = 5 * D + 2 + dense_dim + 2 * genome_dim
+        #   ts_norm (1) + movie_year (1)
+        #   genome (genome_dim)
+        self.in_dim = 5 * D + 4 + genome_dim
         self.head = nn.Linear(self.in_dim, 1)
 
-    def forward(self, uids, mids, dense):
+    def forward(self, uids, mids, ts):
         u_e = self.user_embed(uids)
         i_e = self.item_embed(mids)
 
@@ -408,25 +336,25 @@ class LinearBaseline(nn.Module):
         i_hist_rat_mean = (i_hist_rat * i_valid.squeeze(-1)).sum(dim=1) / i_count.squeeze(-1)
         i_hist_rat_mean = i_hist_rat_mean.unsqueeze(-1)
 
-        # Genres + genome lookups
+        # Item content: genre + genome + year
         genre_e = self.genre_proj(_movie_genres_t[mids])  # (B, D)
         genome_e = _genome_t[mids]                        # (B, GENOME_DIM)
-        u_genome = _user_genome_t[uids]                   # (B, GENOME_DIM)
+        year = _movie_year_t[mids].unsqueeze(-1)          # (B, 1)
 
         x = torch.cat([
             u_e, i_e,
             u_hist_pool, u_hist_rat_mean,
             i_hist_pool, i_hist_rat_mean,
             genre_e,
-            dense,
-            genome_e, u_genome,
+            ts, year,
+            genome_e,
         ], dim=-1)
         return self.head(x).squeeze(-1)
 
 
-model = LinearBaseline(num_users, num_items, num_genres, DENSE_DIM, GENOME_DIM, EMBED_DIM).to(DEVICE)
+model = LinearBaseline(num_users, num_items, num_genres, GENOME_DIM, EMBED_DIM).to(DEVICE)
 n_params = sum(p.numel() for p in model.parameters())
-log.info(f"Parameters: {n_params/1e6:.1f}M | dense_dim={DENSE_DIM} | genome_dim={GENOME_DIM} | "
+log.info(f"Parameters: {n_params/1e6:.1f}M | genome_dim={GENOME_DIM} | "
          f"in_dim={model.in_dim} | head_params={(model.in_dim + 1)}")
 
 opt = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
@@ -444,7 +372,7 @@ def run_eval():
     with torch.no_grad():
         for s in range(0, n_eval, eval_batch):
             e = min(s + eval_batch, n_eval)
-            logits = model(eval_uids[s:e], eval_mids[s:e], eval_dense[s:e])
+            logits = model(eval_uids[s:e], eval_mids[s:e], eval_ts[s:e])
             scores.append(torch.sigmoid(logits).cpu().numpy())
     model.train()
     scores = np.concatenate(scores)
@@ -464,11 +392,10 @@ loss_n = 0
 done = False
 
 for epoch in range(MAX_EPOCHS):
-    # Shuffle training indices
     perm = torch.randperm(n_train, device=DEVICE)
     for b in range(n_batches_per_epoch):
         idx = perm[b * BATCH_SIZE:(b + 1) * BATCH_SIZE]
-        logits = model(train_uids[idx], train_mids[idx], train_dense[idx])
+        logits = model(train_uids[idx], train_mids[idx], train_ts[idx])
         loss = loss_fn(logits, train_labels[idx])
         opt.zero_grad()
         loss.backward()
@@ -504,8 +431,6 @@ if best_state is not None:
     log.info(f"Restored best model (AUC: {best_auc:.4f})")
 
 t_train_end = time.time()
-
-# Final eval (uses best weights)
 final_metrics = run_eval()
 
 if torch.cuda.is_available():

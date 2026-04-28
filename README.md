@@ -25,9 +25,9 @@ graph TD
         UHIST["User history<br/>(last 100 items + ratings)"]
         IHIST["Item history<br/>(last 30 raters + ratings)"]
         GENRE["Genre multi-hot (20)"]
-        DENSE["Dense (17)<br/>timestamp, rating histograms,<br/>counts, ug_dot, year,<br/>genre_count, movie_age"]
+        TS["timestamp_norm (1)"]
+        YEAR["movie_year (1)"]
         GENOME["Tag genome (1128)"]
-        UGENOME["User genome (1128)"]
     end
 
     subgraph "Embeddings (trainable)"
@@ -46,16 +46,16 @@ graph TD
         GENRE --> GP["Linear(20, 28, bias=False)<br/>→ genre_e"]
     end
 
-    UE --> CONCAT["concat<br/>(in_dim ≈ 2400 for ml-25m)"]
+    UE --> CONCAT["concat<br/>(in_dim ≈ 1272 for ml-25m)"]
     IE --> CONCAT
     UHP --> CONCAT
     UHR --> CONCAT
     IHP --> CONCAT
     IHR --> CONCAT
     GP --> CONCAT
-    DENSE --> CONCAT
+    TS --> CONCAT
+    YEAR --> CONCAT
     GENOME --> CONCAT
-    UGENOME --> CONCAT
 
     CONCAT --> HEAD["Linear(in_dim, 1)"]
     HEAD --> SIGMOID["sigmoid"]
@@ -69,7 +69,9 @@ graph TD
     style PRED fill:#c8e6c9
 ```
 
-The "linear" naming refers to the prediction head — embeddings are still trainable (~6.1M params for ml-25m). The `genre_proj` is a single bias-free Linear that projects a 20-dim multi-hot into 28-dim; it has no nonlinearity. Total ~6.2M params; the head itself is ~2.4K params.
+The "linear" naming refers to the prediction head — embeddings are still trainable (~6.1M params for ml-25m). The `genre_proj` is a single bias-free Linear that projects a 20-dim multi-hot into 28-dim; it has no nonlinearity.
+
+Stripped to the bones: only raw IDs, raw history sequences, and pure content metadata (genres, tag genome, year, timestamp). All pre-computed user/item statistics — rating histograms, counts, user-genre affinity, user genome profile — are out, on the principle that aggregations are relationships the model should learn from raw data, not inputs hand-specified before training.
 
 ## Layout
 
@@ -101,4 +103,4 @@ DATASET=ml-25m uv run python train.py
 - The 16 architectural-cycle's worth of dropouts, gates, residuals, and conditional flags
 - Anything in `legacy/train.py` past the feature-engineering section
 
-The starting baseline AUC will be substantially below 0.8284 — that's the point. Build it back up deliberately.
+Stripped baseline AUC: **0.8217 on ml-25m** (deterministic, SEED=42). Surprisingly close to the legacy 0.8284 ceiling without any of its machinery — and notably higher than the same linear head with all of legacy's pre-computed user/item statistics fed in (0.7848). The pre-computed aggregations were diluting signal, not adding it.

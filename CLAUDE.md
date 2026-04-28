@@ -50,7 +50,7 @@ grep "^val_auc:\|^peak_memory_mb:" run.log
 
 ## Current checked-in baseline (train.py)
 
-`concat(features) → Linear(in, 1) → sigmoid`. The features:
+`concat(features) → Linear(in, 1) → sigmoid`. Stripped to the bones — only raw IDs, raw history sequences, and pure content metadata. All pre-computed user/item statistics (rating histograms, counts, user-genre affinity, user genome profile) are removed on the principle that aggregations are relationships the model should learn from raw data, not inputs hand-specified before training.
 
 ```
 - userId  → Embedding(num_users, 28)            → user_e (28)
@@ -62,11 +62,11 @@ grep "^val_auc:\|^peak_memory_mb:" run.log
     mean-pool of user_embed over valid raters    → item_hist_pool (28)
     mean rating in item history                  → item_hist_rat_mean (1)
 - Genre multi-hot (20) → Linear(20, 28, bias=False) → genre_e (28)
-- Dense (17): timestamp, user-rating-histogram (5), user-count, item-rating-histogram (5), item-count, ug_dot, year, genre-count, movie_age
+- timestamp_norm                                  → ts (1)
+- movie_year                                      → year (1)
 - Tag genome (1128, raw)                          → genome (1128)
-- Per-user genome profile (1128, raw)             → user_genome (1128)
 
-concat → Linear(in_dim, 1) → sigmoid
+concat → Linear(in_dim, 1) → sigmoid    # in_dim = 5*28 + 4 + 1128 = 1272 (ml-25m)
 
 Loss: BCEWithLogitsLoss
 Optimizer: Adam, lr=1e-3, weight_decay=1e-5
