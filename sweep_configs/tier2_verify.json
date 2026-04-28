@@ -1,0 +1,18 @@
+[
+  {"name": "t09_stack_both_centered_s42", "env": {"USER_HIST_POOL": "rating_centered", "ITEM_HIST_POOL": "rating_centered"}},
+
+  {"name": "noise_baseline_s43", "env": {"SEED": "43"}},
+  {"name": "noise_baseline_s44", "env": {"SEED": "44"}},
+  {"name": "noise_baseline_s45", "env": {"SEED": "45"}},
+  {"name": "noise_baseline_s46", "env": {"SEED": "46"}},
+
+  {"name": "verify_user_centered_s43", "env": {"SEED": "43", "USER_HIST_POOL": "rating_centered"}},
+  {"name": "verify_user_centered_s44", "env": {"SEED": "44", "USER_HIST_POOL": "rating_centered"}},
+  {"name": "verify_user_centered_s45", "env": {"SEED": "45", "USER_HIST_POOL": "rating_centered"}},
+  {"name": "verify_user_centered_s46", "env": {"SEED": "46", "USER_HIST_POOL": "rating_centered"}},
+
+  {"name": "verify_stack_s43", "env": {"SEED": "43", "USER_HIST_POOL": "rating_centered", "ITEM_HIST_POOL": "rating_centered"}},
+  {"name": "verify_stack_s44", "env": {"SEED": "44", "USER_HIST_POOL": "rating_centered", "ITEM_HIST_POOL": "rating_centered"}},
+  {"name": "verify_stack_s45", "env": {"SEED": "45", "USER_HIST_POOL": "rating_centered", "ITEM_HIST_POOL": "rating_centered"}},
+  {"name": "verify_stack_s46", "env": {"SEED": "46", "USER_HIST_POOL": "rating_centered", "ITEM_HIST_POOL": "rating_centered"}}
+]

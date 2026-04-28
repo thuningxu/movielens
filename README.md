@@ -36,9 +36,9 @@ graph TD
     end
 
     subgraph "Pooling (no params)"
-        UHIST --> UHP["mean-pool of item_embed<br/>over valid positions → 28"]
+        UHIST --> UHP["rating-centered pool of item_embed<br/>weight = (rating − 0.6) * valid<br/>→ 28"]
         UHIST --> UHR["mean rating → 1"]
-        IHIST --> IHP["mean-pool of user_embed<br/>over valid raters → 28"]
+        IHIST --> IHP["rating-centered pool of user_embed<br/>weight = (rating − 0.6) * valid<br/>→ 28"]
         IHIST --> IHR["mean rating → 1"]
     end
 
@@ -99,4 +99,4 @@ DATASET=ml-25m uv run python train.py
 - The 16 architectural-cycle's worth of dropouts, gates, residuals, and conditional flags
 - Anything in `legacy/train.py` past the feature-engineering section
 
-Stripped baseline AUC: **0.8219 on ml-25m** (deterministic, SEED=42). Surprisingly close to the legacy 0.8284 ceiling without any of its machinery — and notably higher than the same linear head with all of legacy's pre-computed user/item statistics fed in (0.7848). The pre-computed aggregations were diluting signal, not adding it.
+Current baseline AUC: **0.8246 on ml-25m** (deterministic, SEED=42; 5-seed mean +0.00258 over the prior 0.8219 mean-pool baseline). Reached by switching both user-history and item-history pools from a plain mean to a rating-centered weighted pool (`weight = (rating - 0.6) * is_valid`, normalize by sum-of-absolute-weights): items rated above 3 stars push the pool *toward* their embedding, items below 3 stars push *away*. No new params, no new layers — just a different aggregator.

@@ -8,7 +8,7 @@ Restart (apr28) of the MovieLens hybrid engagement prediction project. Same task
 
 The legacy project at `legacy/` reached **val_auc = 0.8284** but two separate ceiling tests (apr27, apr27c) confirmed the architecture family is saturated. This restart begins from the **simplest possible model — a single Linear head on concatenated features — with the same input features**, so future architectural decisions can be motivated by clean ablations rather than 540 experiments of inherited assumptions.
 
-The starting baseline AUC will be substantially below 0.8284. Build it back up deliberately.
+Current baseline: **0.8246 on ml-25m** (5-seed mean +0.00258 over the prior 0.8219 mean-pool baseline; σ ≈ 0.00008 across SEEDs 42-46). Reached by replacing the plain mean-pool over user/item history with a rating-centered weighted pool — items rated above 3 stars push the pool toward their embedding, items below push away. Zero new parameters; the win is in the choice of aggregator.
 
 ## Commands
 
@@ -56,10 +56,13 @@ grep "^val_auc:\|^peak_memory_mb:" run.log
 - userId  → Embedding(num_users, 28)            → user_e (28)
 - movieId → Embedding(num_items, 28)            → item_e (28)
 - User history (last 100 items + ratings):
-    mean-pool of item_embed over valid positions → user_hist_pool (28)
+    rating-centered pool of item_embed           → user_hist_pool (28)
+      weight = (rating - 0.6) * is_valid
+      normalize by sum(|weight|).clamp(1e-6)
     mean rating in user history                  → user_hist_rat_mean (1)
 - Item history (last 30 raters + ratings):
-    mean-pool of user_embed over valid raters    → item_hist_pool (28)
+    rating-centered pool of user_embed           → item_hist_pool (28)
+      weight = (rating - 0.6) * is_valid
     mean rating in item history                  → item_hist_rat_mean (1)
 - Genre multi-hot (raw, no projection)            → genre (num_genres, e.g. 20)
 - timestamp_norm                                  → ts (1)

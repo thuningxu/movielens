@@ -1,0 +1,10 @@
+[
+  {"name": "t01_baseline_replicate", "env": {}},
+  {"name": "t02_user_pool_rating", "env": {"USER_HIST_POOL": "rating"}},
+  {"name": "t03_user_pool_rating_centered", "env": {"USER_HIST_POOL": "rating_centered"}},
+  {"name": "t04_item_pool_rating", "env": {"ITEM_HIST_POOL": "rating"}},
+  {"name": "t05_item_pool_rating_centered", "env": {"ITEM_HIST_POOL": "rating_centered"}},
+  {"name": "t06_user_dislike_pool", "env": {"USER_HIST_DISLIKE_POOL": "1"}},
+  {"name": "t07_user_last_position", "env": {"USER_HIST_LAST_POSITION": "1"}},
+  {"name": "t08_item_last_position", "env": {"ITEM_HIST_LAST_POSITION": "1"}}
+]

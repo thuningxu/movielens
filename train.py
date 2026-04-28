@@ -60,8 +60,8 @@ EVAL_PER_EPOCH = int(os.environ.get("EVAL_PER_EPOCH", "3"))
 MAX_EPOCHS = int(os.environ.get("MAX_EPOCHS", "20"))
 
 # History pooling modes (mean is the byte-equivalent default).
-USER_HIST_POOL = os.environ.get("USER_HIST_POOL", "mean")
-ITEM_HIST_POOL = os.environ.get("ITEM_HIST_POOL", "mean")
+USER_HIST_POOL = os.environ.get("USER_HIST_POOL", "rating_centered")
+ITEM_HIST_POOL = os.environ.get("ITEM_HIST_POOL", "rating_centered")
 assert USER_HIST_POOL in {"mean", "rating", "rating_centered"}, USER_HIST_POOL
 assert ITEM_HIST_POOL in {"mean", "rating", "rating_centered"}, ITEM_HIST_POOL
 
