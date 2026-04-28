@@ -300,16 +300,14 @@ class LinearBaseline(nn.Module):
         # Embeddings (+1 row for PAD)
         self.user_embed = nn.Embedding(num_users + 1, D, padding_idx=num_users)
         self.item_embed = nn.Embedding(num_items + 1, D, padding_idx=num_items)
-        # Single Linear projection of genre multi-hot (no hidden layer; no nonlinearity)
-        self.genre_proj = nn.Linear(num_genres, D, bias=False)
         # Concat dim:
         #   user_e (D) + item_e (D)
         #   user_hist mean (D) + user_hist mean rating (1)
         #   item_hist mean (D) + item_hist mean rating (1)
-        #   genre_proj (D)
+        #   genre multi-hot (num_genres, raw — no projection)
         #   ts_norm (1) + movie_year (1)
         #   genome (genome_dim)
-        self.in_dim = 5 * D + 4 + genome_dim
+        self.in_dim = 4 * D + 2 + num_genres + 2 + genome_dim
         self.head = nn.Linear(self.in_dim, 1)
 
     def forward(self, uids, mids, ts):
@@ -336,8 +334,8 @@ class LinearBaseline(nn.Module):
         i_hist_rat_mean = (i_hist_rat * i_valid.squeeze(-1)).sum(dim=1) / i_count.squeeze(-1)
         i_hist_rat_mean = i_hist_rat_mean.unsqueeze(-1)
 
-        # Item content: genre + genome + year
-        genre_e = self.genre_proj(_movie_genres_t[mids])  # (B, D)
+        # Item content: raw genre multi-hot + raw genome + year
+        genre_raw = _movie_genres_t[mids]                 # (B, num_genres)
         genome_e = _genome_t[mids]                        # (B, GENOME_DIM)
         year = _movie_year_t[mids].unsqueeze(-1)          # (B, 1)
 
@@ -345,7 +343,7 @@ class LinearBaseline(nn.Module):
             u_e, i_e,
             u_hist_pool, u_hist_rat_mean,
             i_hist_pool, i_hist_rat_mean,
-            genre_e,
+            genre_raw,
             ts, year,
             genome_e,
         ], dim=-1)

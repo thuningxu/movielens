@@ -61,19 +61,19 @@ grep "^val_auc:\|^peak_memory_mb:" run.log
 - Item history (last 30 raters + ratings):
     mean-pool of user_embed over valid raters    → item_hist_pool (28)
     mean rating in item history                  → item_hist_rat_mean (1)
-- Genre multi-hot (20) → Linear(20, 28, bias=False) → genre_e (28)
+- Genre multi-hot (raw, no projection)            → genre (num_genres, e.g. 20)
 - timestamp_norm                                  → ts (1)
 - movie_year                                      → year (1)
 - Tag genome (1128, raw)                          → genome (1128)
 
-concat → Linear(in_dim, 1) → sigmoid    # in_dim = 5*28 + 4 + 1128 = 1272 (ml-25m)
+concat → Linear(in_dim, 1) → sigmoid    # in_dim = 4*28 + 20 + 4 + 1128 = 1264 (ml-25m)
 
 Loss: BCEWithLogitsLoss
 Optimizer: Adam, lr=1e-3, weight_decay=1e-5
 Training: batch=16384, sub-epoch eval 3×, patience=3 evals, max 20 epochs
 ```
 
-The "linear" naming refers to the prediction head — embeddings are still trainable (~6M params for ml-25m). The `genre_proj` is a single bias-free Linear that exists purely to project a high-dimensional one-hot into the same dim as the embeddings; it has no nonlinearity.
+The "linear" naming refers to the prediction head — embeddings are still trainable (~6M params for ml-25m). Genre multi-hot, timestamp, year, and tag genome go straight into the concat with no intermediate projection (a `Linear(20, 28) → Linear(in, 1)` chain is expressively equivalent to a direct slice in the head).
 
 ## Discipline
 

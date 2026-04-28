@@ -42,17 +42,13 @@ graph TD
         IHIST --> IHR["mean rating → 1"]
     end
 
-    subgraph "Projection"
-        GENRE --> GP["Linear(20, 28, bias=False)<br/>→ genre_e"]
-    end
-
-    UE --> CONCAT["concat<br/>(in_dim ≈ 1272 for ml-25m)"]
+    UE --> CONCAT["concat<br/>(in_dim = 1264 for ml-25m)"]
     IE --> CONCAT
     UHP --> CONCAT
     UHR --> CONCAT
     IHP --> CONCAT
     IHR --> CONCAT
-    GP --> CONCAT
+    GENRE --> CONCAT
     TS --> CONCAT
     YEAR --> CONCAT
     GENOME --> CONCAT
@@ -69,7 +65,7 @@ graph TD
     style PRED fill:#c8e6c9
 ```
 
-The "linear" naming refers to the prediction head — embeddings are still trainable (~6.1M params for ml-25m). The `genre_proj` is a single bias-free Linear that projects a 20-dim multi-hot into 28-dim; it has no nonlinearity.
+The "linear" naming refers to the prediction head — embeddings are still trainable (~6.1M params for ml-25m); the head itself is ~1.3K params. Genre multi-hot, timestamp, year, and tag genome feed the head as-is, with no intermediate projection (a `Linear(20, 28) → Linear(in, 1)` chain is mathematically equivalent to a direct `Linear(20, 1)` slice in the head — the projection was redundant).
 
 Stripped to the bones: only raw IDs, raw history sequences, and pure content metadata (genres, tag genome, year, timestamp). All pre-computed user/item statistics — rating histograms, counts, user-genre affinity, user genome profile — are out, on the principle that aggregations are relationships the model should learn from raw data, not inputs hand-specified before training.
 
@@ -103,4 +99,4 @@ DATASET=ml-25m uv run python train.py
 - The 16 architectural-cycle's worth of dropouts, gates, residuals, and conditional flags
 - Anything in `legacy/train.py` past the feature-engineering section
 
-Stripped baseline AUC: **0.8217 on ml-25m** (deterministic, SEED=42). Surprisingly close to the legacy 0.8284 ceiling without any of its machinery — and notably higher than the same linear head with all of legacy's pre-computed user/item statistics fed in (0.7848). The pre-computed aggregations were diluting signal, not adding it.
+Stripped baseline AUC: **0.8219 on ml-25m** (deterministic, SEED=42). Surprisingly close to the legacy 0.8284 ceiling without any of its machinery — and notably higher than the same linear head with all of legacy's pre-computed user/item statistics fed in (0.7848). The pre-computed aggregations were diluting signal, not adding it.
