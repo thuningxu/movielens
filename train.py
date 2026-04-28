@@ -59,6 +59,17 @@ PATIENCE = int(os.environ.get("PATIENCE", "3"))
 EVAL_PER_EPOCH = int(os.environ.get("EVAL_PER_EPOCH", "3"))
 MAX_EPOCHS = int(os.environ.get("MAX_EPOCHS", "20"))
 
+# History pooling modes (mean is the byte-equivalent default).
+USER_HIST_POOL = os.environ.get("USER_HIST_POOL", "mean")
+ITEM_HIST_POOL = os.environ.get("ITEM_HIST_POOL", "mean")
+assert USER_HIST_POOL in {"mean", "rating", "rating_centered"}, USER_HIST_POOL
+assert ITEM_HIST_POOL in {"mean", "rating", "rating_centered"}, ITEM_HIST_POOL
+
+# Optional add-on fields (each appends one D-dim field to the concat).
+USER_HIST_DISLIKE_POOL = int(os.environ.get("USER_HIST_DISLIKE_POOL", "0"))
+USER_HIST_LAST_POSITION = int(os.environ.get("USER_HIST_LAST_POSITION", "0"))
+ITEM_HIST_LAST_POSITION = int(os.environ.get("ITEM_HIST_LAST_POSITION", "0"))
+
 # ─── Device ────────────────────────────────────────────────────────
 torch.manual_seed(SEED)
 if torch.cuda.is_available():
@@ -292,6 +303,33 @@ log.info(f"Eval set: {_n_val_pos} pos + {len(_val_hard_neg)} hard neg + {_n_val_
 # MODEL — single Linear head on concatenated features
 # ═══════════════════════════════════════════════════════════════════
 
+def _pool_history(embed, ratings, valid, mode):
+    """Pool a (B, L, D) embedding sequence over valid positions.
+
+    embed:   (B, L, D)
+    ratings: (B, L)       — already normalized to [0, 1] (rating / 5.0)
+    valid:   (B, L)       — float, 1.0 for non-PAD, 0.0 for PAD
+    mode: 'mean' | 'rating' | 'rating_centered'
+    Returns (B, D).
+    """
+    valid_e = valid.unsqueeze(-1)                                     # (B, L, 1)
+    if mode == "mean":
+        count = valid.sum(dim=1, keepdim=True).clamp(min=1.0)         # (B, 1)
+        return (embed * valid_e).sum(dim=1) / count
+    if mode == "rating":
+        w = ratings * valid                                           # (B, L)
+        w_e = w.unsqueeze(-1)                                         # (B, L, 1)
+        denom = w.sum(dim=1, keepdim=True).clamp(min=1e-6)            # (B, 1)
+        return (embed * w_e).sum(dim=1) / denom
+    if mode == "rating_centered":
+        # Allow negative weights; normalize by sum of absolute weights.
+        w = (ratings - 0.6) * valid                                   # (B, L)
+        w_e = w.unsqueeze(-1)
+        denom = w.abs().sum(dim=1, keepdim=True).clamp(min=1e-6)
+        return (embed * w_e).sum(dim=1) / denom
+    raise ValueError(f"Unknown pool mode: {mode}")
+
+
 class LinearBaseline(nn.Module):
     """concat(features) -> Linear(in, 1) -> sigmoid."""
     def __init__(self, num_users, num_items, num_genres, genome_dim, embed_dim):
@@ -302,36 +340,43 @@ class LinearBaseline(nn.Module):
         self.item_embed = nn.Embedding(num_items + 1, D, padding_idx=num_items)
         # Concat dim:
         #   user_e (D) + item_e (D)
-        #   user_hist mean (D) + user_hist mean rating (1)
-        #   item_hist mean (D) + item_hist mean rating (1)
+        #   user_hist pool (D) + user_hist mean rating (1)
+        #   item_hist pool (D) + item_hist mean rating (1)
         #   genre multi-hot (num_genres, raw — no projection)
         #   ts_norm (1) + movie_year (1)
         #   genome (genome_dim)
-        self.in_dim = 4 * D + 2 + num_genres + 2 + genome_dim
+        # Optional add-on fields (each adds D when its flag is on):
+        #   USER_HIST_DISLIKE_POOL: parallel "dislike" pool over user history
+        #   USER_HIST_LAST_POSITION: most recent valid item embedding
+        #   ITEM_HIST_LAST_POSITION: most recent valid rater embedding
+        addon_fields = (USER_HIST_DISLIKE_POOL
+                        + USER_HIST_LAST_POSITION
+                        + ITEM_HIST_LAST_POSITION)
+        self.in_dim = 4 * D + 2 + num_genres + 2 + genome_dim + addon_fields * D
         self.head = nn.Linear(self.in_dim, 1)
 
     def forward(self, uids, mids, ts):
         u_e = self.user_embed(uids)
         i_e = self.item_embed(mids)
 
-        # User history: mean-pool item_embed over valid (non-PAD) positions
+        # User history: pool item_embed over valid (non-PAD) positions
         u_hist = _user_hist_t[uids]                       # (B, L)
         u_hist_rat = _user_hist_rat_t[uids]               # (B, L)
         u_hist_e = self.item_embed(u_hist)                # (B, L, D)
-        u_valid = (u_hist != PAD_IDX).float().unsqueeze(-1)
-        u_count = u_valid.sum(dim=1).clamp(min=1.0)
-        u_hist_pool = (u_hist_e * u_valid).sum(dim=1) / u_count                # (B, D)
-        u_hist_rat_mean = (u_hist_rat * u_valid.squeeze(-1)).sum(dim=1) / u_count.squeeze(-1)
+        u_valid = (u_hist != PAD_IDX).float()             # (B, L)
+        u_count = u_valid.sum(dim=1).clamp(min=1.0)       # (B,)
+        u_hist_pool = _pool_history(u_hist_e, u_hist_rat, u_valid, USER_HIST_POOL)
+        u_hist_rat_mean = (u_hist_rat * u_valid).sum(dim=1) / u_count
         u_hist_rat_mean = u_hist_rat_mean.unsqueeze(-1)                        # (B, 1)
 
-        # Item history: mean-pool user_embed over valid raters
+        # Item history: pool user_embed over valid raters
         i_hist = _item_hist_t[mids]                       # (B, IL)
         i_hist_rat = _item_hist_rat_t[mids]               # (B, IL)
         i_hist_e = self.user_embed(i_hist)                # (B, IL, D)
-        i_valid = (i_hist != USER_PAD_IDX).float().unsqueeze(-1)
+        i_valid = (i_hist != USER_PAD_IDX).float()        # (B, IL)
         i_count = i_valid.sum(dim=1).clamp(min=1.0)
-        i_hist_pool = (i_hist_e * i_valid).sum(dim=1) / i_count
-        i_hist_rat_mean = (i_hist_rat * i_valid.squeeze(-1)).sum(dim=1) / i_count.squeeze(-1)
+        i_hist_pool = _pool_history(i_hist_e, i_hist_rat, i_valid, ITEM_HIST_POOL)
+        i_hist_rat_mean = (i_hist_rat * i_valid).sum(dim=1) / i_count
         i_hist_rat_mean = i_hist_rat_mean.unsqueeze(-1)
 
         # Item content: raw genre multi-hot + raw genome + year
@@ -339,14 +384,33 @@ class LinearBaseline(nn.Module):
         genome_e = _genome_t[mids]                        # (B, GENOME_DIM)
         year = _movie_year_t[mids].unsqueeze(-1)          # (B, 1)
 
-        x = torch.cat([
+        parts = [
             u_e, i_e,
             u_hist_pool, u_hist_rat_mean,
             i_hist_pool, i_hist_rat_mean,
             genre_raw,
             ts, year,
             genome_e,
-        ], dim=-1)
+        ]
+
+        # Optional add-on fields (only appended if flag is on; off-state is byte-equivalent)
+        if USER_HIST_DISLIKE_POOL:
+            # Dislike pool: weight by (1 - rating) over valid positions.
+            w = (1.0 - u_hist_rat) * u_valid                          # (B, L)
+            denom = w.sum(dim=1, keepdim=True).clamp(min=1e-6)        # (B, 1)
+            dislike_pool = (u_hist_e * w.unsqueeze(-1)).sum(dim=1) / denom
+            parts.append(dislike_pool)
+        if USER_HIST_LAST_POSITION:
+            # Most recent valid user-history slot (PAD on the left, recent on the right).
+            last_e = u_hist_e[:, -1, :]                               # (B, D)
+            last_valid = u_valid[:, -1].unsqueeze(-1)                 # (B, 1)
+            parts.append(last_e * last_valid)
+        if ITEM_HIST_LAST_POSITION:
+            last_e = i_hist_e[:, -1, :]                               # (B, D)
+            last_valid = i_valid[:, -1].unsqueeze(-1)                 # (B, 1)
+            parts.append(last_e * last_valid)
+
+        x = torch.cat(parts, dim=-1)
         return self.head(x).squeeze(-1)
 
 
