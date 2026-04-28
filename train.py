@@ -70,6 +70,9 @@ USER_HIST_DISLIKE_POOL = int(os.environ.get("USER_HIST_DISLIKE_POOL", "0"))
 USER_HIST_LAST_POSITION = int(os.environ.get("USER_HIST_LAST_POSITION", "0"))
 ITEM_HIST_LAST_POSITION = int(os.environ.get("ITEM_HIST_LAST_POSITION", "0"))
 
+# Pivot used by rating_centered pool mode. Default 0.6 = 3 stars / 5 (current behavior).
+POOL_PIVOT = float(os.environ.get("POOL_PIVOT", "0.6"))
+
 # ─── Device ────────────────────────────────────────────────────────
 torch.manual_seed(SEED)
 if torch.cuda.is_available():
@@ -323,7 +326,7 @@ def _pool_history(embed, ratings, valid, mode):
         return (embed * w_e).sum(dim=1) / denom
     if mode == "rating_centered":
         # Allow negative weights; normalize by sum of absolute weights.
-        w = (ratings - 0.6) * valid                                   # (B, L)
+        w = (ratings - POOL_PIVOT) * valid                            # (B, L)
         w_e = w.unsqueeze(-1)
         denom = w.abs().sum(dim=1, keepdim=True).clamp(min=1e-6)
         return (embed * w_e).sum(dim=1) / denom

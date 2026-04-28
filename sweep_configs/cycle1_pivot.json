@@ -1,0 +1,25 @@
+[
+  {"name": "pivot050_s42", "env": {"POOL_PIVOT": "0.5", "SEED": "42"}},
+  {"name": "pivot050_s43", "env": {"POOL_PIVOT": "0.5", "SEED": "43"}},
+  {"name": "pivot050_s44", "env": {"POOL_PIVOT": "0.5", "SEED": "44"}},
+  {"name": "pivot050_s45", "env": {"POOL_PIVOT": "0.5", "SEED": "45"}},
+  {"name": "pivot050_s46", "env": {"POOL_PIVOT": "0.5", "SEED": "46"}},
+
+  {"name": "pivot060_s42", "env": {"POOL_PIVOT": "0.6", "SEED": "42"}},
+  {"name": "pivot060_s43", "env": {"POOL_PIVOT": "0.6", "SEED": "43"}},
+  {"name": "pivot060_s44", "env": {"POOL_PIVOT": "0.6", "SEED": "44"}},
+  {"name": "pivot060_s45", "env": {"POOL_PIVOT": "0.6", "SEED": "45"}},
+  {"name": "pivot060_s46", "env": {"POOL_PIVOT": "0.6", "SEED": "46"}},
+
+  {"name": "pivot070_s42", "env": {"POOL_PIVOT": "0.7", "SEED": "42"}},
+  {"name": "pivot070_s43", "env": {"POOL_PIVOT": "0.7", "SEED": "43"}},
+  {"name": "pivot070_s44", "env": {"POOL_PIVOT": "0.7", "SEED": "44"}},
+  {"name": "pivot070_s45", "env": {"POOL_PIVOT": "0.7", "SEED": "45"}},
+  {"name": "pivot070_s46", "env": {"POOL_PIVOT": "0.7", "SEED": "46"}},
+
+  {"name": "pivot080_s42", "env": {"POOL_PIVOT": "0.8", "SEED": "42"}},
+  {"name": "pivot080_s43", "env": {"POOL_PIVOT": "0.8", "SEED": "43"}},
+  {"name": "pivot080_s44", "env": {"POOL_PIVOT": "0.8", "SEED": "44"}},
+  {"name": "pivot080_s45", "env": {"POOL_PIVOT": "0.8", "SEED": "45"}},
+  {"name": "pivot080_s46", "env": {"POOL_PIVOT": "0.8", "SEED": "46"}}
+]
