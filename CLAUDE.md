@@ -44,7 +44,7 @@ grep "^val_auc:\|^peak_memory_mb:" run.log
 - **Device**: Single CUDA GPU. Auto-detects CUDA / MPS / CPU.
 - **Environment**: Use the repo-local `uv` env (`uv sync`, then `uv run ...`).
 - **Datasets**: `ml-100k` (smoke test only, no genome data), `ml-1m` (fast iteration), `ml-10m` (medium), `ml-25m` (default, has genome data).
-- **Reproducibility**: Deterministic at SEED=42. Run-to-run variance at the same seed is <0.001 AUC; seed-to-seed variance is larger and should be estimated empirically before declaring any win.
+- **Reproducibility**: Deterministic at SEED=42. Run-to-run variance at the same seed is <1e-5 AUC; seed-to-seed variance for the current linear baseline is σ ≈ 0.00008 across SEED ∈ {42,43,44,45,46} — about 10× tighter than the legacy DLRM's σ ≈ 0.00078. Estimate empirically again whenever the model architecture changes meaningfully.
 - **Data**: auto-downloaded to `data/` on first use; not checked into git.
 - **Feature cache**: `data/features_<hash>.npz` is built on first run per (dataset, history-len) and reused afterward.
 

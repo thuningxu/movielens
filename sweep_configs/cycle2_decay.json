@@ -1,0 +1,9 @@
+[
+  {"name": "decay_both_init_neg2", "env": {"USER_HIST_DECAY": "1", "ITEM_HIST_DECAY": "1", "USER_HIST_DECAY_INIT": "-2.0", "ITEM_HIST_DECAY_INIT": "-2.0"}},
+  {"name": "decay_both_init_neg1", "env": {"USER_HIST_DECAY": "1", "ITEM_HIST_DECAY": "1", "USER_HIST_DECAY_INIT": "-1.0", "ITEM_HIST_DECAY_INIT": "-1.0"}},
+  {"name": "decay_both_init_0", "env": {"USER_HIST_DECAY": "1", "ITEM_HIST_DECAY": "1", "USER_HIST_DECAY_INIT": "0.0", "ITEM_HIST_DECAY_INIT": "0.0"}},
+  {"name": "decay_both_init_pos1", "env": {"USER_HIST_DECAY": "1", "ITEM_HIST_DECAY": "1", "USER_HIST_DECAY_INIT": "1.0", "ITEM_HIST_DECAY_INIT": "1.0"}},
+  {"name": "decay_both_init_pos2", "env": {"USER_HIST_DECAY": "1", "ITEM_HIST_DECAY": "1", "USER_HIST_DECAY_INIT": "2.0", "ITEM_HIST_DECAY_INIT": "2.0"}},
+  {"name": "decay_user_only_init_0", "env": {"USER_HIST_DECAY": "1", "USER_HIST_DECAY_INIT": "0.0"}},
+  {"name": "decay_item_only_init_0", "env": {"ITEM_HIST_DECAY": "1", "ITEM_HIST_DECAY_INIT": "0.0"}}
+]
