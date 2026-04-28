@@ -24,6 +24,7 @@ np.random.seed(SEED)
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from prepare import load_data_hybrid, evaluate, print_summary
 
@@ -88,6 +89,19 @@ GRAD_CLIP = float(os.environ.get("GRAD_CLIP", "0.0"))
 WARMUP_STEPS = int(os.environ.get("WARMUP_STEPS", "0"))
 GENOME_BOTTLENECK_HIDDEN = os.environ.get("GENOME_BOTTLENECK_HIDDEN", "256,64")
 GENOME_BOTTLENECK_DROPOUT = float(os.environ.get("GENOME_BOTTLENECK_DROPOUT", "0.0"))
+TX_ENCODER_LAYERS = int(os.environ.get("TX_ENCODER_LAYERS", "0"))
+TX_ENCODER_HEADS = int(os.environ.get("TX_ENCODER_HEADS", "2"))
+TX_FFN_RATIO = int(os.environ.get("TX_FFN_RATIO", "2"))
+TX_DROPOUT = float(os.environ.get("TX_DROPOUT", "0.1"))
+TX_POOL = os.environ.get("TX_POOL", "target")  # target | rating | cls
+TX_POS = os.environ.get("TX_POS", "learned")   # learned | sinusoidal
+TX_BYPASS_SE = int(os.environ.get("TX_BYPASS_SE", "0"))
+TX_GATE_INIT = float(os.environ.get("TX_GATE_INIT", "0.0"))  # for ε-test only
+
+if TX_POOL not in {"target", "rating", "cls"}:
+    raise ValueError(f"Unknown TX_POOL: {TX_POOL}")
+if TX_POS not in {"learned", "sinusoidal"}:
+    raise ValueError(f"Unknown TX_POS: {TX_POS}")
 
 if TRAIN_NEG_MODE not in {"global", "anchor_pos", "anchor_pos_catalog"}:
     raise ValueError(f"Unknown TRAIN_NEG_MODE: {TRAIN_NEG_MODE}")
@@ -562,6 +576,60 @@ def run_eval():
 # MODEL
 # ═══════════════════════════════════════════════════════════════════
 
+class TxBlock(nn.Module):
+    """Pre-LN transformer encoder block: MHA + FFN with GELU."""
+    def __init__(self, d_model, num_heads, ffn_ratio, dropout):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        if d_model % num_heads != 0:
+            raise ValueError(f"d_model {d_model} must be divisible by num_heads {num_heads}")
+        self.ln1 = nn.LayerNorm(d_model)
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.o_proj = nn.Linear(d_model, d_model)
+        self.attn_drop = nn.Dropout(dropout)
+        self.ln2 = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_model * ffn_ratio),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * ffn_ratio, d_model),
+        )
+        self.ffn_drop = nn.Dropout(dropout)
+
+    def forward(self, x, attn_mask):
+        # x: (B, L, D), attn_mask: (B, 1, L, L) bool, True = keep
+        B, L, D = x.shape
+        h = self.ln1(x)
+        Q = self.q_proj(h).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)  # (B, H, L, D_h)
+        K = self.k_proj(h).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        V = self.v_proj(h).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        # SDPA expects attn_mask as additive float OR bool (True = keep). Use bool form.
+        out = F.scaled_dot_product_attention(Q, K, V, attn_mask=attn_mask, is_causal=False)
+        out = out.transpose(1, 2).contiguous().view(B, L, D)
+        out = self.o_proj(out)
+        x = x + self.attn_drop(out)
+        h = self.ln2(x)
+        h = self.ffn(h)
+        x = x + self.ffn_drop(h)
+        return x
+
+
+def _sinusoidal_pos_embed(seq_len, d_model, device):
+    """Standard sinusoidal positional embedding (Vaswani 2017)."""
+    pos = torch.arange(seq_len, device=device, dtype=torch.float32).unsqueeze(1)
+    i = torch.arange(d_model, device=device, dtype=torch.float32).unsqueeze(0)
+    div = torch.exp(-(i // 2) * 2 * np.log(10000.0) / d_model)
+    angles = pos * div
+    pe = torch.zeros(seq_len, d_model, device=device)
+    pe[:, 0::2] = torch.sin(angles[:, 0::2])
+    pe[:, 1::2] = torch.cos(angles[:, 1::2])
+    return pe
+
+
 class DLRM(nn.Module):
     def __init__(self):
         super().__init__()
@@ -635,11 +703,24 @@ class DLRM(nn.Module):
             self.ug_dot_proj = nn.Linear(1, D)
 
         # Squeeze-and-Excitation: learn per-field importance weights
-        cross_dim = 7 * D  # user, item, user_hist(DIN), item_hist(DIN), dense, genre, genome
+        # SE field count and cross_dim depend on TX flags:
+        #   - TX_ENCODER_LAYERS=0: 7 fields, cross_dim = 7*D (unchanged baseline)
+        #   - TX_ENCODER_LAYERS>0, USER_HIST_MODE="off": tx replaces user_hist → still 7 fields
+        #   - TX_ENCODER_LAYERS>0, USER_HIST_MODE!="off", TX_BYPASS_SE=0: 8 fields through SE → cross_dim = 8*D
+        #   - TX_ENCODER_LAYERS>0, USER_HIST_MODE!="off", TX_BYPASS_SE=1: 7 fields SE + tx concat → cross_dim = 8*D
+        if TX_ENCODER_LAYERS > 0 and USER_HIST_MODE != "off" and TX_BYPASS_SE == 0:
+            n_se_fields = 8
+        else:
+            n_se_fields = 7
+        if TX_ENCODER_LAYERS > 0 and USER_HIST_MODE != "off":
+            cross_dim = 8 * D  # 7 base fields + tx_field (either inside SE or concatenated)
+        else:
+            cross_dim = 7 * D  # baseline OR tx replaces user_hist
+        self.n_se_fields = n_se_fields
         self.se = nn.Sequential(
-            nn.Linear(7, 7 * 4),
+            nn.Linear(n_se_fields, n_se_fields * 4),
             nn.ReLU(),
-            nn.Linear(7 * 4, 7),
+            nn.Linear(n_se_fields * 4, n_se_fields),
             nn.Sigmoid(),
         )
 
@@ -657,6 +738,66 @@ class DLRM(nn.Module):
         )
 
         self._init_weights()
+
+        # ─── Transformer encoder (off-state byte-equivalent guard) ────
+        # All TX modules constructed here AFTER _init_weights() per learning #11.
+        # Off-state (TX_ENCODER_LAYERS=0): no parameters added, no RNG drawn.
+        if TX_ENCODER_LAYERS > 0:
+            self.tx_layers = TX_ENCODER_LAYERS
+            self.tx_pool = TX_POOL
+            self.tx_pos_mode = TX_POS
+            self.tx_bypass_se = TX_BYPASS_SE
+            self.tx_replaces_user_hist = (USER_HIST_MODE == "off")
+            if TX_POS == "learned":
+                self.tx_pos_e = nn.Parameter(torch.zeros(HISTORY_LEN, D))
+                nn.init.normal_(self.tx_pos_e, 0.0, 0.02)
+            else:
+                # Sinusoidal: register as buffer (deterministic, not learned)
+                self.register_buffer("tx_pos_e", _sinusoidal_pos_embed(HISTORY_LEN, D, torch.device("cpu")))
+            self.tx_in_drop = nn.Dropout(TX_DROPOUT)
+            self.tx_blocks = nn.ModuleList([
+                TxBlock(D, TX_ENCODER_HEADS, TX_FFN_RATIO, TX_DROPOUT)
+                for _ in range(TX_ENCODER_LAYERS)
+            ])
+            # Re-init TX block linears with xavier (consistent with rest of model)
+            for blk in self.tx_blocks:
+                for m in blk.modules():
+                    if isinstance(m, nn.Linear):
+                        nn.init.xavier_uniform_(m.weight)
+                        if m.bias is not None:
+                            nn.init.zeros_(m.bias)
+            self.tx_out_proj = nn.Linear(D, D)
+            nn.init.kaiming_uniform_(self.tx_out_proj.weight, a=5 ** 0.5)
+            if self.tx_out_proj.bias is not None:
+                nn.init.zeros_(self.tx_out_proj.bias)
+            self.tx_out_ln = nn.LayerNorm(D)
+            # Gate as bare Parameter (NOT nn.Linear) per learning #11.
+            if TX_GATE_INIT == 0.0:
+                self.tx_gate = nn.Parameter(torch.zeros(D))
+            else:
+                self.tx_gate = nn.Parameter(torch.full((D,), TX_GATE_INIT))
+            if TX_POOL == "cls":
+                self.tx_cls = nn.Parameter(torch.zeros(1, 1, D))
+                nn.init.normal_(self.tx_cls, 0.0, 0.02)
+            elif TX_POOL == "target":
+                # Cross-attention pool: target item_e is the 1-token query.
+                # Use a learned linear projection for query alignment.
+                self.tx_target_q = nn.Linear(D, D)
+                nn.init.xavier_uniform_(self.tx_target_q.weight)
+                if self.tx_target_q.bias is not None:
+                    nn.init.zeros_(self.tx_target_q.bias)
+                self.tx_target_k = nn.Linear(D, D)
+                nn.init.xavier_uniform_(self.tx_target_k.weight)
+                if self.tx_target_k.bias is not None:
+                    nn.init.zeros_(self.tx_target_k.bias)
+                self.tx_target_v = nn.Linear(D, D)
+                nn.init.xavier_uniform_(self.tx_target_v.weight)
+                if self.tx_target_v.bias is not None:
+                    nn.init.zeros_(self.tx_target_v.bias)
+        else:
+            self.tx_layers = 0
+            self.tx_replaces_user_hist = False
+            self.tx_bypass_se = 0
 
     def _init_weights(self):
         for m in self.modules():
@@ -714,6 +855,8 @@ class DLRM(nn.Module):
             rating_weights = hist_ratings.unsqueeze(-1) * hist_mask
             denom = rating_weights.sum(dim=1).clamp_min(1e-6)
             user_hist_e = (hist_item_e * rating_weights).sum(dim=1) / denom
+        elif self.user_hist_mode == "off":
+            user_hist_e = torch.zeros_like(item_e)
         else:
             raise ValueError(f"Unknown USER_HIST_MODE: {self.user_hist_mode}")
 
@@ -760,12 +903,79 @@ class DLRM(nn.Module):
             else:  # genome_field
                 genome_field = genome_field + ug_field
 
-        # Squeeze-and-Excitation: learn per-field importance weights
-        fields = torch.stack([user_e, item_e, user_hist_e, item_hist_e, dense_e, genre_e, genome_field], dim=1)  # (B, 7, D)
-        se_input = fields.mean(dim=2)               # (B, 7) — global avg pool per field
-        se_weights = self.se(se_input).unsqueeze(-1) # (B, 7, 1) — learned importance
-        fields = fields * se_weights                  # reweight fields
-        x0 = fields.reshape(fields.size(0), -1)      # (B, 7*D) — flatten
+        # Transformer encoder over user history (optional, off by default)
+        tx_field = None
+        if self.tx_layers > 0:
+            B, L = history.shape
+            D = raw_hist_item_e.size(-1)
+            # Input: raw token + rating + positional, scaled by sqrt(D)
+            pos = self.tx_pos_e[:L].unsqueeze(0)                              # (1, L, D)
+            tx_x = (raw_hist_item_e + hist_rat_e + pos) * (D ** 0.5)
+            if self.tx_pool == "cls":
+                cls_tok = self.tx_cls.expand(B, -1, -1)                       # (B, 1, D)
+                tx_x = torch.cat([cls_tok, tx_x], dim=1)                      # (B, L+1, D)
+                # CLS attends to everything; everything else only to valid history
+                cls_valid = torch.ones(B, 1, device=history.device, dtype=torch.bool)
+                tx_valid = torch.cat([cls_valid, hist_valid], dim=1)          # (B, L+1)
+            else:
+                tx_valid = hist_valid                                         # (B, L)
+            tx_x = self.tx_in_drop(tx_x)
+            # Build attention mask: causal + key-padding (True = keep).
+            tx_L = tx_x.size(1)
+            causal = torch.tril(torch.ones((tx_L, tx_L), device=history.device, dtype=torch.bool))
+            key_keep = tx_valid.unsqueeze(1).expand(-1, tx_L, -1)             # (B, L, L)
+            attn_mask = (causal.unsqueeze(0) & key_keep).unsqueeze(1)         # (B, 1, L, L)
+            for blk in self.tx_blocks:
+                tx_x = blk(tx_x, attn_mask)
+            # Pool
+            if self.tx_pool == "rating":
+                # Rating-weighted mean over history positions (CLS not present here).
+                rating_weights = hist_ratings.unsqueeze(-1) * hist_valid.unsqueeze(-1)
+                denom = rating_weights.sum(dim=1).clamp_min(1e-6)
+                tx_pooled = (tx_x * rating_weights).sum(dim=1) / denom        # (B, D)
+            elif self.tx_pool == "cls":
+                tx_pooled = tx_x[:, 0]                                        # (B, D)
+            else:  # target — cross-attention with target item_e as 1-token query
+                Q = self.tx_target_q(item_e).unsqueeze(1)                     # (B, 1, D)
+                K = self.tx_target_k(tx_x)                                    # (B, L, D)
+                V = self.tx_target_v(tx_x)                                    # (B, L, D)
+                scale = D ** 0.5
+                scores = torch.bmm(Q, K.transpose(1, 2)).squeeze(1) / scale   # (B, L)
+                pool_valid = tx_valid                                         # (B, L) — same support as tx_x
+                w = _masked_softmax(scores, pool_valid, dim=-1).unsqueeze(-1) # (B, L, 1)
+                tx_pooled = (V * w).sum(dim=1)                                # (B, D)
+            tx_pooled = self.tx_out_proj(tx_pooled)
+            tx_pooled = self.tx_out_ln(tx_pooled)
+            tx_field = tx_pooled * self.tx_gate                               # zero at init → off-state byte-eq
+
+        # Field assembly: handle TX integration modes
+        if self.tx_layers > 0 and self.tx_replaces_user_hist:
+            user_hist_e = tx_field
+            tx_field_for_se = None  # already merged
+        else:
+            tx_field_for_se = tx_field
+
+        if tx_field_for_se is not None and self.tx_bypass_se == 0:
+            # TX as 8th field inside SE
+            fields = torch.stack([user_e, item_e, user_hist_e, item_hist_e, dense_e, genre_e, genome_field, tx_field_for_se], dim=1)  # (B, 8, D)
+            se_input = fields.mean(dim=2)
+            se_weights = self.se(se_input).unsqueeze(-1)
+            fields = fields * se_weights
+            x0 = fields.reshape(fields.size(0), -1)                            # (B, 8*D)
+        elif tx_field_for_se is not None and self.tx_bypass_se == 1:
+            # 7 fields through SE, tx_field concatenated AFTER SE flatten
+            fields = torch.stack([user_e, item_e, user_hist_e, item_hist_e, dense_e, genre_e, genome_field], dim=1)  # (B, 7, D)
+            se_input = fields.mean(dim=2)
+            se_weights = self.se(se_input).unsqueeze(-1)
+            fields = fields * se_weights
+            x0 = torch.cat([fields.reshape(fields.size(0), -1), tx_field_for_se], dim=-1)  # (B, 7*D + D)
+        else:
+            # Baseline 7-field path (TX_ENCODER_LAYERS=0, or TX replaces user_hist)
+            fields = torch.stack([user_e, item_e, user_hist_e, item_hist_e, dense_e, genre_e, genome_field], dim=1)  # (B, 7, D)
+            se_input = fields.mean(dim=2)
+            se_weights = self.se(se_input).unsqueeze(-1)
+            fields = fields * se_weights
+            x0 = fields.reshape(fields.size(0), -1)                            # (B, 7*D) — flatten
 
         return self.top_mlp(x0).squeeze(-1)
 
