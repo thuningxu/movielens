@@ -1,108 +1,61 @@
 #!/usr/bin/env python3
 """
-DLRM for hybrid engagement prediction on MovieLens.
+Linear baseline for hybrid engagement prediction on MovieLens.
 
-Label scheme:
+Restart from scratch (apr28). Same input features and prediction goals as the
+legacy DLRM at legacy/train.py, but the model itself is a single Linear head:
+
+    concat(all features) -> Linear(in, 1) -> sigmoid
+
+No hidden layers, no attention, no MLP. The point is a clean low ceiling
+to build up from. See README.md and program.md for the broader plan.
+
+Label scheme (unchanged from legacy):
   - 1: user rated >= 4 (watched and liked)
   - 0: user rated < 4 (hard negative) OR random unrated movie (easy negative)
-
-Loss: BCE (calibrated probabilities for threshold-based serving).
 """
 
-import copy
+import hashlib
+import json
 import logging
 import os
+import re
 import sys
-from pathlib import Path
 import time
+from pathlib import Path
 
 import numpy as np
 
-# Fix all random seeds for reproducibility
 SEED = int(os.environ.get("SEED", "42"))
 np.random.seed(SEED)
+
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+
 from prepare import load_data_hybrid, evaluate, print_summary
 
-# ─── Logging ────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(message)s",
-    datefmt="%H:%M:%S",
-    stream=sys.stdout,
-)
+# ─── Logging ───────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s",
+                    datefmt="%H:%M:%S", stream=sys.stdout)
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
 log = logging.getLogger("train")
 
-# ─── Helpers ────────────────────────────────────────────────────────
-
-def _env_flag(name, default):
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.lower() in {"1", "true", "yes", "on"}
-
-
-def _masked_softmax(scores, valid_mask, dim=-1):
-    masked_scores = scores.masked_fill(~valid_mask, -1e4)
-    weights = torch.softmax(masked_scores, dim=dim)
-    weights = weights * valid_mask.to(weights.dtype)
-    denom = weights.sum(dim=dim, keepdim=True).clamp_min(1e-8)
-    return weights / denom
-
-
-# ─── Configuration ──────────────────────────────────────────────────
+# ─── Config (env-overridable) ──────────────────────────────────────
 DATASET = os.environ.get("DATASET", "ml-25m")
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "16384"))
-LR = float(os.environ.get("LR", "7e-5"))
-WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "5e-5"))
+LR = float(os.environ.get("LR", "1e-3"))
+WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "1e-5"))
 EMBED_DIM = int(os.environ.get("EMBED_DIM", "28"))
 HISTORY_LEN = int(os.environ.get("HISTORY_LEN", "100"))
 ITEM_HIST_LEN = int(os.environ.get("ITEM_HIST_LEN", "30"))
-NUM_DENSE = 17  # 1 timestamp + 5 user hist bins + 1 user count + 5 item hist bins + 1 item count + 1 ug_dot + 1 year + 1 genre_count + 1 movie_age
-NEG_RATIO = int(os.environ.get("NEG_RATIO", "1"))  # random unrated negatives per positive in training data
-EVAL_EVERY = 1
+NEG_RATIO = int(os.environ.get("NEG_RATIO", "1"))
 PATIENCE = int(os.environ.get("PATIENCE", "3"))
-ACCUM_STEPS = int(os.environ.get("ACCUM_STEPS", "2"))
-RECENCY_FRAC = float(os.environ.get("RECENCY_FRAC", "0.7"))
-TRAIN_NEG_MODE = os.environ.get("TRAIN_NEG_MODE", "anchor_pos_catalog")  # global | anchor_pos | anchor_pos_catalog
-POST_RECENCY_NEG_RESAMPLE = _env_flag("POST_RECENCY_NEG_RESAMPLE", True)
-POST_RECENCY_EASY_NEG_PER_POS = float(os.environ.get("POST_RECENCY_EASY_NEG_PER_POS", "0.4"))
-USER_HIST_MODE = os.environ.get("USER_HIST_MODE", "rating")  # din | mean | rating
-ITEM_HIST_MODE = os.environ.get("ITEM_HIST_MODE", "din")  # din | mean | off
-USER_HIST_CONTEXT = os.environ.get("USER_HIST_CONTEXT", "causal_masked")  # static | causal_masked
-ITEM_HIST_CONTEXT = os.environ.get("ITEM_HIST_CONTEXT", "causal_masked")  # static | causal_masked
-GENOME_FUSION_MODE = os.environ.get("GENOME_FUSION_MODE", "legacy")  # legacy | mask_only
-USER_GENOME = os.environ.get("USER_GENOME", "scalar_dot")  # off | scalar_dot
-USER_GENOME_TARGET = os.environ.get("USER_GENOME_TARGET", "genome_field")  # dense_e | genome_field
-USE_CAUSAL_SA = _env_flag("USE_CAUSAL_SA", True)
-USE_TORCH_COMPILE = _env_flag("USE_TORCH_COMPILE", True)
-EMBED_DROPOUT = float(os.environ.get("EMBED_DROPOUT", "0.1"))
-MLP_DROPOUT = float(os.environ.get("MLP_DROPOUT", "0.3"))
-LABEL_SMOOTH = float(os.environ.get("LABEL_SMOOTH", "0.05"))
-GRAD_CLIP = float(os.environ.get("GRAD_CLIP", "0.0"))
-WARMUP_STEPS = int(os.environ.get("WARMUP_STEPS", "0"))
-GENOME_BOTTLENECK_HIDDEN = os.environ.get("GENOME_BOTTLENECK_HIDDEN", "256,64")
-GENOME_BOTTLENECK_DROPOUT = float(os.environ.get("GENOME_BOTTLENECK_DROPOUT", "0.0"))
+EVAL_PER_EPOCH = int(os.environ.get("EVAL_PER_EPOCH", "3"))
+MAX_EPOCHS = int(os.environ.get("MAX_EPOCHS", "20"))
 
-if TRAIN_NEG_MODE not in {"global", "anchor_pos", "anchor_pos_catalog"}:
-    raise ValueError(f"Unknown TRAIN_NEG_MODE: {TRAIN_NEG_MODE}")
-if USER_HIST_CONTEXT not in {"static", "causal_masked"}:
-    raise ValueError(f"Unknown USER_HIST_CONTEXT: {USER_HIST_CONTEXT}")
-if ITEM_HIST_CONTEXT not in {"static", "causal_masked"}:
-    raise ValueError(f"Unknown ITEM_HIST_CONTEXT: {ITEM_HIST_CONTEXT}")
-if GENOME_FUSION_MODE not in {"legacy", "mask_only"}:
-    raise ValueError(f"Unknown GENOME_FUSION_MODE: {GENOME_FUSION_MODE}")
-if USER_GENOME not in {"off", "scalar_dot"}:
-    raise ValueError(f"Unknown USER_GENOME: {USER_GENOME}")
-if USER_GENOME_TARGET not in {"dense_e", "genome_field"}:
-    raise ValueError(f"Unknown USER_GENOME_TARGET: {USER_GENOME_TARGET}")
-
-# ─── Device ─────────────────────────────────────────────────────────
+# ─── Device ────────────────────────────────────────────────────────
 torch.manual_seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
@@ -111,22 +64,14 @@ elif torch.backends.mps.is_available():
     DEVICE = torch.device("mps")
 else:
     DEVICE = torch.device("cpu")
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-torch.set_float32_matmul_precision('high')  # enable TF32 tensor cores
-log.info(
-    f"Device: {DEVICE} | "
-    f"user_hist={USER_HIST_MODE} | item_hist={ITEM_HIST_MODE} | "
-    f"user_ctx={USER_HIST_CONTEXT} | item_ctx={ITEM_HIST_CONTEXT} | "
-    f"causal_sa={USE_CAUSAL_SA} | dim={EMBED_DIM} | item_hist_len={ITEM_HIST_LEN} | "
-    f"train_neg={TRAIN_NEG_MODE} | post_recency_resample={POST_RECENCY_NEG_RESAMPLE} "
-    f"| easy_neg_per_pos={POST_RECENCY_EASY_NEG_PER_POS:.2f} "
-    f"| genome_fusion={GENOME_FUSION_MODE} | user_genome={USER_GENOME}"
-)
+log.info(f"Device: {DEVICE} | dim={EMBED_DIM} | hist={HISTORY_LEN}/{ITEM_HIST_LEN} | "
+         f"neg_ratio={NEG_RATIO} | lr={LR} | wd={WEIGHT_DECAY}")
 
-# ─── Load Data ──────────────────────────────────────────────────────
-total_start = time.time()
-data = load_data_hybrid(DATASET, neg_ratio=NEG_RATIO, train_neg_mode=TRAIN_NEG_MODE)
+t_total_start = time.time()
+
+# ─── Data ──────────────────────────────────────────────────────────
+data = load_data_hybrid(DATASET, neg_ratio=NEG_RATIO,
+                        train_neg_mode="anchor_pos_catalog")
 train_df, val_df = data["train"], data["val"]
 movies_df, stats = data["movies"], data["stats"]
 user_all_items = data["user_all_items"]
@@ -135,14 +80,15 @@ log.info(f"Dataset: {DATASET} | Users: {num_users} | Items: {num_items} | "
          f"Train: {stats['num_train']} | Val: {stats['num_val']} | "
          f"Pos rate: {stats['pos_rate']:.2%}")
 
+# ─── Feature engineering (with disk cache) ─────────────────────────
+# Same feature set as the legacy DLRM:
+#   - genre multi-hot, rating histograms, user/item count
+#   - user/item history sequences (last K + ratings)
+#   - user-genre affinity, timestamp, year, genre count
+#   - tag genome (1128) + per-user genome profile (1128)
 
-# ═══════════════════════════════════════════════════════════════════
-# FEATURE ENGINEERING (with disk caching)
-# ═══════════════════════════════════════════════════════════════════
-
-import hashlib, json
 _cache_key = hashlib.md5(json.dumps({
-    "feature_version": 5,
+    "feature_version": 5,                 # match legacy cache version
     "dataset": DATASET, "neg_ratio": NEG_RATIO,
     "history_len": HISTORY_LEN, "item_hist_len": ITEM_HIST_LEN,
     "num_users": num_users, "num_items": num_items,
@@ -151,39 +97,33 @@ _cache_path = Path(__file__).parent / "data" / f"features_{_cache_key}.npz"
 
 if _cache_path.exists():
     log.info(f"Loading cached features from {_cache_path.name}...")
-    _cache = np.load(_cache_path, allow_pickle=True)
-    movie_genres = _cache["movie_genres"]
+    _c = np.load(_cache_path, allow_pickle=True)
+    movie_genres = _c["movie_genres"]
     num_genres = movie_genres.shape[1]
-    user_hist_bins = _cache["user_hist_bins"]
-    item_hist_bins = _cache["item_hist_bins"]
-    user_count_norm = _cache["user_count_norm"]
-    item_count_norm = _cache["item_count_norm"]
-    user_histories = _cache["user_histories"]
-    user_hist_ratings = _cache["user_hist_ratings"]
-    user_hist_timestamps = _cache["user_hist_timestamps"]
-    item_histories = _cache["item_histories"]
-    item_hist_ratings = _cache["item_hist_ratings"]
-    item_hist_timestamps = _cache["item_hist_timestamps"]
-    user_genre_affinity = _cache["user_genre_affinity"]
-    ts_min = float(_cache["ts_min"])
-    ts_range = float(_cache["ts_range"])
-    movie_year = _cache["movie_year"]
-    movie_genre_count = _cache["movie_genre_count"]
-    genome_matrix = _cache["genome_matrix"]
-    has_genome = _cache["has_genome"]
-    user_genome = _cache["user_genome"]
-    has_user_genome = _cache["has_user_genome"]
+    user_hist_bins = _c["user_hist_bins"]
+    item_hist_bins = _c["item_hist_bins"]
+    user_count_norm = _c["user_count_norm"]
+    item_count_norm = _c["item_count_norm"]
+    user_histories = _c["user_histories"]
+    user_hist_ratings = _c["user_hist_ratings"]
+    item_histories = _c["item_histories"]
+    item_hist_ratings = _c["item_hist_ratings"]
+    user_genre_affinity = _c["user_genre_affinity"]
+    ts_min = float(_c["ts_min"])
+    ts_range = float(_c["ts_range"])
+    movie_year = _c["movie_year"]
+    movie_genre_count = _c["movie_genre_count"]
+    genome_matrix = _c["genome_matrix"]
+    has_genome = _c["has_genome"]
+    user_genome = _c["user_genome"]
+    has_user_genome = _c["has_user_genome"]
     GENOME_DIM = genome_matrix.shape[1]
-    PAD_IDX = num_items
-    USER_PAD_IDX = num_users
-    ITEM_HIST_LEN = item_histories.shape[1]
-    del _cache
-    log.info("Cached features loaded.")
+    del _c
 else:
     log.info("Computing features (will cache for next run)...")
     real_train = train_df[train_df["rating"] > 0]
 
-    # 1. Genre multi-hot encoding
+    # Genre multi-hot
     all_genres_set = set()
     for g in movies_df["genres"].dropna():
         all_genres_set.update(g.split("|"))
@@ -198,71 +138,66 @@ else:
                 if g in genre_to_idx:
                     movie_genres[mid, genre_to_idx[g]] = 1.0
 
-    # 2. Rating histograms (vectorized)
-    _rt_uids = real_train["userId"].values
-    _rt_mids = real_train["movieId"].values
-    _rt_ratings = real_train["rating"].values
-    _rt_bins = np.clip((_rt_ratings - 0.01) // 1, 0, 4).astype(np.intp)
+    # Rating histograms (5-bin per user/item)
+    _uids = real_train["userId"].values
+    _mids = real_train["movieId"].values
+    _ratings = real_train["rating"].values
+    _bins = np.clip((_ratings - 0.01) // 1, 0, 4).astype(np.intp)
     user_hist_bins = np.zeros((num_users, 5), dtype=np.float32)
     item_hist_bins = np.zeros((num_items, 5), dtype=np.float32)
-    np.add.at(user_hist_bins, (_rt_uids, _rt_bins), 1)
-    np.add.at(item_hist_bins, (_rt_mids, _rt_bins), 1)
+    np.add.at(user_hist_bins, (_uids, _bins), 1)
+    np.add.at(item_hist_bins, (_mids, _bins), 1)
     user_count = user_hist_bins.sum(axis=1)
     item_count = item_hist_bins.sum(axis=1)
-    user_hist_bins = user_hist_bins / (user_count[:, None] + 1e-8)
-    item_hist_bins = item_hist_bins / (item_count[:, None] + 1e-8)
+    user_hist_bins /= (user_count[:, None] + 1e-8)
+    item_hist_bins /= (item_count[:, None] + 1e-8)
     user_count_norm = (user_count - user_count.mean()) / (user_count.std() + 1e-8)
     item_count_norm = (item_count - item_count.mean()) / (item_count.std() + 1e-8)
-    del _rt_bins
+    del _bins
 
-    # 3. User/item history sequences (vectorized)
+    # User/item history sequences
     PAD_IDX = num_items
     USER_PAD_IDX = num_users
-
-    def _build_history_arrays(ids, targets, ratings, timestamps, num_entities, pad_idx, max_len):
+    def _build_history(ids, targets, ratings, timestamps, n_entities, pad_idx, max_len):
         sort_idx = np.lexsort((timestamps, ids))
         s_ids, s_targets = ids[sort_idx], targets[sort_idx]
         s_ratings = ratings[sort_idx].astype(np.float32) / 5.0
-        s_timestamps = timestamps[sort_idx].astype(np.int32)
-        hist = np.full((num_entities, max_len), pad_idx, dtype=np.int64)
-        hist_rat = np.zeros((num_entities, max_len), dtype=np.float32)
-        hist_ts = np.zeros((num_entities, max_len), dtype=np.int32)
+        hist = np.full((n_entities, max_len), pad_idx, dtype=np.int64)
+        hist_rat = np.zeros((n_entities, max_len), dtype=np.float32)
         boundaries = np.where(np.diff(s_ids) != 0)[0] + 1
         starts = np.concatenate([[0], boundaries])
         ends = np.concatenate([boundaries, [len(s_ids)]])
-        entity_ids = s_ids[starts]
-        for i in range(len(entity_ids)):
-            eid, s, e = entity_ids[i], starts[i], ends[i]
+        for s, e in zip(starts, ends):
+            eid = s_ids[s]
             length = min(e - s, max_len)
             hist[eid, -length:] = s_targets[e - length:e]
             hist_rat[eid, -length:] = s_ratings[e - length:e]
-            hist_ts[eid, -length:] = s_timestamps[e - length:e]
-        return hist, hist_rat, hist_ts
+        return hist, hist_rat
 
-    _rt_ts = real_train["timestamp"].values
-    user_histories, user_hist_ratings, user_hist_timestamps = _build_history_arrays(
-        _rt_uids, _rt_mids, _rt_ratings, _rt_ts, num_users, PAD_IDX, HISTORY_LEN)
-    item_histories, item_hist_ratings, item_hist_timestamps = _build_history_arrays(
-        _rt_mids, _rt_uids, _rt_ratings, _rt_ts, num_items, USER_PAD_IDX, ITEM_HIST_LEN)
+    _ts = real_train["timestamp"].values
+    user_histories, user_hist_ratings = _build_history(_uids, _mids, _ratings, _ts,
+                                                       num_users, PAD_IDX, HISTORY_LEN)
+    item_histories, item_hist_ratings = _build_history(_mids, _uids, _ratings, _ts,
+                                                       num_items, USER_PAD_IDX, ITEM_HIST_LEN)
 
-    # 4. User-genre affinity
+    # User-genre affinity
     user_genre_affinity = np.zeros((num_users, num_genres), dtype=np.float32)
     user_genre_count = np.zeros((num_users, num_genres), dtype=np.float32)
-    _genres_of_items = movie_genres[_rt_mids]
-    np.add.at(user_genre_affinity, _rt_uids, _rt_ratings[:, None].astype(np.float32) * _genres_of_items)
-    np.add.at(user_genre_count, _rt_uids, _genres_of_items)
-    del _rt_uids, _rt_mids, _rt_ratings, _rt_ts, _genres_of_items
+    _gi = movie_genres[_mids]
+    np.add.at(user_genre_affinity, _uids, _ratings[:, None].astype(np.float32) * _gi)
+    np.add.at(user_genre_count, _uids, _gi)
     mask = user_genre_count > 0
     user_genre_affinity[mask] /= user_genre_count[mask]
-    mu, sigma = user_genre_affinity[mask].mean(), user_genre_affinity[mask].std() + 1e-8
+    mu = user_genre_affinity[mask].mean()
+    sigma = user_genre_affinity[mask].std() + 1e-8
     user_genre_affinity[mask] = (user_genre_affinity[mask] - mu) / sigma
+    del _uids, _mids, _ratings, _ts, _gi
 
-    # 5. Timestamp normalization
+    # Timestamp normalization
     ts_min = float(real_train["timestamp"].min())
     ts_range = float(real_train["timestamp"].max() - ts_min) + 1.0
 
-    # 6. Movie release year
-    import re
+    # Movie release year
     movie_year = np.zeros(num_items, dtype=np.float32)
     for _, row in movies_df.iterrows():
         mid = int(row["movieId"])
@@ -276,87 +211,79 @@ else:
         movie_year[movie_year == 0] = median_year
         movie_year = (movie_year - movie_year.mean()) / (movie_year.std() + 1e-8)
 
-    # 7. Genre count per movie
+    # Genre count per movie
     movie_genre_count = movie_genres.sum(axis=1).astype(np.float32)
     movie_genre_count = (movie_genre_count - movie_genre_count.mean()) / (movie_genre_count.std() + 1e-8)
 
-    # 8. Tag genome features (1128 relevance scores per movie)
+    # Tag genome (1128 relevance scores per movie, ml-25m only — zeros otherwise)
     _genome_path = Path(__file__).parent / "data" / DATASET / "genome-scores.csv"
     if _genome_path.exists():
         log.info("Loading tag genome scores...")
-        # Replicate prepare.py's ID remapping: sort ratings by timestamp, unique movieIds in order
-        _raw_ratings_path = Path(__file__).parent / "data" / DATASET
         if DATASET == "ml-25m":
-            _raw_ratings = pd.read_csv(_raw_ratings_path / "ratings.csv")
+            _raw = pd.read_csv(Path(__file__).parent / "data" / DATASET / "ratings.csv")
         elif DATASET == "ml-10m":
-            _raw_ratings = pd.read_csv(
-                Path(__file__).parent / "data" / "ml-10M100K" / "ratings.dat",
-                sep="::", engine="python", names=["userId", "movieId", "rating", "timestamp"])
+            _raw = pd.read_csv(Path(__file__).parent / "data" / "ml-10M100K" / "ratings.dat",
+                               sep="::", engine="python",
+                               names=["userId", "movieId", "rating", "timestamp"])
         elif DATASET == "ml-1m":
-            _raw_ratings = pd.read_csv(
-                _raw_ratings_path / "ratings.dat", sep="::", engine="python",
-                names=["userId", "movieId", "rating", "timestamp"])
+            _raw = pd.read_csv(Path(__file__).parent / "data" / DATASET / "ratings.dat",
+                               sep="::", engine="python",
+                               names=["userId", "movieId", "rating", "timestamp"])
         else:
-            _raw_ratings = None
-        if _raw_ratings is not None:
-            _raw_ratings = _raw_ratings.sort_values("timestamp").reset_index(drop=True)
-            _all_movies_ordered = _raw_ratings["movieId"].unique()
-            _movie_map = {mid: i for i, mid in enumerate(_all_movies_ordered)}
-            _genome_df = pd.read_csv(_genome_path)
-            _num_tags = int(_genome_df["tagId"].max())
+            _raw = None
+        if _raw is not None:
+            _raw = _raw.sort_values("timestamp").reset_index(drop=True)
+            _movie_map = {mid: i for i, mid in enumerate(_raw["movieId"].unique())}
+            _gdf = pd.read_csv(_genome_path)
+            _num_tags = int(_gdf["tagId"].max())
             genome_matrix = np.zeros((num_items, _num_tags), dtype=np.float32)
             has_genome = np.zeros(num_items, dtype=np.float32)
-            # Map genome movieIds to remapped IDs
-            _genome_df["mapped_mid"] = _genome_df["movieId"].map(_movie_map)
-            _genome_df = _genome_df.dropna(subset=["mapped_mid"])
-            _genome_df["mapped_mid"] = _genome_df["mapped_mid"].astype(int)
-            # Pivot: fill genome_matrix
-            for mid, group in _genome_df.groupby("mapped_mid"):
+            _gdf["mapped_mid"] = _gdf["movieId"].map(_movie_map)
+            _gdf = _gdf.dropna(subset=["mapped_mid"])
+            _gdf["mapped_mid"] = _gdf["mapped_mid"].astype(int)
+            for mid, group in _gdf.groupby("mapped_mid"):
                 if mid < num_items:
-                    tag_ids = group["tagId"].values.astype(int) - 1  # 1-indexed to 0-indexed
+                    tag_ids = group["tagId"].values.astype(int) - 1
                     genome_matrix[mid, tag_ids] = group["relevance"].values.astype(np.float32)
                     has_genome[mid] = 1.0
-            log.info(f"Tag genome: {int(has_genome.sum())} movies with data out of {num_items} ({has_genome.mean()*100:.1f}%)")
-            del _genome_df, _raw_ratings, _all_movies_ordered, _movie_map
+            log.info(f"Tag genome: {int(has_genome.sum())}/{num_items} movies "
+                     f"({has_genome.mean()*100:.1f}%)")
         else:
             genome_matrix = np.zeros((num_items, 1128), dtype=np.float32)
             has_genome = np.zeros(num_items, dtype=np.float32)
     else:
-        log.info("No genome-scores.csv found, using zeros.")
         genome_matrix = np.zeros((num_items, 1128), dtype=np.float32)
         has_genome = np.zeros(num_items, dtype=np.float32)
     GENOME_DIM = genome_matrix.shape[1]
 
-    # 9. Per-user genome profile: mean of genome relevance vectors over user's high-rated genome-having items.
+    # Per-user genome profile (mean of genome over user's high-rated genome-having items)
     log.info("Computing user genome profiles...")
     user_genome = np.zeros((num_users, GENOME_DIM), dtype=np.float32)
     _ug_count = np.zeros(num_users, dtype=np.float32)
-    _hr_mask = (real_train["rating"].values >= 4.0)
-    _hr_uids = real_train["userId"].values[_hr_mask].astype(np.int64)
-    _hr_mids = real_train["movieId"].values[_hr_mask].astype(np.int64)
-    _has_g = has_genome[_hr_mids] > 0
-    _hr_uids = _hr_uids[_has_g]
-    _hr_mids = _hr_mids[_has_g]
-    _chunk = 500_000
-    for i in range(0, len(_hr_uids), _chunk):
-        u_chunk = _hr_uids[i:i + _chunk]
-        m_chunk = _hr_mids[i:i + _chunk]
+    _hr = real_train["rating"].values >= 4.0
+    _hu = real_train["userId"].values[_hr].astype(np.int64)
+    _hm = real_train["movieId"].values[_hr].astype(np.int64)
+    _hg = has_genome[_hm] > 0
+    _hu = _hu[_hg]; _hm = _hm[_hg]
+    for i in range(0, len(_hu), 500_000):
+        u_chunk = _hu[i:i + 500_000]
+        m_chunk = _hm[i:i + 500_000]
         np.add.at(user_genome, u_chunk, genome_matrix[m_chunk])
         np.add.at(_ug_count, u_chunk, 1.0)
     _has_ug = _ug_count > 0
     user_genome[_has_ug] /= _ug_count[_has_ug, None]
     has_user_genome = _has_ug.astype(np.float32)
-    log.info(f"User genome: {int(_has_ug.sum())}/{num_users} users with profile ({_has_ug.mean()*100:.1f}%)")
-    del _hr_mask, _hr_uids, _hr_mids, _has_g, _has_ug, _ug_count
+    del _hr, _hu, _hm, _hg, _has_ug, _ug_count
 
-    # Save cache
     np.savez_compressed(_cache_path,
         movie_genres=movie_genres, user_hist_bins=user_hist_bins,
         item_hist_bins=item_hist_bins, user_count_norm=user_count_norm,
         item_count_norm=item_count_norm, user_histories=user_histories,
-        user_hist_ratings=user_hist_ratings, user_hist_timestamps=user_hist_timestamps,
+        user_hist_ratings=user_hist_ratings,
+        user_hist_timestamps=np.zeros((num_users, HISTORY_LEN), dtype=np.int32),
         item_histories=item_histories, item_hist_ratings=item_hist_ratings,
-        item_hist_timestamps=item_hist_timestamps, user_genre_affinity=user_genre_affinity,
+        item_hist_timestamps=np.zeros((num_items, ITEM_HIST_LEN), dtype=np.int32),
+        user_genre_affinity=user_genre_affinity,
         ts_min=np.array(ts_min), ts_range=np.array(ts_range),
         movie_year=movie_year, movie_genre_count=movie_genre_count,
         genome_matrix=genome_matrix, has_genome=has_genome,
@@ -364,93 +291,23 @@ else:
     )
     log.info(f"Features cached to {_cache_path.name}")
 
+PAD_IDX = num_items
+USER_PAD_IDX = num_users
 
-# ═══════════════════════════════════════════════════════════════════
-# RECENCY FILTER — drop oldest 20% of real ratings (features already computed from full data)
-# ═══════════════════════════════════════════════════════════════════
+# Move lookup tables to GPU
+_user_hist_t = torch.from_numpy(user_histories).to(DEVICE)
+_user_hist_rat_t = torch.from_numpy(user_hist_ratings).to(DEVICE)
+_item_hist_t = torch.from_numpy(item_histories).to(DEVICE)
+_item_hist_rat_t = torch.from_numpy(item_hist_ratings).to(DEVICE)
+_movie_genres_t = torch.from_numpy(movie_genres).to(DEVICE)
+_genome_t = torch.from_numpy(genome_matrix).to(DEVICE)
+_user_genome_t = torch.from_numpy(user_genome).to(DEVICE)
 
-full_real_train = train_df[train_df["rating"] > 0].copy()
-real_mask = train_df["rating"] > 0
-real_ratings = train_df[real_mask].sort_values("timestamp")
-cutoff = int(len(real_ratings) * (1 - RECENCY_FRAC))
-keep_real = real_ratings.iloc[cutoff:].index
-keep_neg = train_df[~real_mask].index
-train_df = train_df.loc[keep_real.union(keep_neg)].reset_index(drop=True)
-n_dropped = int(real_mask.sum()) - len(keep_real)
-log.info(f"Recency filter: kept {RECENCY_FRAC:.0%} of real ratings, dropped {n_dropped} oldest")
-
-if POST_RECENCY_NEG_RESAMPLE:
-    kept_real_train = train_df[train_df["rating"] > 0].reset_index(drop=True)
-    kept_pos = kept_real_train[kept_real_train["label"] == 1].reset_index(drop=True)
-    old_easy_neg = int((train_df["rating"] == 0).sum())
-    num_easy_neg = int(round(len(kept_pos) * POST_RECENCY_EASY_NEG_PER_POS))
-    if len(kept_pos) == 0 or num_easy_neg == 0:
-        train_df = kept_real_train.copy()
-        log.info("Post-recency neg resample: no kept positives; dropped existing easy negatives")
-    else:
-        from scipy.sparse import csr_matrix
-
-        rng = np.random.RandomState(SEED)
-        full_rows = full_real_train["userId"].values.astype(np.int64)
-        full_cols = full_real_train["movieId"].values.astype(np.int64)
-        rated_matrix = csr_matrix(
-            (np.ones(len(full_rows), dtype=bool), (full_rows, full_cols)),
-            shape=(num_users, num_items),
-        )
-        item_first_seen = np.full(num_items, int(full_real_train["timestamp"].max()), dtype=np.int64)
-        first_seen_series = full_real_train.groupby("movieId")["timestamp"].min()
-        item_first_seen[first_seen_series.index.values.astype(np.int64)] = first_seen_series.values.astype(np.int64)
-
-        anchor_idx = rng.randint(0, len(kept_pos), size=num_easy_neg)
-        anchor_rows = kept_pos.iloc[anchor_idx]
-        neg_users = anchor_rows["userId"].values.astype(np.int64)
-        neg_timestamps = anchor_rows["timestamp"].values.astype(np.int64)
-        neg_items = rng.randint(0, num_items, size=num_easy_neg)
-        for _ in range(10):
-            is_rated = np.array(rated_matrix[neg_users, neg_items]).flatten().astype(bool)
-            is_rated |= item_first_seen[neg_items] > neg_timestamps
-            n_bad = int(is_rated.sum())
-            if n_bad == 0:
-                break
-            neg_items[is_rated] = rng.randint(0, num_items, size=n_bad)
-
-        new_easy_neg = pd.DataFrame({
-            "userId": neg_users,
-            "movieId": neg_items,
-            "rating": 0.0,
-            "timestamp": neg_timestamps,
-            "label": 0,
-        })
-        train_df = pd.concat([kept_real_train, new_easy_neg], ignore_index=True)
-        log.info(
-            f"Post-recency neg resample: replaced {old_easy_neg} easy neg with {num_easy_neg} "
-            f"({POST_RECENCY_EASY_NEG_PER_POS:.2f} per kept positive)"
-        )
-
-
-# ═══════════════════════════════════════════════════════════════════
-# DATASET — precompute features on GPU (lookup tables stay compact)
-# ═══════════════════════════════════════════════════════════════════
-
-# Compact lookup tables on GPU (indexed by user/item ID, not per-sample)
-_user_histories_gpu = torch.from_numpy(user_histories).to(DEVICE)       # (num_users, L)
-_user_hist_ratings_gpu = torch.from_numpy(user_hist_ratings).to(DEVICE) # (num_users, L)
-_user_hist_ts_gpu = torch.from_numpy(user_hist_timestamps).to(DEVICE)   # (num_users, L)
-_item_histories_gpu = torch.from_numpy(item_histories).to(DEVICE)       # (num_items, IL)
-_item_hist_ratings_gpu = torch.from_numpy(item_hist_ratings).to(DEVICE) # (num_items, IL)
-_item_hist_ts_gpu = torch.from_numpy(item_hist_timestamps).to(DEVICE)   # (num_items, IL)
-_movie_genres_gpu = torch.from_numpy(movie_genres).to(DEVICE)           # (num_items, G)
-_genome_gpu = torch.from_numpy(genome_matrix).to(DEVICE)               # (num_items, GENOME_DIM)
-_has_genome_gpu = torch.from_numpy(has_genome).to(DEVICE)              # (num_items,)
-_user_genome_gpu = torch.from_numpy(user_genome).to(DEVICE).half()     # (num_users, GENOME_DIM) fp16
-_has_user_genome_gpu = torch.from_numpy(has_user_genome).to(DEVICE)    # (num_users,)
-
-def _build_gpu_tensors(df):
-    """Precompute per-sample features on GPU. Histories/genres looked up at training time."""
+# Per-sample dense features (computed once for train + eval)
+def _build_sample_tensors(df):
     uids = df["userId"].values.astype(np.int64)
     mids = df["movieId"].values.astype(np.int64)
     labels = df["label"].values.astype(np.float32)
-    sample_ts = df["timestamp"].values.astype(np.int32)
     ts_norm = ((df["timestamp"].values - ts_min) / ts_range).astype(np.float32)
     ug_dot = np.sum(user_genre_affinity[uids] * movie_genres[mids], axis=1).astype(np.float32)
     movie_age = ts_norm - movie_year[mids]
@@ -461,431 +318,206 @@ def _build_gpu_tensors(df):
         ug_dot,
         movie_year[mids], movie_genre_count[mids], movie_age,
     ]).astype(np.float32)
-    return (
-        torch.from_numpy(uids).to(DEVICE),
-        torch.from_numpy(mids).to(DEVICE),
-        torch.from_numpy(dense).to(DEVICE),
-        torch.from_numpy(labels).to(DEVICE),
-        torch.from_numpy(sample_ts).to(DEVICE),
-    )
+    return (torch.from_numpy(uids).to(DEVICE),
+            torch.from_numpy(mids).to(DEVICE),
+            torch.from_numpy(dense).to(DEVICE),
+            torch.from_numpy(labels).to(DEVICE))
 
-log.info("Precomputing training tensors on GPU...")
-train_uids, train_mids, train_dense, train_labels, train_ts = _build_gpu_tensors(train_df)
+log.info("Precomputing training tensors...")
+train_uids, train_mids, train_dense, train_labels = _build_sample_tensors(train_df)
 n_train = len(train_labels)
-n_batches_per_epoch = n_train // BATCH_SIZE
+DENSE_DIM = train_dense.shape[1]
 
-
-# ═══════════════════════════════════════════════════════════════════
-# EVAL SET — val rated items + sampled unrated negatives
-# ═══════════════════════════════════════════════════════════════════
-
-# Val positives: rated >= 4 in val set (label=1)
-# Val hard negatives: rated < 4 in val set (label=0)
-# Val easy negatives: random unrated movies (label=0), 1 per val positive
+# ─── Eval set: val pos + val hard neg + sampled easy neg ──────────
 _val_pos_mask = val_df["label"] == 1
 _val_pos = val_df[_val_pos_mask]
 _val_hard_neg = val_df[~_val_pos_mask]
 _n_val_pos = len(_val_pos)
 
-# Build user -> all items (train + val) for eval neg sampling exclusion
-_val_user_all = {}
-for uid, items in user_all_items.items():
-    _val_user_all[uid] = set(items)
+_val_user_all = {uid: set(items) for uid, items in user_all_items.items()}
 for uid, group in val_df.groupby("userId"):
-    if uid not in _val_user_all:
-        _val_user_all[uid] = set()
-    _val_user_all[uid].update(group["movieId"].values)
+    _val_user_all.setdefault(uid, set()).update(group["movieId"].values)
 
-# Sample fixed easy negatives for val positives
 _eval_rng = np.random.RandomState(42)
 _easy_neg_users = _val_pos["userId"].values.astype(np.int64)
 _easy_neg_items = np.empty(_n_val_pos, dtype=np.int64)
 for i in range(_n_val_pos):
-    uid = _easy_neg_users[i]
-    rated = _val_user_all.get(uid, set())
+    rated = _val_user_all.get(_easy_neg_users[i], set())
     mid = _eval_rng.randint(0, num_items)
     while mid in rated:
         mid = _eval_rng.randint(0, num_items)
     _easy_neg_items[i] = mid
 
-# Combine: val positives + val hard negatives + easy negatives
-_eval_users = np.concatenate([
-    _val_pos["userId"].values, _val_hard_neg["userId"].values, _easy_neg_users
-]).astype(np.int64)
-_eval_items = np.concatenate([
-    _val_pos["movieId"].values, _val_hard_neg["movieId"].values, _easy_neg_items
-]).astype(np.int64)
-_eval_ts = np.concatenate([
-    _val_pos["timestamp"].values, _val_hard_neg["timestamp"].values, _val_pos["timestamp"].values
-])
-_eval_ts_norm = ((_eval_ts - ts_min) / ts_range).astype(np.float32)
-_eval_labels = np.concatenate([
-    np.ones(_n_val_pos), np.zeros(len(_val_hard_neg)), np.zeros(_n_val_pos)
-])
+_eval_df = pd.DataFrame({
+    "userId": np.concatenate([_val_pos["userId"].values, _val_hard_neg["userId"].values, _easy_neg_users]),
+    "movieId": np.concatenate([_val_pos["movieId"].values, _val_hard_neg["movieId"].values, _easy_neg_items]),
+    "timestamp": np.concatenate([_val_pos["timestamp"].values, _val_hard_neg["timestamp"].values, _val_pos["timestamp"].values]),
+    "label": np.concatenate([np.ones(_n_val_pos), np.zeros(len(_val_hard_neg)), np.zeros(_n_val_pos)]),
+})
+log.info("Precomputing eval tensors...")
+eval_uids, eval_mids, eval_dense, eval_labels_t = _build_sample_tensors(_eval_df)
+n_eval = len(eval_uids)
+log.info(f"Eval set: {_n_val_pos} pos + {len(_val_hard_neg)} hard neg + {_n_val_pos} easy neg = {n_eval}")
 
-log.info("Precomputing eval tensors on GPU...")
-_eval_uids_t, _eval_mids_t, _eval_dense_t, _, _eval_ts_t = _build_gpu_tensors(
-    pd.DataFrame({
-        "userId": _eval_users, "movieId": _eval_items,
-        "timestamp": _eval_ts, "label": _eval_labels,
-    })
-)
-n_eval = len(_eval_users)
-log.info(f"Eval set: {_n_val_pos} pos + {len(_val_hard_neg)} hard neg + {_n_val_pos} easy neg = {n_eval} total")
 
+# ═══════════════════════════════════════════════════════════════════
+# MODEL — single Linear head on concatenated features
+# ═══════════════════════════════════════════════════════════════════
+
+class LinearBaseline(nn.Module):
+    """concat(all features) -> Linear(in, 1) -> sigmoid."""
+    def __init__(self, num_users, num_items, num_genres, dense_dim, genome_dim, embed_dim):
+        super().__init__()
+        D = embed_dim
+        # Embeddings (+1 row for PAD)
+        self.user_embed = nn.Embedding(num_users + 1, D, padding_idx=num_users)
+        self.item_embed = nn.Embedding(num_items + 1, D, padding_idx=num_items)
+        # Single Linear projection of genre multi-hot (no hidden layer; this is not an MLP)
+        self.genre_proj = nn.Linear(num_genres, D, bias=False)
+        # Concat dim:
+        #   user_e (D) + item_e (D)
+        #   user_hist mean (D) + user_hist mean rating (1)
+        #   item_hist mean (D) + item_hist mean rating (1)
+        #   genre_proj (D)
+        #   dense (dense_dim)
+        #   genome (genome_dim) + user_genome (genome_dim)
+        self.in_dim = 5 * D + 2 + dense_dim + 2 * genome_dim
+        self.head = nn.Linear(self.in_dim, 1)
+
+    def forward(self, uids, mids, dense):
+        u_e = self.user_embed(uids)
+        i_e = self.item_embed(mids)
+
+        # User history: mean-pool item_embed over valid (non-PAD) positions
+        u_hist = _user_hist_t[uids]                       # (B, L)
+        u_hist_rat = _user_hist_rat_t[uids]               # (B, L)
+        u_hist_e = self.item_embed(u_hist)                # (B, L, D)
+        u_valid = (u_hist != PAD_IDX).float().unsqueeze(-1)
+        u_count = u_valid.sum(dim=1).clamp(min=1.0)
+        u_hist_pool = (u_hist_e * u_valid).sum(dim=1) / u_count                # (B, D)
+        u_hist_rat_mean = (u_hist_rat * u_valid.squeeze(-1)).sum(dim=1) / u_count.squeeze(-1)
+        u_hist_rat_mean = u_hist_rat_mean.unsqueeze(-1)                        # (B, 1)
+
+        # Item history: mean-pool user_embed over valid raters
+        i_hist = _item_hist_t[mids]                       # (B, IL)
+        i_hist_rat = _item_hist_rat_t[mids]               # (B, IL)
+        i_hist_e = self.user_embed(i_hist)                # (B, IL, D)
+        i_valid = (i_hist != USER_PAD_IDX).float().unsqueeze(-1)
+        i_count = i_valid.sum(dim=1).clamp(min=1.0)
+        i_hist_pool = (i_hist_e * i_valid).sum(dim=1) / i_count
+        i_hist_rat_mean = (i_hist_rat * i_valid.squeeze(-1)).sum(dim=1) / i_count.squeeze(-1)
+        i_hist_rat_mean = i_hist_rat_mean.unsqueeze(-1)
+
+        # Genres + genome lookups
+        genre_e = self.genre_proj(_movie_genres_t[mids])  # (B, D)
+        genome_e = _genome_t[mids]                        # (B, GENOME_DIM)
+        u_genome = _user_genome_t[uids]                   # (B, GENOME_DIM)
+
+        x = torch.cat([
+            u_e, i_e,
+            u_hist_pool, u_hist_rat_mean,
+            i_hist_pool, i_hist_rat_mean,
+            genre_e,
+            dense,
+            genome_e, u_genome,
+        ], dim=-1)
+        return self.head(x).squeeze(-1)
+
+
+model = LinearBaseline(num_users, num_items, num_genres, DENSE_DIM, GENOME_DIM, EMBED_DIM).to(DEVICE)
+n_params = sum(p.numel() for p in model.parameters())
+log.info(f"Parameters: {n_params/1e6:.1f}M | dense_dim={DENSE_DIM} | genome_dim={GENOME_DIM} | "
+         f"in_dim={model.in_dim} | head_params={(model.in_dim + 1)}")
+
+opt = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+loss_fn = nn.BCEWithLogitsLoss()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# TRAINING LOOP — patience-based early stopping, sub-epoch eval
+# ═══════════════════════════════════════════════════════════════════
 
 def run_eval():
-    """Evaluate AUC on validation set."""
     model.eval()
     eval_batch = BATCH_SIZE * 2
-    all_scores = []
+    scores = []
     with torch.no_grad():
-        for start in range(0, n_eval, eval_batch):
-            end = min(start + eval_batch, n_eval)
-            u = _eval_uids_t[start:end]
-            m = _eval_mids_t[start:end]
-            logits = model(
-                u, m, _eval_dense_t[start:end],
-                _user_histories_gpu[u], _user_hist_ratings_gpu[u], _user_hist_ts_gpu[u], _eval_ts_t[start:end],
-                _movie_genres_gpu[m],
-                _item_histories_gpu[m], _item_hist_ratings_gpu[m], _item_hist_ts_gpu[m],
-                _genome_gpu[m], _has_genome_gpu[m],
-                _user_genome_gpu[u], _has_user_genome_gpu[u],
-            )
-            all_scores.append(torch.sigmoid(logits).cpu().numpy())
-
-    scores = np.concatenate(all_scores)
-    return evaluate(_eval_labels, scores)
-
-
-# ═══════════════════════════════════════════════════════════════════
-# MODEL
-# ═══════════════════════════════════════════════════════════════════
-
-class DLRM(nn.Module):
-    def __init__(self):
-        super().__init__()
-        D = EMBED_DIM
-
-        self.user_embed = nn.Embedding(num_users, D)
-        self.item_embed = nn.Embedding(num_items, D)
-        self.hist_embed = nn.Embedding(num_items + 1, D, padding_idx=PAD_IDX)
-        self.rater_embed = nn.Embedding(num_users + 1, D, padding_idx=USER_PAD_IDX)
-        self.zero_item_hist = ITEM_HIST_MODE == "off"
-        self.use_causal_sa = USE_CAUSAL_SA
-        self.user_hist_mode = USER_HIST_MODE
-        self.item_hist_mode = ITEM_HIST_MODE
-
-        # Rating projection: scalar rating → D-dim vector
-        self.rating_proj = nn.Linear(1, D)
-
-        # Lightweight causal self-attention on history (single head, no FFN)
-        self.hist_q = nn.Linear(D, D, bias=False)
-        self.hist_k = nn.Linear(D, D, bias=False)
-        self.hist_v = nn.Linear(D, D, bias=False)
-
-        # DIN: target-item-aware attention over history
-        self.din_attn = nn.Sequential(
-            nn.Linear(3 * 2 * D, 64),  # 2*D per position (item+rating), 3 groups
-            nn.ReLU(),
-            nn.Linear(64, 1),
-        )
-
-        # Item-side DIN: target-user-aware attention over recent raters
-        self.item_din_attn = nn.Sequential(
-            nn.Linear(3 * 2 * D, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1),
-        )
-
-        self.bottom_mlp = nn.Sequential(
-            nn.Linear(NUM_DENSE, 128),
-            nn.ReLU(),
-            nn.Linear(128, D),
-            nn.ReLU(),
-        )
-
-        self.genre_proj = nn.Sequential(
-            nn.Linear(num_genres, D),
-            nn.ReLU(),
-        )
-
-        # Tag genome: learned bottleneck compression 1128 → D with gating
-        _genome_hidden_dims = [int(h) for h in GENOME_BOTTLENECK_HIDDEN.split(",") if h.strip()]
-        _genome_layers = []
-        _prev_dim = GENOME_DIM
-        for _h in _genome_hidden_dims:
-            _genome_layers.append(nn.Linear(_prev_dim, _h))
-            _genome_layers.append(nn.ReLU())
-            _prev_dim = _h
-        _genome_layers.append(nn.Dropout(GENOME_BOTTLENECK_DROPOUT))
-        _genome_layers.append(nn.Linear(_prev_dim, D))
-        self.genome_proj = nn.Sequential(*_genome_layers)
-        # sigmoid gate to blend genome with item_embed fallback
-        self.genome_fusion_mode = GENOME_FUSION_MODE
-        if GENOME_FUSION_MODE == "legacy":
-            self.genome_gate = nn.Linear(D, D)
-        elif GENOME_FUSION_MODE == "mask_only":
-            self.genome_gate = nn.Linear(1, D)
-
-        # User × item content alignment scalar → small projection.
-        self.user_genome_mode = USER_GENOME
-        self.user_genome_target = USER_GENOME_TARGET
-        if USER_GENOME == "scalar_dot":
-            self.ug_dot_proj = nn.Linear(1, D)
-
-        # Squeeze-and-Excitation: learn per-field importance weights
-        cross_dim = 7 * D  # user, item, user_hist(DIN), item_hist(DIN), dense, genre, genome
-        self.se = nn.Sequential(
-            nn.Linear(7, 7 * 4),
-            nn.ReLU(),
-            nn.Linear(7 * 4, 7),
-            nn.Sigmoid(),
-        )
-
-        # Top MLP: SE-reweighted fields → prediction
-        self.top_mlp = nn.Sequential(
-            nn.Linear(cross_dim, 256),
-            nn.ReLU(),
-            nn.Dropout(MLP_DROPOUT),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(MLP_DROPOUT),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1),
-        )
-
-        self._init_weights()
-
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.Embedding):
-                nn.init.normal_(m.weight, 0.0, 0.01)
-                if m.padding_idx is not None:
-                    nn.init.zeros_(m.weight[m.padding_idx])
-
-    def forward(self, user_id, movie_id, dense, history, hist_ratings, hist_timestamps, sample_timestamps,
-                genres, item_hist, item_hist_ratings, item_hist_timestamps, genome_raw, has_genome_mask,
-                user_genome_raw=None, has_user_genome_mask=None):
-        user_e = nn.functional.dropout(self.user_embed(user_id), EMBED_DROPOUT, self.training)
-        item_e = nn.functional.dropout(self.item_embed(movie_id), EMBED_DROPOUT, self.training)
-        hist_valid = history != PAD_IDX
-        if USER_HIST_CONTEXT == "causal_masked":
-            hist_valid = hist_valid & (hist_timestamps < sample_timestamps.unsqueeze(1))
-        item_hist_valid = item_hist != USER_PAD_IDX
-        if ITEM_HIST_CONTEXT == "causal_masked":
-            item_hist_valid = item_hist_valid & (item_hist_timestamps < sample_timestamps.unsqueeze(1))
-        hist_mask = hist_valid.unsqueeze(-1)
-        item_hist_mask = item_hist_valid.unsqueeze(-1)
-
-        # --- User-side: causal self-attention + DIN ---
-        raw_hist_item_e = self.hist_embed(history)                     # (B, L, D) — save raw
-        hist_item_e = raw_hist_item_e
-        hist_rat_e = self.rating_proj(hist_ratings.unsqueeze(-1))      # (B, L, D)
-        if self.use_causal_sa:
-            Q = self.hist_q(hist_item_e)                                   # (B, L, D)
-            K = self.hist_k(hist_item_e)                                   # (B, L, D)
-            V = self.hist_v(hist_item_e)                                   # (B, L, D)
-            scale = Q.size(-1) ** 0.5
-            causal_scores = torch.bmm(Q, K.transpose(1, 2)) / scale       # (B, L, L)
-            L = history.size(1)
-            causal_valid = torch.tril(torch.ones((L, L), device=history.device, dtype=torch.bool))
-            key_valid = hist_valid.unsqueeze(1).expand(-1, L, -1)
-            causal_weights = _masked_softmax(causal_scores, causal_valid.unsqueeze(0) & key_valid, dim=-1)
-            hist_item_e = torch.bmm(causal_weights, V) + raw_hist_item_e
-
-        if self.user_hist_mode == "din":
-            hist_e_raw = torch.cat([hist_item_e, hist_rat_e], dim=-1)     # (B, L, 2D)
-            target_e = torch.cat([item_e, item_e], dim=-1)                # (B, 2D) — no rating for target
-            target_exp = target_e.unsqueeze(1).expand_as(hist_e_raw)      # (B, L, 2D)
-            attn_in = torch.cat([hist_e_raw, target_exp, hist_e_raw * target_exp], dim=-1)
-            attn_w = self.din_attn(attn_in).squeeze(-1)                   # (B, L)
-            attn_w = _masked_softmax(attn_w, hist_valid, dim=-1).unsqueeze(-1)
-            user_hist_e = (hist_item_e * attn_w).sum(dim=1)               # (B, D)
-        elif self.user_hist_mode == "mean":
-            denom = hist_mask.sum(dim=1).clamp_min(1)
-            user_hist_e = (hist_item_e * hist_mask).sum(dim=1) / denom
-        elif self.user_hist_mode == "rating":
-            rating_weights = hist_ratings.unsqueeze(-1) * hist_mask
-            denom = rating_weights.sum(dim=1).clamp_min(1e-6)
-            user_hist_e = (hist_item_e * rating_weights).sum(dim=1) / denom
-        else:
-            raise ValueError(f"Unknown USER_HIST_MODE: {self.user_hist_mode}")
-
-        # --- Item-side DIN: attention over users who rated this item ---
-        rater_e = nn.functional.dropout(self.rater_embed(item_hist), EMBED_DROPOUT, self.training)  # (B, IL, D)
-        if self.item_hist_mode == "din":
-            rater_rat_e = self.rating_proj(item_hist_ratings.unsqueeze(-1)) # (B, IL, D)
-            rater_e_raw = torch.cat([rater_e, rater_rat_e], dim=-1)       # (B, IL, 2D)
-            query_e = torch.cat([user_e, user_e], dim=-1)                 # (B, 2D)
-            query_exp = query_e.unsqueeze(1).expand_as(rater_e_raw)       # (B, IL, 2D)
-            item_attn_in = torch.cat([rater_e_raw, query_exp, rater_e_raw * query_exp], dim=-1)
-            item_attn_w = self.item_din_attn(item_attn_in).squeeze(-1)    # (B, IL)
-            item_attn_w = _masked_softmax(item_attn_w, item_hist_valid, dim=-1).unsqueeze(-1)
-            item_hist_e = (rater_e * item_attn_w).sum(dim=1)              # (B, D)
-        elif self.item_hist_mode == "mean":
-            denom = item_hist_mask.sum(dim=1).clamp_min(1)
-            item_hist_e = (rater_e * item_hist_mask).sum(dim=1) / denom
-        elif self.item_hist_mode == "off":
-            item_hist_e = torch.zeros_like(item_e)
-        else:
-            raise ValueError(f"Unknown ITEM_HIST_MODE: {self.item_hist_mode}")
-
-        dense_e = self.bottom_mlp(dense)
-        genre_e = self.genre_proj(genres)
-
-        # Tag genome: learned compression with gating
-        genome_e = self.genome_proj(genome_raw)                           # (B, D)
-        if self.genome_fusion_mode == "legacy":
-            gate_input = genome_e
-        elif self.genome_fusion_mode == "mask_only":
-            gate_input = has_genome_mask.unsqueeze(-1)                    # (B, 1)
-        gate = torch.sigmoid(self.genome_gate(gate_input))                # (B, D)
-        genome_field = gate * genome_e + (1 - gate) * item_e.detach()     # blend genome with item fallback
-
-        # User × item content alignment: dot(user_genome, item_genome) / GENOME_DIM
-        # → Linear(1, D) → added to either dense_e or genome_field (per USER_GENOME_TARGET).
-        if self.user_genome_mode == "scalar_dot":
-            ug_raw = user_genome_raw.float()
-            dot = (ug_raw * genome_raw).sum(dim=-1, keepdim=True) / GENOME_DIM  # (B, 1)
-            valid = has_user_genome_mask.unsqueeze(-1) * has_genome_mask.unsqueeze(-1)
-            ug_field = self.ug_dot_proj(dot * valid)                      # (B, D)
-            if self.user_genome_target == "dense_e":
-                dense_e = dense_e + ug_field
-            else:  # genome_field
-                genome_field = genome_field + ug_field
-
-        # Squeeze-and-Excitation: learn per-field importance weights
-        fields = torch.stack([user_e, item_e, user_hist_e, item_hist_e, dense_e, genre_e, genome_field], dim=1)  # (B, 7, D)
-        se_input = fields.mean(dim=2)               # (B, 7) — global avg pool per field
-        se_weights = self.se(se_input).unsqueeze(-1) # (B, 7, 1) — learned importance
-        fields = fields * se_weights                  # reweight fields
-        x0 = fields.reshape(fields.size(0), -1)      # (B, 7*D) — flatten
-
-        return self.top_mlp(x0).squeeze(-1)
-
-
-model = DLRM().to(DEVICE)
-num_params = sum(p.numel() for p in model.parameters())
-log.info(f"Parameters: {num_params / 1e6:.1f}M | Genres: {num_genres}")
-
-# Compile model for CUDA graphs / kernel fusion
-if DEVICE.type == "cuda" and USE_TORCH_COMPILE:
-    model = torch.compile(model)
-
-
-# ═══════════════════════════════════════════════════════════════════
-# TRAINING LOOP — BCE loss
-# ═══════════════════════════════════════════════════════════════════
-
-optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-criterion = nn.BCEWithLogitsLoss()
-use_amp = DEVICE.type == "cuda"
-scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-
-training_start = time.time()
-peak_memory_mb = 0.0
-best_auc = 0.0
-best_state = None
-evals_without_improvement = 0
-global_step = 0
-eval_every_steps = max(n_batches_per_epoch // 3, 1)  # eval ~3x per epoch
-epoch = 0
-
-while True:
+        for s in range(0, n_eval, eval_batch):
+            e = min(s + eval_batch, n_eval)
+            logits = model(eval_uids[s:e], eval_mids[s:e], eval_dense[s:e])
+            scores.append(torch.sigmoid(logits).cpu().numpy())
     model.train()
-    epoch_loss = 0.0
+    scores = np.concatenate(scores)
+    labels = eval_labels_t.cpu().numpy()
+    return evaluate(labels, scores)
 
-    # Shuffle training data each epoch via random permutation
+
+t_train_start = time.time()
+best_auc = -1.0
+best_state = None
+no_improve = 0
+n_batches_per_epoch = n_train // BATCH_SIZE
+eval_interval = max(1, n_batches_per_epoch // EVAL_PER_EPOCH)
+step = 0
+loss_sum = 0.0
+loss_n = 0
+done = False
+
+for epoch in range(MAX_EPOCHS):
+    # Shuffle training indices
     perm = torch.randperm(n_train, device=DEVICE)
+    for b in range(n_batches_per_epoch):
+        idx = perm[b * BATCH_SIZE:(b + 1) * BATCH_SIZE]
+        logits = model(train_uids[idx], train_mids[idx], train_dense[idx])
+        loss = loss_fn(logits, train_labels[idx])
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        loss_sum += float(loss.item())
+        loss_n += 1
+        step += 1
 
-    for i in range(n_batches_per_epoch):
-        idx = perm[i * BATCH_SIZE : (i + 1) * BATCH_SIZE]
-
-        u_batch = train_uids[idx]
-        m_batch = train_mids[idx]
-        with torch.amp.autocast("cuda", enabled=use_amp):
-            logits = model(
-                u_batch, m_batch, train_dense[idx],
-                _user_histories_gpu[u_batch], _user_hist_ratings_gpu[u_batch],
-                _user_hist_ts_gpu[u_batch], train_ts[idx],
-                _movie_genres_gpu[m_batch],
-                _item_histories_gpu[m_batch], _item_hist_ratings_gpu[m_batch],
-                _item_hist_ts_gpu[m_batch],
-                _genome_gpu[m_batch], _has_genome_gpu[m_batch],
-                _user_genome_gpu[u_batch], _has_user_genome_gpu[u_batch],
-            )
-            # Label smoothing: soft targets
-            smooth_labels = train_labels[idx] * (1.0 - 2 * LABEL_SMOOTH) + LABEL_SMOOTH
-            loss = criterion(logits, smooth_labels)
-
-        scaler.scale(loss / ACCUM_STEPS).backward()
-        if (i + 1) % ACCUM_STEPS == 0:
-            if GRAD_CLIP > 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-            if WARMUP_STEPS > 0:
-                _opt_step = (i + 1) // ACCUM_STEPS + epoch * (n_batches_per_epoch // ACCUM_STEPS)
-                if _opt_step < WARMUP_STEPS:
-                    _scale = (_opt_step + 1) / WARMUP_STEPS
-                    for _pg in optimizer.param_groups:
-                        _pg["lr"] = LR * _scale
-                else:
-                    for _pg in optimizer.param_groups:
-                        _pg["lr"] = LR
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
-
-        epoch_loss += loss.item()
-        global_step += 1
-
-        # Sub-epoch evaluation
-        if global_step % eval_every_steps == 0:
-            avg_loss = epoch_loss / (i + 1)
-            elapsed = time.time() - training_start
-            val_metrics = run_eval()
-            val_auc = val_metrics["auc"]
-            improved = "***" if val_auc > best_auc else ""
-            log.info(f"Step {global_step:6d} | Loss {avg_loss:.4f} | Val AUC {val_auc:.4f} {improved} | {elapsed:.0f}s")
-
-            if val_auc > best_auc:
-                best_auc = val_auc
-                best_state = copy.deepcopy(model.state_dict())
-                evals_without_improvement = 0
+        if step % eval_interval == 0:
+            metrics = run_eval()
+            avg_loss = loss_sum / max(1, loss_n)
+            elapsed = time.time() - t_train_start
+            star = ""
+            if metrics["auc"] > best_auc:
+                best_auc = metrics["auc"]
+                best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+                no_improve = 0
+                star = " ***"
             else:
-                evals_without_improvement += 1
-
-            if evals_without_improvement >= PATIENCE:
+                no_improve += 1
+            log.info(f"Step {step:6d} | Loss {avg_loss:.4f} | Val AUC {metrics['auc']:.4f}{star} | {elapsed:.0f}s")
+            loss_sum = 0.0
+            loss_n = 0
+            if no_improve >= PATIENCE:
                 log.info(f"Early stopping: no improvement for {PATIENCE} evals (best AUC: {best_auc:.4f})")
+                done = True
                 break
-            model.train()
-
-    epoch += 1
-    if evals_without_improvement >= PATIENCE:
+    if done:
         break
-
-# Record peak CUDA memory after training
-if DEVICE.type == "cuda":
-    peak_memory_mb = torch.cuda.max_memory_allocated(DEVICE) / (1024 * 1024)
-
-training_seconds = time.time() - training_start
-
-
-# ═══════════════════════════════════════════════════════════════════
-# EVALUATION
-# ═══════════════════════════════════════════════════════════════════
 
 if best_state is not None:
     model.load_state_dict(best_state)
     log.info(f"Restored best model (AUC: {best_auc:.4f})")
 
-metrics = run_eval()
-total_seconds = time.time() - total_start
+t_train_end = time.time()
 
-print_summary(metrics, training_seconds, total_seconds, peak_memory_mb, num_params, stats)
+# Final eval (uses best weights)
+final_metrics = run_eval()
+
+if torch.cuda.is_available():
+    peak_mem_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
+else:
+    peak_mem_mb = 0.0
+
+print_summary(
+    metrics=final_metrics,
+    training_seconds=t_train_end - t_train_start,
+    total_seconds=time.time() - t_total_start,
+    peak_memory_mb=peak_mem_mb,
+    num_params=n_params,
+    stats=stats,
+)

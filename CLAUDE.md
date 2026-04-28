@@ -4,11 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Research repo for movie recommendation on MovieLens. Uses a hybrid engagement prediction task: predict whether a user will rate a movie >= 4 stars, with both "watched but didn't like" (hard negatives) and "random unrated" (easy negatives) as label=0. Output is a calibrated probability via BCE loss, suitable for front-page recommendation with a threshold.
+Restart (apr28) of the MovieLens hybrid engagement prediction project. Same task as legacy: predict whether a user will rate a movie >= 4 stars, with both "rated < 4" (hard negatives) and "random unrated" (easy negatives) as label=0. BCE loss over calibrated probabilities. Metric: val_auc on ml-25m (deterministic, SEED=42).
 
-Best historical single-model AUC: **0.821 on ml-25m** (deterministic, SEED=42). The current restart baseline reproduces at **0.8284 at SEED=42** (apr27b 100-trial HP sweep, 5-seed mean lift +0.00170 over the prior 0.8272 baseline).
-The checked-in `train.py` is the restart baseline and is not the exact historical field-attention/two-stream model. Treat `train.py` as the source of truth for the current baseline and `program.md` as the experiment history.
-See `program.md` for full experiment history (~500 experiments). See `README.md` for AUC progress chart.
+The legacy project at `legacy/` reached **val_auc = 0.8284** but two separate ceiling tests (apr27, apr27c) confirmed the architecture family is saturated. This restart begins from the **simplest possible model — a single Linear head on concatenated features — with the same input features**, so future architectural decisions can be motivated by clean ablations rather than 540 experiments of inherited assumptions.
+
+The starting baseline AUC will be substantially below 0.8284. Build it back up deliberately.
 
 ## Commands
 
@@ -16,10 +16,10 @@ See `program.md` for full experiment history (~500 experiments). See `README.md`
 # Sync the repo-local environment
 uv sync
 
-# Quick smoke test (ml-100k, ~seconds) — only for crash detection, NOT for AUC comparison
+# Quick smoke test (ml-100k, ~seconds) — crash detection only, NOT for AUC comparison
 DATASET=ml-100k uv run python train.py
 
-# Standard experiment (ml-25m on the current CUDA GPU; runtime is hardware-dependent)
+# Standard experiment (ml-25m on the current CUDA GPU)
 DATASET=ml-25m uv run python train.py
 
 # Full experiment run (redirected, for autoresearch loop)
@@ -31,70 +31,67 @@ grep "^val_auc:\|^peak_memory_mb:" run.log
 
 ## Architecture
 
-- **`prepare.py`** — Data download/loading (all MovieLens sizes), `load_data_hybrid()` for the current formulation, time-based train/val/test splits, AUC evaluation, `print_summary()`. May be modified for data setup changes. Keep `evaluate()` and `print_summary()` stable.
-- **`train.py`** — The experimentation file. Feature engineering, model architecture, and training loop. Primary file to modify. Treat the code as the source of truth for the checked-in baseline.
-- **`program.md`** — The autoresearch protocol: setup, experiment loop, logging, full experiment history (~500 experiments), and historical learnings.
+- **`prepare.py`** — Shared with legacy. Data download/loading (all MovieLens sizes), `load_data_hybrid()`, time-based train/val/test splits, AUC evaluation, `print_summary()`. **Do not modify the evaluation harness.**
+- **`train.py`** — The current baseline + experimentation file. Same input features as legacy; model is `concat → Linear(in, 1) → sigmoid`. No hidden layer.
+- **`program.md`** — Fresh experiment log starting at the apr28 baseline.
+- **`legacy/`** — Frozen archive of the old project. `legacy/program.md` has ~540-experiment history. `legacy/CLAUDE.md` lists 16 critical learnings from that body of work — **read those before proposing any new architecture**.
 - **`results.tsv`** — Experiment log (untracked). Tab-separated: commit, val_auc, memory_mb, status, description.
 
 ## Key Details
 
-- **Metric**: val_auc (higher is better).
-- **Label**: rating >= 4 → positive (1), rating < 4 or random unrated → negative (0).
-- **Device**: Single CUDA GPU machine. Auto-detects CUDA/CPU.
-- **Environment**: Use the repo-local `uv` environment (`uv sync`, then `uv run ...`).
-- **Training termination**: Early stopping (patience=3 evals, sub-epoch eval 3x/epoch), no fixed time budget.
-- **Datasets**: `ml-100k` (smoke test only), `ml-1m` (fast iteration), `ml-10m` (medium), `ml-25m` (default, full scale). Selected via `DATASET` env var.
-- **Reproducibility**: Deterministic training (SEED=42). Run-to-run variance <0.001 AUC.
-- Data is auto-downloaded to `data/` on first use. Not checked into git.
+- **Metric**: val_auc on ml-25m (higher is better).
+- **Label**: rating >= 4 → positive (1); rating < 4 OR random unrated → negative (0).
+- **Device**: Single CUDA GPU. Auto-detects CUDA / MPS / CPU.
+- **Environment**: Use the repo-local `uv` env (`uv sync`, then `uv run ...`).
+- **Datasets**: `ml-100k` (smoke test only, no genome data), `ml-1m` (fast iteration), `ml-10m` (medium), `ml-25m` (default, has genome data).
+- **Reproducibility**: Deterministic at SEED=42. **Run-to-run variance at the same seed: <0.001 AUC. Seed-to-seed variance: σ ≈ 0.00078 (legacy learning #14).** Multi-seed verification is mandatory for any "win" claim.
+- **Data**: auto-downloaded to `data/` on first use; not checked into git.
+- **Feature cache**: `data/features_<hash>.npz` is built on first run per (dataset, history-len) and reused afterward.
 
 ## Current checked-in baseline (train.py)
 
-Reproduces at **val_auc = 0.828432 on ml-25m** at SEED=42 (deterministic). 5-seed mean (SEED 42-46) ≈ 0.8278; 5-seed mean lift over prior 0.8272 baseline = **+0.00170 (5/5 positive, min lift +0.0009)**.
+`concat(features) → Linear(in, 1) → sigmoid`. The features:
 
 ```
-Features:
-  - Sparse: userId, movieId (embeddings, dim=28, with dropout 0.1)
-  - Genre: multi-hot → linear projection → dim=28
-  - User history: last 100 items + ratings → causal self-attention + residual → rating-weighted pooling over causal prefix → dim=28
-  - Item history: last 30 raters + ratings → item-side DIN (target-user-aware) over causal prefix → dim=28
-  - Tag genome: 1128-dim relevance scores → bottleneck MLP (1128→256→64→28) → sigmoid gate with detached item_e fallback for missing data → dim=28
-  - User genome profile: per-user mean of genome relevance vectors over their high-rated genome-having items
-  - Dense: timestamp, user rating histogram (5-bin), user count, item rating histogram (5-bin), item count, ug_dot (1), year (1), genre_count (1), movie_age (1) → bottom MLP → dim=28
+- userId  → Embedding(num_users, 28)            → user_e (28)
+- movieId → Embedding(num_items, 28)            → item_e (28)
+- User history (last 100 items + ratings):
+    mean-pool of item_embed over valid positions → user_hist_pool (28)
+    mean rating in user history                  → user_hist_rat_mean (1)
+- Item history (last 30 raters + ratings):
+    mean-pool of user_embed over valid raters    → item_hist_pool (28)
+    mean rating in item history                  → item_hist_rat_mean (1)
+- Genre multi-hot (20) → Linear(20, 28, bias=False) → genre_e (28)
+- Dense (17): timestamp, user-rating-histogram (5), user-count, item-rating-histogram (5), item-count, ug_dot, year, genre-count, movie_age
+- Tag genome (1128, raw)                          → genome (1128)
+- Per-user genome profile (1128, raw)             → user_genome (1128)
 
-User × item content alignment (USER_GENOME=scalar_dot, USER_GENOME_TARGET=genome_field):
-  - dot(user_genome, target_genome) / GENOME_DIM → Linear(1, 28) → added to genome_field
-  - Bounded magnitude, only ~28 new params; cycle-8 lift: +0.000944 over the legacy baseline
+concat → Linear(in_dim, 1) → sigmoid
 
-Interaction: squeeze-and-excitation field reweighting across 7 fields, then flatten to 7×28 = 196
-
-Top MLP: 196 → 256 → 128 → 64 → 1 (with dropout 0.3)
-
-Loss: BCEWithLogitsLoss with label smoothing 0.1
-Optimizer: Adam, LR=7e-5, weight_decay=5e-5
-AMP: fp16, torch.compile, TF32 tensor cores
-Training: batch=16384, grad accum 2× (effective 33K), NEG_RATIO=1, TRAIN_NEG_MODE=anchor_pos_catalog, POST_RECENCY_NEG_RESAMPLE=1, POST_RECENCY_EASY_NEG_PER_POS=0.4, USER_HIST_MODE=rating, USER_HIST_CONTEXT=causal_masked, ITEM_HIST_CONTEXT=causal_masked, RECENCY_FRAC=0.7, GENOME_BOTTLENECK_DROPOUT=0.0, sub-epoch eval ~3×, patience=3
-Params/VRAM: printed at runtime; historical runs fit comfortably on a 24 GB L4
+Loss: BCEWithLogitsLoss
+Optimizer: Adam, lr=1e-3, weight_decay=1e-5
+Training: batch=16384, sub-epoch eval 3×, patience=3 evals, max 20 epochs
 ```
 
-Best historical single-model variant differed from this checked-in baseline: 1-head field attention across fields plus FinalMLP two-stream user/item heads with a bilinear interaction. See `README.md` and `program.md` for that architecture in context.
+The "linear" naming refers to the prediction head — embeddings are still trainable (~6M params for ml-25m). The `genre_proj` is a single bias-free Linear that exists purely to project a high-dimensional one-hot into the same dim as the embeddings; it has no nonlinearity.
 
-## Critical learnings from ~500 experiments
+## Critical learnings inherited from legacy/
 
-See `program.md` for the full list. The most important:
+The legacy project (~540 experiments over apr01–apr28) produced 16 learnings that should still apply to this restart. See `legacy/CLAUDE.md` for the full list. The most important when proposing new architecture:
 
-1. **New information > more capacity.** Features that add genuinely new signal help (item-side DIN +0.029, tag genome +0.008, rating histograms +0.003). Bigger MLPs, more heads, deeper layers all hurt.
-2. **Richer features unlock more capacity.** 4 GDCN layers and embed_dim=28 only work because histogram bins provide richer input. Feature quality shifts the overfitting threshold.
-3. **Training procedure changes rarely work.** LR schedules, warmup, multi-task, contrastive, BPR, focal — all tried across 3 datasets, almost all failed.
-4. **Tag genome works with learned compression, not PCA.** PCA-32 failed (0.798). Learned 3-layer bottleneck MLP succeeds (0.814). The sigmoid gate gracefully handles 78% missing data.
-5. **NEG_RATIO is the hidden lever.** Reducing from 4→1 gave +0.005 AUC — the biggest HP-only gain. Fewer random negatives = cleaner signal focused on hard negatives.
-6. **HP combinations stack.** NEG_RATIO + WD + ACCUM_STEPS + LR each contributed incrementally for +0.006 total.
-7. **Time-valid easy negatives matter.** Replacing synthetic median-timestamp train negatives with anchored positive-event timestamps and catalog-valid sampled items improved the checked-in baseline to ~0.8238 on `ml-25m`.
-8. **Field attention > GDCN.** 1-head MHA across 7 fields with residual slightly beats 4 gated cross layers (0.8207 vs 0.8201). Simpler and fewer parameters.
-9. **10–20 trial HP sweeps per idea.** Never test an architecture idea once and discard. The NEG_RATIO breakthrough came from systematic HP sweep after the "ceiling" was declared. Apr27 cycles bumped sweeps to 20 trials/idea to give each direction a fair shot.
-10. **User-genome content alignment is information-bottlenecked at one scalar.** `dot(user_genome, item_genome) / GENOME_DIM → Linear(1, 28)` into `genome_field` gives +0.000944 (apr26 cycle-8 win). Adding a second scalar (dislike, item-rater, recency-weighted aggregations) actively hurts; element-wise / vector forms overfit.
-11. **`nn.Linear.__init__` draws RNG at construction.** Even when registered last in a module, the kaiming `reset_parameters()` call shifts global RNG state and pollutes downstream xavier inits — making AUX_W=ε regress AUC by -0.0016 in apr27 cycle 8. For new heads where off-state byte-equivalence matters, use `nn.Parameter(torch.zeros(...))` instead. Validators should test with `flag=ε` (tiny but >0), not just `flag=0`, since `flag=0` skips construction entirely.
-12. **The cycle-8 architecture is saturated for *new architectural surface*** — content-alignment additions, field-interaction redesigns, multi-task aux losses, per-position genome similarity, and HSTU-style gated attention. Apr27 ran 10 cycles / ~63 trials with zero keeps. **However, apr27b showed the architecture was NOT saturated for HP retuning** — stacking 4 "lower-is-better" knobs lifted the baseline +0.0012 (see learning #15). Future architectural-surface progress likely still requires bigger shifts (transformer encoder, external data); future HP-surface progress may exist in axes apr27b didn't cover (e.g., inter-knob interactions beyond 4-way, genome dim scan beyond {128,256,512}).
-13. **HSTU paper's pointwise-normalization (`silu(QKᵀ/√D) / N_valid`) does NOT transfer to ml-25m scale.** Apr27 cycle-10 swept N=1..4 paper-faithful layers — all within noise of baseline. Cycle-7's softmax-lite variant (+0.000599 ridge, sub-threshold) outperformed the paper-faithful form at every depth. Softmax contrast is doing useful work at MovieLens scale; HSTU's gains likely require billion-scale data.
-14. **Seed variance is much larger than determinism noise.** Multi-seed verification (apr27b 100-trial sweep) showed σ ≈ 0.00078 across SEED ∈ {42,43,44,45,46} — the previous CLAUDE.md "<0.001 run-to-run variance" referred to *deterministic re-runs at the same seed*, not seed-to-seed. Single-seed lifts of +0.0003-+0.0005 are deeply in noise band; only multi-seed-confirmed lifts ≥ +0.0007 mean (with 5/5 positive) should be considered keeps.
-15. **Joint HP knobs stack.** Individual single-knob lifts of +0.0004-+0.0006 (sub-+0.001 noise band) were dismissed by past sweeps. Apr27b stacked the four "lower-is-better" knobs — RECENCY_FRAC 0.8→0.7, POST_RECENCY_EASY_NEG_PER_POS 0.75→0.4, GENOME_BOTTLENECK_DROPOUT 0.1→0.0, MLP_DROPOUT 0.2→0.3 — for +0.00170 5-seed mean lift. The four knobs all reduce noise/regularization in the negative-easy-bias direction; together they cleared the multi-seed bar where individually they could not.
-16. **Genome bottleneck dropout was actively hurting.** Setting GENOME_BOTTLENECK_DROPOUT=0.0 (down from 0.1) gave +0.00032 5-seed mean lift on its own. The 256→64→28 bottleneck is already a regularizer; layered dropout was overkill for the new scalar_dot user-genome path.
+1. **New information > more capacity.** Genuinely new feature signal helps; bigger MLPs / more heads / deeper layers all hurt without new information.
+2. **Richer features unlock more capacity.** Dimension and depth choices depend on feature richness — they're not independent knobs.
+3. **Training procedure changes rarely work.** LR schedules, warmup, multi-task, contrastive, BPR, focal — all tried; almost all failed.
+4. **Tag genome works with learned compression, not PCA.** Bottleneck MLP (1128→256→64→28) succeeded where PCA-32 failed.
+5. **NEG_RATIO=1 with anchor-pos-catalog negatives** was the biggest HP-only win in legacy (+0.005 AUC). The starting `train.py` defaults to this.
+11. **`nn.Linear.__init__` draws RNG at construction.** When adding a new module behind a feature flag, use `nn.Parameter(torch.zeros(...))` for gates that need byte-equivalent off-state. Validators should test with `flag=ε` (tiny but >0), not `flag=0`.
+14. **Seed variance ≈ 0.00078** across SEED ∈ {42–46}. Single-seed lifts of +0.0003-0.0005 are deeply in noise. Only multi-seed-confirmed lifts ≥ +0.0007 mean (with 5/5 positive) should be considered keeps.
+15. **Sub-noise single-knob lifts can stack.** Apr27b's 4 winning HP knobs were all individually sub-bar; together they cleared +0.0017 mean lift. Don't dismiss small consistent positives.
+
+## Discipline
+
+- **Multi-seed verification is mandatory for any keep claim.** σ ≈ 0.00078; require 5-seed mean ≥ +0.0007, 5/5 positive, min lift ≥ -0.0003.
+- **Smoke-test on ml-100k for crashes only**, not for AUC. ml-100k has no genome data and is too small for the linear baseline to be informative.
+- **`prepare.py:evaluate()` is the ground truth.** Do not modify it.
+- **Trust the legacy learnings.** If you propose something the legacy explicitly tried and rejected (PCA genome, NEG_RATIO=4, multi-task aux losses, HSTU paper-faithful), justify why the restart changes the calculus.
+- **Keep `train.py` simple while it's small.** When the model grows past ~500 lines, split into `model.py` / `data.py` / `train.py`.
