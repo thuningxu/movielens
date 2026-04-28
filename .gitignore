@@ -1,7 +1,9 @@
 data/
 run.log
+sweep*.log
 __pycache__/
 *.pyc
 .venv/
 results.tsv
 artifacts/
+.claude/

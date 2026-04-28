@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Research repo for movie recommendation on MovieLens. Uses a hybrid engagement prediction task: predict whether a user will rate a movie >= 4 stars, with both "watched but didn't like" (hard negatives) and "random unrated" (easy negatives) as label=0. Output is a calibrated probability via BCE loss, suitable for front-page recommendation with a threshold.
 
-Best historical single-model AUC: **0.821 on ml-25m** (deterministic, SEED=42). The current restart baseline now reproduces at **0.8272**.
+Best historical single-model AUC: **0.821 on ml-25m** (deterministic, SEED=42). The current restart baseline reproduces at **0.8284 at SEED=42** (apr27b 100-trial HP sweep, 5-seed mean lift +0.00170 over the prior 0.8272 baseline).
 The checked-in `train.py` is the restart baseline and is not the exact historical field-attention/two-stream model. Treat `train.py` as the source of truth for the current baseline and `program.md` as the experiment history.
 See `program.md` for full experiment history (~500 experiments). See `README.md` for AUC progress chart.
 
@@ -49,7 +49,7 @@ grep "^val_auc:\|^peak_memory_mb:" run.log
 
 ## Current checked-in baseline (train.py)
 
-Reproduces at **val_auc = 0.827224 on ml-25m** (deterministic, SEED=42).
+Reproduces at **val_auc = 0.828432 on ml-25m** at SEED=42 (deterministic). 5-seed mean (SEED 42-46) ≈ 0.8278; 5-seed mean lift over prior 0.8272 baseline = **+0.00170 (5/5 positive, min lift +0.0009)**.
 
 ```
 Features:
@@ -67,12 +67,12 @@ User × item content alignment (USER_GENOME=scalar_dot, USER_GENOME_TARGET=genom
 
 Interaction: squeeze-and-excitation field reweighting across 7 fields, then flatten to 7×28 = 196
 
-Top MLP: 196 → 256 → 128 → 64 → 1 (with dropout 0.2)
+Top MLP: 196 → 256 → 128 → 64 → 1 (with dropout 0.3)
 
 Loss: BCEWithLogitsLoss with label smoothing 0.1
 Optimizer: Adam, LR=7e-5, weight_decay=5e-5
 AMP: fp16, torch.compile, TF32 tensor cores
-Training: batch=16384, grad accum 2× (effective 33K), NEG_RATIO=1, TRAIN_NEG_MODE=anchor_pos_catalog, POST_RECENCY_NEG_RESAMPLE=1, POST_RECENCY_EASY_NEG_PER_POS=0.75, USER_HIST_MODE=rating, USER_HIST_CONTEXT=causal_masked, ITEM_HIST_CONTEXT=causal_masked, RECENCY_FRAC=0.8, sub-epoch eval ~3×, patience=3
+Training: batch=16384, grad accum 2× (effective 33K), NEG_RATIO=1, TRAIN_NEG_MODE=anchor_pos_catalog, POST_RECENCY_NEG_RESAMPLE=1, POST_RECENCY_EASY_NEG_PER_POS=0.4, USER_HIST_MODE=rating, USER_HIST_CONTEXT=causal_masked, ITEM_HIST_CONTEXT=causal_masked, RECENCY_FRAC=0.7, GENOME_BOTTLENECK_DROPOUT=0.0, sub-epoch eval ~3×, patience=3
 Params/VRAM: printed at runtime; historical runs fit comfortably on a 24 GB L4
 ```
 
@@ -95,3 +95,6 @@ See `program.md` for the full list. The most important:
 11. **`nn.Linear.__init__` draws RNG at construction.** Even when registered last in a module, the kaiming `reset_parameters()` call shifts global RNG state and pollutes downstream xavier inits — making AUX_W=ε regress AUC by -0.0016 in apr27 cycle 8. For new heads where off-state byte-equivalence matters, use `nn.Parameter(torch.zeros(...))` instead. Validators should test with `flag=ε` (tiny but >0), not just `flag=0`, since `flag=0` skips construction entirely.
 12. **The 0.8272 baseline is near-saturated** for content-alignment additions, field-interaction redesigns, multi-task aux losses, per-position genome similarity, and HSTU-style gated attention. Apr27 ran 10 cycles / ~63 trials with zero keeps. Future progress likely requires bigger architectural shifts (transformer encoder, full sequential model) or external data (IMDB summaries, posters).
 13. **HSTU paper's pointwise-normalization (`silu(QKᵀ/√D) / N_valid`) does NOT transfer to ml-25m scale.** Apr27 cycle-10 swept N=1..4 paper-faithful layers — all within noise of baseline. Cycle-7's softmax-lite variant (+0.000599 ridge, sub-threshold) outperformed the paper-faithful form at every depth. Softmax contrast is doing useful work at MovieLens scale; HSTU's gains likely require billion-scale data.
+14. **Seed variance is much larger than determinism noise.** Multi-seed verification (apr27b 100-trial sweep) showed σ ≈ 0.00078 across SEED ∈ {42,43,44,45,46} — the previous CLAUDE.md "<0.001 run-to-run variance" referred to *deterministic re-runs at the same seed*, not seed-to-seed. Single-seed lifts of +0.0003-+0.0005 are deeply in noise band; only multi-seed-confirmed lifts ≥ +0.0007 mean (with 5/5 positive) should be considered keeps.
+15. **Joint HP knobs stack.** Individual single-knob lifts of +0.0004-+0.0006 (sub-+0.001 noise band) were dismissed by past sweeps. Apr27b stacked the four "lower-is-better" knobs — RECENCY_FRAC 0.8→0.7, POST_RECENCY_EASY_NEG_PER_POS 0.75→0.4, GENOME_BOTTLENECK_DROPOUT 0.1→0.0, MLP_DROPOUT 0.2→0.3 — for +0.00170 5-seed mean lift. The four knobs all reduce noise/regularization in the negative-easy-bias direction; together they cleared the multi-seed bar where individually they could not.
+16. **Genome bottleneck dropout was actively hurting.** Setting GENOME_BOTTLENECK_DROPOUT=0.0 (down from 0.1) gave +0.00032 5-seed mean lift on its own. The 256→64→28 bottleneck is already a regularizer; layered dropout was overkill for the new scalar_dot user-genome path.

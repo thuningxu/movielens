@@ -1,0 +1,5 @@
+[
+  {"name": "p11j_t17_rec07eneg04_s42", "env": {"RECENCY_FRAC": "0.7", "POST_RECENCY_EASY_NEG_PER_POS": "0.4"}},
+  {"name": "p11j_t18_top3_s42", "env": {"RECENCY_FRAC": "0.7", "POST_RECENCY_EASY_NEG_PER_POS": "0.4", "GENOME_BOTTLENECK_DROPOUT": "0.0"}},
+  {"name": "p11j_t19_allin_s42", "env": {"RECENCY_FRAC": "0.7", "POST_RECENCY_EASY_NEG_PER_POS": "0.4", "GENOME_BOTTLENECK_DROPOUT": "0.0", "MLP_DROPOUT": "0.3"}}
+]

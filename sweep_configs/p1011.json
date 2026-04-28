@@ -1,0 +1,51 @@
+[
+  {"name": "p10_t01", "env": {"SEED": "43"}},
+  {"name": "p10_t02", "env": {"SEED": "44"}},
+  {"name": "p10_t03", "env": {"SEED": "45"}},
+  {"name": "p10_t04", "env": {"SEED": "46"}},
+
+  {"name": "p11s_t01_recency07_s43", "env": {"SEED": "43", "RECENCY_FRAC": "0.7"}},
+  {"name": "p11s_t02_recency07_s44", "env": {"SEED": "44", "RECENCY_FRAC": "0.7"}},
+  {"name": "p11s_t03_recency07_s45", "env": {"SEED": "45", "RECENCY_FRAC": "0.7"}},
+  {"name": "p11s_t04_recency07_s46", "env": {"SEED": "46", "RECENCY_FRAC": "0.7"}},
+
+  {"name": "p11s_t05_easyneg04_s43", "env": {"SEED": "43", "POST_RECENCY_EASY_NEG_PER_POS": "0.4"}},
+  {"name": "p11s_t06_easyneg04_s44", "env": {"SEED": "44", "POST_RECENCY_EASY_NEG_PER_POS": "0.4"}},
+  {"name": "p11s_t07_easyneg04_s45", "env": {"SEED": "45", "POST_RECENCY_EASY_NEG_PER_POS": "0.4"}},
+  {"name": "p11s_t08_easyneg04_s46", "env": {"SEED": "46", "POST_RECENCY_EASY_NEG_PER_POS": "0.4"}},
+
+  {"name": "p11s_t09_genomedrop0_s43", "env": {"SEED": "43", "GENOME_BOTTLENECK_DROPOUT": "0.0"}},
+  {"name": "p11s_t10_genomedrop0_s44", "env": {"SEED": "44", "GENOME_BOTTLENECK_DROPOUT": "0.0"}},
+  {"name": "p11s_t11_genomedrop0_s45", "env": {"SEED": "45", "GENOME_BOTTLENECK_DROPOUT": "0.0"}},
+  {"name": "p11s_t12_genomedrop0_s46", "env": {"SEED": "46", "GENOME_BOTTLENECK_DROPOUT": "0.0"}},
+
+  {"name": "p11s_t13_easyneg06rec075_s43", "env": {"SEED": "43", "POST_RECENCY_EASY_NEG_PER_POS": "0.6", "RECENCY_FRAC": "0.75"}},
+  {"name": "p11s_t14_easyneg06rec075_s44", "env": {"SEED": "44", "POST_RECENCY_EASY_NEG_PER_POS": "0.6", "RECENCY_FRAC": "0.75"}},
+  {"name": "p11s_t15_easyneg06rec075_s45", "env": {"SEED": "45", "POST_RECENCY_EASY_NEG_PER_POS": "0.6", "RECENCY_FRAC": "0.75"}},
+  {"name": "p11s_t16_easyneg06rec075_s46", "env": {"SEED": "46", "POST_RECENCY_EASY_NEG_PER_POS": "0.6", "RECENCY_FRAC": "0.75"}},
+
+  {"name": "p11s_t17_drop0503_s43", "env": {"SEED": "43", "EMBED_DROPOUT": "0.05", "MLP_DROPOUT": "0.3"}},
+  {"name": "p11s_t18_drop0503_s44", "env": {"SEED": "44", "EMBED_DROPOUT": "0.05", "MLP_DROPOUT": "0.3"}},
+  {"name": "p11s_t19_drop0503_s45", "env": {"SEED": "45", "EMBED_DROPOUT": "0.05", "MLP_DROPOUT": "0.3"}},
+  {"name": "p11s_t20_drop0503_s46", "env": {"SEED": "46", "EMBED_DROPOUT": "0.05", "MLP_DROPOUT": "0.3"}},
+
+  {"name": "p11j_t01_rec07eneg04_s43", "env": {"SEED": "43", "RECENCY_FRAC": "0.7", "POST_RECENCY_EASY_NEG_PER_POS": "0.4"}},
+  {"name": "p11j_t02_rec07eneg04_s44", "env": {"SEED": "44", "RECENCY_FRAC": "0.7", "POST_RECENCY_EASY_NEG_PER_POS": "0.4"}},
+  {"name": "p11j_t03_rec07eneg04_s45", "env": {"SEED": "45", "RECENCY_FRAC": "0.7", "POST_RECENCY_EASY_NEG_PER_POS": "0.4"}},
+  {"name": "p11j_t04_rec07eneg04_s46", "env": {"SEED": "46", "RECENCY_FRAC": "0.7", "POST_RECENCY_EASY_NEG_PER_POS": "0.4"}},
+
+  {"name": "p11j_t05_rec07gdrop0_s43", "env": {"SEED": "43", "RECENCY_FRAC": "0.7", "GENOME_BOTTLENECK_DROPOUT": "0.0"}},
+  {"name": "p11j_t06_rec07gdrop0_s44", "env": {"SEED": "44", "RECENCY_FRAC": "0.7", "GENOME_BOTTLENECK_DROPOUT": "0.0"}},
+  {"name": "p11j_t07_rec07gdrop0_s45", "env": {"SEED": "45", "RECENCY_FRAC": "0.7", "GENOME_BOTTLENECK_DROPOUT": "0.0"}},
+  {"name": "p11j_t08_rec07gdrop0_s46", "env": {"SEED": "46", "RECENCY_FRAC": "0.7", "GENOME_BOTTLENECK_DROPOUT": "0.0"}},
+
+  {"name": "p11j_t09_top3_s43", "env": {"SEED": "43", "RECENCY_FRAC": "0.7", "POST_RECENCY_EASY_NEG_PER_POS": "0.4", "GENOME_BOTTLENECK_DROPOUT": "0.0"}},
+  {"name": "p11j_t10_top3_s44", "env": {"SEED": "44", "RECENCY_FRAC": "0.7", "POST_RECENCY_EASY_NEG_PER_POS": "0.4", "GENOME_BOTTLENECK_DROPOUT": "0.0"}},
+  {"name": "p11j_t11_top3_s45", "env": {"SEED": "45", "RECENCY_FRAC": "0.7", "POST_RECENCY_EASY_NEG_PER_POS": "0.4", "GENOME_BOTTLENECK_DROPOUT": "0.0"}},
+  {"name": "p11j_t12_top3_s46", "env": {"SEED": "46", "RECENCY_FRAC": "0.7", "POST_RECENCY_EASY_NEG_PER_POS": "0.4", "GENOME_BOTTLENECK_DROPOUT": "0.0"}},
+
+  {"name": "p11j_t13_allin_s43", "env": {"SEED": "43", "RECENCY_FRAC": "0.7", "POST_RECENCY_EASY_NEG_PER_POS": "0.4", "GENOME_BOTTLENECK_DROPOUT": "0.0", "MLP_DROPOUT": "0.3"}},
+  {"name": "p11j_t14_allin_s44", "env": {"SEED": "44", "RECENCY_FRAC": "0.7", "POST_RECENCY_EASY_NEG_PER_POS": "0.4", "GENOME_BOTTLENECK_DROPOUT": "0.0", "MLP_DROPOUT": "0.3"}},
+  {"name": "p11j_t15_allin_s45", "env": {"SEED": "45", "RECENCY_FRAC": "0.7", "POST_RECENCY_EASY_NEG_PER_POS": "0.4", "GENOME_BOTTLENECK_DROPOUT": "0.0", "MLP_DROPOUT": "0.3"}},
+  {"name": "p11j_t16_allin_s46", "env": {"SEED": "46", "RECENCY_FRAC": "0.7", "POST_RECENCY_EASY_NEG_PER_POS": "0.4", "GENOME_BOTTLENECK_DROPOUT": "0.0", "MLP_DROPOUT": "0.3"}}
+]

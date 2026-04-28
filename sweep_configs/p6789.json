@@ -1,0 +1,15 @@
+[
+  {"name": "p6_t01", "env": {"PATIENCE": "5"}},
+  {"name": "p7_t01", "env": {"GRAD_CLIP": "0"}},
+  {"name": "p7_t02", "env": {"GRAD_CLIP": "1.0"}},
+  {"name": "p7_t03", "env": {"GRAD_CLIP": "5.0"}},
+  {"name": "p7_t04", "env": {"GRAD_CLIP": "10.0"}},
+  {"name": "p8_t01", "env": {"WARMUP_STEPS": "0"}},
+  {"name": "p8_t02", "env": {"WARMUP_STEPS": "200"}},
+  {"name": "p8_t03", "env": {"WARMUP_STEPS": "500"}},
+  {"name": "p8_t04", "env": {"WARMUP_STEPS": "1000"}},
+  {"name": "p9_t01", "env": {"GENOME_BOTTLENECK_HIDDEN": "128,32"}},
+  {"name": "p9_t02", "env": {"GENOME_BOTTLENECK_HIDDEN": "512,128"}},
+  {"name": "p9_t03", "env": {"GENOME_BOTTLENECK_HIDDEN": "256,32"}},
+  {"name": "p9_t04", "env": {"GENOME_BOTTLENECK_DROPOUT": "0.0"}}
+]

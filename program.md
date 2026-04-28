@@ -732,6 +732,61 @@ The model may be stuck in a local minimum due to over-parameterization. Evidence
 40. **The 0.8272 baseline is near-saturated** for content-alignment additions, field-interaction redesigns, and label-prediction aux losses. Future progress likely requires either bigger architectural shifts (full HSTU rewrite, transformer encoder) or external data.
 41. **HSTU paper's pointwise-normalization claim does NOT transfer to ml-25m scale.** Cycle 10 swept N=1..4 layers of the paper-faithful `silu(QKᵀ/√D) / N_valid` count-divide form — all trials within noise of baseline, strictly worse than cycle 7's softmax-lite at the same depth (which gave +0.000599 ridge). Softmax's strong contrast is doing useful work at this dataset scale; HSTU paper's gains likely require billion-scale data the paper actually used.
 
+### Experiment log (autoresearch/apr27b) — ml-25m, 100-trial HP saturation-confirmation sweep
+
+> **KEEP. Baseline lifted 0.827224 → 0.828432 (SEED=42) via stacked sub-noise HP knobs. 5-seed mean lift +0.00170 (5/5 positive, min lift +0.0009).**
+> Goal: confirm 0.8272 saturation OR find any remaining ridge gains via systematic HP-only sweep on the existing apr26 cycle-8 architecture.
+
+**Setup**: MLE plumbed 8 new env flags (SEED, EMBED_DROPOUT, MLP_DROPOUT, LABEL_SMOOTH, GRAD_CLIP, WARMUP_STEPS, GENOME_BOTTLENECK_HIDDEN, GENOME_BOTTLENECK_DROPOUT). Validator confirmed byte-equivalence at all defaults (ml-100k & ml-1m smoke tests + ε-flag tests catching learning-#11 RNG-construction drift).
+
+**Phases (100 trials total, ~5 GPU hours wall-clock)**:
+
+- **P1 LR×WD (18 LHS)**: All 18 trials at or below baseline. Top-3 anchors (LR=7e-5 row, WD=3e-5/5e-5/8e-5) tied within ±0.0002. The cycle-8 ridge is *flat*, not under-resolved. NO LIFT.
+- **P2 Negatives (12)**: Strong monotonic trend — lower POST_RECENCY_EASY_NEG_PER_POS and lower RECENCY_FRAC both lift. Top single-knob: `RECENCY_FRAC=0.7` +0.000421, `POST_RECENCY_EASY_NEG_PER_POS=0.4` +0.000350. Joint (0.6, 0.75) +0.000302. All sub-+0.001 single-seed.
+- **P3 Effective batch (5)**: Baseline (eff 33K) is the optimum. ACCUM=4/BATCH=8192 (eff 32K) +0.0001. NO LIFT.
+- **P4 Dropout (9)**: `MLP_DROPOUT=0.3` consistently +0.0002 lift across EMBED values. `EMBED=0.05/MLP=0.3` best single trial at +0.000172. Sub-+0.001.
+- **P6 Patience (1)**: PATIENCE=5 → no effect (early stop pattern unchanged). NO LIFT.
+- **P7 Grad clip (4)**: All values {1.0, 5.0, 10.0} produce identical baseline AUC — gradients never exceed even 1.0 in normal training. NO LIFT.
+- **P8 Warmup (4)**: All warmup values {200, 500, 1000} hurt monotonically (-0.0002 to -0.0005). Confirms learning #3. NO LIFT.
+- **P9 Genome bottleneck (4)**: Smaller dims `128,32` regress -0.0025 (capacity-starved). Bigger dims `512,128` regress -0.0005 (overfit). `256,32` regress -0.0016. **`GENOME_BOTTLENECK_DROPOUT=0.0` lifts +0.000363** at SEED=42 (single-seed) — dropout in the genome MLP was hurting the new scalar_dot user-genome path.
+- **P10 Noise floor (4)**: Baselines at SEED ∈ {43, 44, 45, 46} = {0.8262, 0.8250, 0.8261, 0.8263}. **σ ≈ 0.00078, mean ≈ 0.82589**. SEED=42 (0.8272) is ~+0.0013 fortunate. Critical finding: the prior CLAUDE.md "<0.001 variance" was *deterministic re-runs at the same seed*, not seed variance.
+- **P11 Multi-seed verify (40 + 3 backfill)**: 5 single-knob candidates × 4 new seeds (43-46) = 20 trials, then 4 joint configs × 4 new seeds = 16, plus 4 SEED=42 backfill for joint configs to complete 5-seed verification.
+
+**Multi-seed-verified winners (5-seed mean lift, all 5/5 positive, all min ≥ -0.0003)**:
+
+| Config | 5-seed mean lift | min lift | SEED=42 val_auc |
+|---|---|---|---|
+| **all-in (RECENCY=0.7, EASY_NEG=0.4, GENOME_DROP=0.0, MLP_DROP=0.3)** | **+0.00170** | +0.0009 | **0.828432** |
+| top-3 (RECENCY=0.7, EASY_NEG=0.4, GENOME_DROP=0.0) | +0.00152 | +0.0008 | 0.828306 |
+| RECENCY=0.7 + EASY_NEG=0.4 | +0.00108 | +0.0005 | 0.827971 |
+| RECENCY=0.7 + GENOME_DROP=0.0 | +0.00091 | +0.0008 | (4-seed only) |
+
+**Single-knob 5-seed results (all 5/5 positive but sub-+0.0007 mean — sub-threshold individually)**:
+
+- RECENCY_FRAC=0.7 alone: mean +0.0005, min +0.0002
+- POST_RECENCY_EASY_NEG_PER_POS=0.4 alone: mean +0.00064, min +0.0001
+- GENOME_BOTTLENECK_DROPOUT=0.0 alone: mean +0.00032, min +0.0001
+- EMBED=0.05 + MLP=0.3 alone: mean +0.0002, min +0.0001
+- EASY_NEG=0.6 + RECENCY=0.75 (P2 joint): mean +0.00056, min +0.0003
+
+**Why stacking works (heuristic)**: All 4 winning knobs reduce regularization/noise in the negative-easy-bias direction:
+- `RECENCY_FRAC=0.7` (was 0.8): drop 30% of oldest ratings (was 20%) → cleaner training distribution closer to validation
+- `EASY_NEG=0.4` (was 0.75): fewer random easy negatives per positive → focus on hard negatives
+- `GENOME_BOTTLENECK_DROPOUT=0.0` (was 0.1): genome MLP already bottlenecked at 256→64→28 — dropout was redundant after the cycle-8 scalar_dot user-genome head was added
+- `MLP_DROPOUT=0.3` (was 0.2): top MLP needs more regularization now that it processes a richer genome_field signal
+
+The four signals are independent enough that they sum to ~+0.0017 from individual ~+0.0003-0.0006 lifts.
+
+**Action**: Promoted all-in defaults in `train.py`. New baseline at SEED=42 = 0.828432.
+
+### Key learnings (apr27b)
+
+42. **Seed variance dwarfs deterministic noise.** σ ≈ 0.00078 across SEED ∈ {42-46} with the cycle-8 architecture. Single-seed lifts of +0.0003-0.0005 are deeply in noise. Multi-seed verification (≥4 new seeds + SEED=42 reference) is mandatory for any HP "win".
+43. **Sub-noise single-knob lifts STACK.** Apr27b's four winning knobs each produce sub-+0.0007 single-seed lift but together produce +0.00170 5-seed mean. Past sweeps that dismissed individual sub-+0.001 lifts as "noise" were leaving real signal on the table — when multiple knobs trend in the same direction (lower-is-better, more-data, less-redundant-regularization), they often stack.
+44. **PATIENCE/GRAD_CLIP/WARMUP all dead** at the cycle-8 baseline. Gradients never exceed magnitude 1.0; warmup hurts monotonically (confirms learning #3); patience just defers overfitting without changing val_auc peak.
+45. **Genome bottleneck dims are well-tuned at 256→64→28.** Smaller (128,32 or 256,32) loses capacity. Bigger (512,128) overfits. The dimension surface is sharp — but genome MLP *dropout* at 0.1 was over-regularization once the cycle-8 scalar_dot path was added.
+46. **The cycle-8 LR×WD ridge is flat, not under-resolved.** Apr27b 18-point LHS produced 18 trials clustered ±0.0011 around baseline with NO clear winner. Past sweeps suggesting "ridge has more room" were sampling-noise artifacts, not genuine under-resolution.
+
 ### Useful references
 
 - BARS benchmark (Zhu et al., SIGIR 2022) — different task (tag CTR) but good training practices and model zoo

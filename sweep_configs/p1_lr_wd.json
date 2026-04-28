@@ -1,0 +1,20 @@
+[
+  {"name": "p1_t01", "env": {"LR": "5e-5", "WEIGHT_DECAY": "3e-5"}},
+  {"name": "p1_t02", "env": {"LR": "5e-5", "WEIGHT_DECAY": "5e-5"}},
+  {"name": "p1_t03", "env": {"LR": "5e-5", "WEIGHT_DECAY": "8e-5"}},
+  {"name": "p1_t04", "env": {"LR": "5e-5", "WEIGHT_DECAY": "1.5e-4"}},
+  {"name": "p1_t05", "env": {"LR": "7e-5", "WEIGHT_DECAY": "3e-5"}},
+  {"name": "p1_t06", "env": {"LR": "7e-5", "WEIGHT_DECAY": "5e-5"}},
+  {"name": "p1_t07", "env": {"LR": "7e-5", "WEIGHT_DECAY": "8e-5"}},
+  {"name": "p1_t08", "env": {"LR": "7e-5", "WEIGHT_DECAY": "1.5e-4"}},
+  {"name": "p1_t09", "env": {"LR": "7e-5", "WEIGHT_DECAY": "2.5e-4"}},
+  {"name": "p1_t10", "env": {"LR": "9e-5", "WEIGHT_DECAY": "3e-5"}},
+  {"name": "p1_t11", "env": {"LR": "9e-5", "WEIGHT_DECAY": "5e-5"}},
+  {"name": "p1_t12", "env": {"LR": "9e-5", "WEIGHT_DECAY": "8e-5"}},
+  {"name": "p1_t13", "env": {"LR": "9e-5", "WEIGHT_DECAY": "1.5e-4"}},
+  {"name": "p1_t14", "env": {"LR": "9e-5", "WEIGHT_DECAY": "2.5e-4"}},
+  {"name": "p1_t15", "env": {"LR": "1.2e-4", "WEIGHT_DECAY": "3e-5"}},
+  {"name": "p1_t16", "env": {"LR": "1.2e-4", "WEIGHT_DECAY": "5e-5"}},
+  {"name": "p1_t17", "env": {"LR": "1.2e-4", "WEIGHT_DECAY": "8e-5"}},
+  {"name": "p1_t18", "env": {"LR": "1.2e-4", "WEIGHT_DECAY": "2.5e-4"}}
+]

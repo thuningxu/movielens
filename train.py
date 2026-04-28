@@ -68,10 +68,10 @@ NEG_RATIO = int(os.environ.get("NEG_RATIO", "1"))  # random unrated negatives pe
 EVAL_EVERY = 1
 PATIENCE = int(os.environ.get("PATIENCE", "3"))
 ACCUM_STEPS = int(os.environ.get("ACCUM_STEPS", "2"))
-RECENCY_FRAC = float(os.environ.get("RECENCY_FRAC", "0.8"))
+RECENCY_FRAC = float(os.environ.get("RECENCY_FRAC", "0.7"))
 TRAIN_NEG_MODE = os.environ.get("TRAIN_NEG_MODE", "anchor_pos_catalog")  # global | anchor_pos | anchor_pos_catalog
 POST_RECENCY_NEG_RESAMPLE = _env_flag("POST_RECENCY_NEG_RESAMPLE", True)
-POST_RECENCY_EASY_NEG_PER_POS = float(os.environ.get("POST_RECENCY_EASY_NEG_PER_POS", "0.75"))
+POST_RECENCY_EASY_NEG_PER_POS = float(os.environ.get("POST_RECENCY_EASY_NEG_PER_POS", "0.4"))
 USER_HIST_MODE = os.environ.get("USER_HIST_MODE", "rating")  # din | mean | rating
 ITEM_HIST_MODE = os.environ.get("ITEM_HIST_MODE", "din")  # din | mean | off
 USER_HIST_CONTEXT = os.environ.get("USER_HIST_CONTEXT", "causal_masked")  # static | causal_masked
@@ -82,12 +82,12 @@ USER_GENOME_TARGET = os.environ.get("USER_GENOME_TARGET", "genome_field")  # den
 USE_CAUSAL_SA = _env_flag("USE_CAUSAL_SA", True)
 USE_TORCH_COMPILE = _env_flag("USE_TORCH_COMPILE", True)
 EMBED_DROPOUT = float(os.environ.get("EMBED_DROPOUT", "0.1"))
-MLP_DROPOUT = float(os.environ.get("MLP_DROPOUT", "0.2"))
+MLP_DROPOUT = float(os.environ.get("MLP_DROPOUT", "0.3"))
 LABEL_SMOOTH = float(os.environ.get("LABEL_SMOOTH", "0.05"))
 GRAD_CLIP = float(os.environ.get("GRAD_CLIP", "0.0"))
 WARMUP_STEPS = int(os.environ.get("WARMUP_STEPS", "0"))
 GENOME_BOTTLENECK_HIDDEN = os.environ.get("GENOME_BOTTLENECK_HIDDEN", "256,64")
-GENOME_BOTTLENECK_DROPOUT = float(os.environ.get("GENOME_BOTTLENECK_DROPOUT", "0.1"))
+GENOME_BOTTLENECK_DROPOUT = float(os.environ.get("GENOME_BOTTLENECK_DROPOUT", "0.0"))
 
 if TRAIN_NEG_MODE not in {"global", "anchor_pos", "anchor_pos_catalog"}:
     raise ValueError(f"Unknown TRAIN_NEG_MODE: {TRAIN_NEG_MODE}")
