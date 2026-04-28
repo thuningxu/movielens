@@ -54,6 +54,124 @@ Linear-baseline noise floor: **σ ≈ 0.00008** across SEED ∈ {42,43,44,45,46}
 
 The decay infrastructure (env flags, cache fields, parameter construction) is left in place — defaults are byte-equivalent, infrastructure is available if a future cycle wants to combine decay with a different pool operator.
 
+## Research backlog
+
+Ideas organized by approximate cost. Each entry specifies a sweep budget — **don't declare an idea dead until at least the listed number of trials are run, with multi-seed verification of any single-seed qualifier**.
+
+Conventions:
+- "Pre-screen" trials are single-seed (SEED=42) to pick a candidate.
+- "Verify" trials run the best pre-screen config at 4 new seeds (43, 44, 45, 46) for a 5-seed total. Bar: 5-seed mean lift ≥ +0.0007, 5/5 positive, min lift ≥ -0.0003.
+- Budget noted as `pre-screen + verify = total` trials at ~3 min each on the current 16 GB GPU.
+
+### Tier 1 — HP / capacity on current architecture (cheap; null-result-tolerant)
+
+1. **Embedding dim sweep** — currently `EMBED_DIM=28` (inherited from legacy). The restart never re-tuned it for the linear head + centered pool.
+   - Pre-screen: dim ∈ {16, 28, 40, 56, 84} at SEED=42 (5 trials)
+   - Verify: top-1 vs current at 4 new seeds (4 trials)
+   - **Budget: 5 + 4 = 9 trials**. Prior: 0.25.
+
+2. **Single hidden layer (MLP head)** — replace `Linear(1264, 1)` with `Linear(1264, H) → ReLU → Linear(H, 1)`. The aggregation work has saturated what a *linear* head can extract; capacity here is the next obvious test.
+   - Pre-screen: hidden_width H ∈ {64, 128, 256, 512} at SEED=42 (4 trials)
+   - Verify: top-1 at 4 seeds (4 trials)
+   - **Budget: 4 + 4 = 8 trials**. Prior: 0.50 — strongest cheap candidate.
+
+3. **MLP depth + dropout joint sweep** — only run if (2) lifts. Adds depth + regularization.
+   - Pre-screen: (depth, dropout) ∈ {1, 2, 3} × {0.0, 0.1, 0.2, 0.3} at SEED=42 = 12 trials
+   - Verify: top-2 × 4 seeds = 8 trials
+   - **Budget: 12 + 8 = 20 trials**. Prior: 0.30 conditional on (2) lifting.
+
+4. **LR + WD joint re-tune** — current `LR=1e-3, WD=1e-5` is the scaffold default; never tuned.
+   - Pre-screen: LR × WD = {3e-4, 1e-3, 3e-3} × {1e-6, 1e-5, 1e-4} = 9 trials at SEED=42
+   - Verify: top-2 × 4 seeds = 8 trials
+   - **Budget: 9 + 8 = 17 trials**. Prior: 0.30.
+
+5. **NEG_RATIO sweep for the linear head** — legacy `NEG_RATIO=1` was tuned for the DLRM. Restart inherited it; may not be the same optimum.
+   - Pre-screen: NEG_RATIO ∈ {0, 0.5, 1, 2, 4} at SEED=42 (5 trials)
+   - Verify: top-1 at 4 seeds (4 trials)
+   - **Budget: 5 + 4 = 9 trials**. Prior: 0.25.
+
+### Tier 2 — Aggregation improvements (continuation of apr28 work)
+
+6. **DIN target-aware attention (user history)** — replace mean/centered pool with attention where the *target item embedding* is the query and history items are keys/values. Adds real capacity in the aggregator.
+   - Pre-screen: (attn_hidden, dropout) ∈ {32, 64, 128} × {0.0, 0.1} = 6 trials at SEED=42
+   - Plus an alternate: dot-product attention (no MLP) as a no-param variant
+   - Verify: top-1 × 4 seeds = 4 trials
+   - **Budget: 7 + 4 = 11 trials**. Prior: 0.40.
+
+7. **DIN target-aware attention (item history)** — symmetric to (6); query = target user embedding, keys/values = item's historical raters. Independent of (6); can run after.
+   - Same sweep shape as (6).
+   - **Budget: 7 + 4 = 11 trials**. Prior: 0.30.
+
+8. **DIN on both sides combined** — only after (6) and (7) individually verified.
+   - Pre-screen: 1 trial (best (6) + best (7))
+   - Verify: 4 seeds (4 trials)
+   - **Budget: 5 trials**. Conditional prior: 0.40 of additive lift if both (6) and (7) win.
+
+9. **Multi-pool concat** — concatenate mean-pool + centered-pool + last-position embedding into one (3D)-dim field per side. Tests whether multiple pooling perspectives stack.
+   - Pre-screen: 3 variants (user only, item only, both sides) at SEED=42
+   - Verify: top-1 × 4 seeds
+   - **Budget: 3 + 4 = 7 trials**. Prior: 0.15 (centered already captures dominant signal).
+
+10. **Element-wise user×target / item×target cross fields** — the linear head can't synthesize crosses; pre-compute `user_e * item_e` and concat as a 28-d field. (FM-style trick.)
+    - Pre-screen: variants {user×item only, user×item + user×genome_field, etc.} = ~3 trials
+    - Verify: top-1 × 4 seeds
+    - **Budget: 3 + 4 = 7 trials**. Prior: 0.30.
+
+### Tier 3 — Architectural additions (medium cost)
+
+11. **Two-tower architecture** — separate user-tower (concat user-side features → MLP → user_vec) and item-tower (concat item-side features → MLP → item_vec). Score = `dot(user_vec, item_vec)`. Different scoring shape from concat-MLP.
+    - Pre-screen: tower_dim ∈ {32, 64, 128}, MLP depth ∈ {1, 2} = 6 trials
+    - Verify: top-1 × 4 seeds = 4 trials
+    - **Budget: 6 + 4 = 10 trials**. Prior: 0.30.
+
+12. **Causal self-attention encoder before pool** — enrich each history position's representation via 1 transformer block (single layer, 1-2 heads), then pool.
+    - Pre-screen: heads ∈ {1, 2}, ffn_ratio ∈ {2, 4}, pool ∈ {centered, target-attention} = 8 trials
+    - Verify: top-1 × 4 seeds = 4 trials
+    - **Budget: 8 + 4 = 12 trials**. Prior: 0.20 (legacy SA was sub-bar; restart context is different but not a slam dunk).
+
+13. **Bilinear / pair-cross layer** — for each pair of fields in the concat, compute a bilinear `f_i^T W_ij f_j` scalar; sum these as the score. Generalizes FM.
+    - Pre-screen: pair_subset ∈ {all, user×item only, target × history pools} = 3 trials
+    - Verify: top-1 × 4 seeds = 4 trials
+    - **Budget: 3 + 4 = 7 trials**. Prior: 0.20.
+
+### Tier 4 — Bigger architectural changes (higher cost; do after tiers 1-3)
+
+14. **Transformer encoder + target attention (full DIN-tower)** — combines (6) and (12). 2-3 layers of self-attention over history, then target-aware attention pool.
+    - Pre-screen: layers ∈ {1, 2}, heads ∈ {1, 2, 4}, pool variants ≈ 12 trials
+    - Verify: top-2 × 4 seeds = 8 trials
+    - **Budget: 12 + 8 = 20 trials**. Prior: 0.30 (hopefully synergistic).
+
+15. **Pure sequential next-item objective as auxiliary loss** — predict the held-out next-item from history with a parallel head; main BCE head unchanged. May provide auxiliary gradient signal that improves embeddings.
+    - Pre-screen: aux_weight ∈ {0.0, 0.1, 0.5, 1.0}, head_arch ∈ {2 variants} = 8 trials
+    - Verify: top-1 × 4 seeds = 4 trials
+    - **Budget: 8 + 4 = 12 trials**. Prior: 0.15 (legacy aux losses were null; sequential is structurally different).
+
+16. **TIGER-style generative retrieval** — codebook-quantize item IDs (RQ-VAE), autoregressively predict next-item codes. Substantial rebuild.
+    - Out of "single sweep cycle" scope. Estimated: 2-3 weeks of implementation, then 30+ trials.
+    - Prior: 0.20 — speculative but novel.
+
+### Tier 5 — New information sources
+
+17. **IMDB plot summaries** — via `links.csv` → IMDB API → small text encoder (e.g., MiniLM, distilBERT) → embed each movie's summary. Concat alongside genre + genome.
+    - Implementation cost: substantial (data fetch, API key, text encoder).
+    - Sweep: encoder choice (3-4 candidates) × pooling, then HP retune.
+    - **Budget: 20-30 trials post-implementation**. Prior: 0.40 — genuinely new signal that the restart explicitly hasn't tried.
+
+18. **Movie poster images** — visual encoder → embedding. Niche but a different modality.
+    - Implementation cost: highest (image fetch, vision model).
+    - **Budget: 20+ trials**. Prior: 0.20 (likely redundant with text + genome).
+
+19. **User-level tag genome (re-add)** — was removed in the strip; could be re-added via a *learned* aggregation rather than the fixed mean-of-rated≥4. E.g., attention pool of `user_history * genome` weighted by rating-centered weights.
+    - Pre-screen: 3-4 variants
+    - **Budget: 3 + 4 = 7 trials**. Prior: 0.20 — tests whether the strip removed real signal or just bad aggregation.
+
+### Operating notes
+
+- **Run ideas in priority order** within each tier; don't skip ahead unless the cheaper ones lift surprisingly fast (rare per legacy history).
+- **Always multi-seed verify any single-seed qualifier** (single-seed lift ≥ +0.0007 → 4 verify seeds). The pivot sweep showed how much per-seed values can shift; don't promote based on SEED=42 alone.
+- **Budget audit**: tier-1 totals ~63 trials (~3 hours), tier-2 ~36 (~2 hours), tier-3 ~29 (~1.5 hours). Tiers 4-5 are larger, multi-cycle commitments.
+- **Cumulative prior on at least one tier-1+2 win**: roughly 0.85 (if all 9 ideas were independently tried). The marginal lift from the *best* of these is the actual question.
+
 ## Useful references
 
 - `legacy/` — full history of the prior project, including its `program.md`, `results.tsv`, and `CLAUDE.md`. Available if useful; not authoritative for the restart.
