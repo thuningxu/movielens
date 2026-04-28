@@ -78,7 +78,7 @@ Params/VRAM: printed at runtime; historical runs fit comfortably on a 24 GB L4
 
 Best historical single-model variant differed from this checked-in baseline: 1-head field attention across fields plus FinalMLP two-stream user/item heads with a bilinear interaction. See `README.md` and `program.md` for that architecture in context.
 
-## Critical learnings from ~460 experiments
+## Critical learnings from ~500 experiments
 
 See `program.md` for the full list. The most important:
 
@@ -90,4 +90,8 @@ See `program.md` for the full list. The most important:
 6. **HP combinations stack.** NEG_RATIO + WD + ACCUM_STEPS + LR each contributed incrementally for +0.006 total.
 7. **Time-valid easy negatives matter.** Replacing synthetic median-timestamp train negatives with anchored positive-event timestamps and catalog-valid sampled items improved the checked-in baseline to ~0.8238 on `ml-25m`.
 8. **Field attention > GDCN.** 1-head MHA across 7 fields with residual slightly beats 4 gated cross layers (0.8207 vs 0.8201). Simpler and fewer parameters.
-9. **10-trial HP sweeps per idea.** Never test an architecture idea once and discard. The NEG_RATIO breakthrough came from systematic HP sweep after the "ceiling" was declared.
+9. **10–20 trial HP sweeps per idea.** Never test an architecture idea once and discard. The NEG_RATIO breakthrough came from systematic HP sweep after the "ceiling" was declared. Apr27 cycles bumped sweeps to 20 trials/idea to give each direction a fair shot.
+10. **User-genome content alignment is information-bottlenecked at one scalar.** `dot(user_genome, item_genome) / GENOME_DIM → Linear(1, 28)` into `genome_field` gives +0.000944 (apr26 cycle-8 win). Adding a second scalar (dislike, item-rater, recency-weighted aggregations) actively hurts; element-wise / vector forms overfit.
+11. **`nn.Linear.__init__` draws RNG at construction.** Even when registered last in a module, the kaiming `reset_parameters()` call shifts global RNG state and pollutes downstream xavier inits — making AUX_W=ε regress AUC by -0.0016 in apr27 cycle 8. For new heads where off-state byte-equivalence matters, use `nn.Parameter(torch.zeros(...))` instead. Validators should test with `flag=ε` (tiny but >0), not just `flag=0`, since `flag=0` skips construction entirely.
+12. **The 0.8272 baseline is near-saturated** for content-alignment additions, field-interaction redesigns, multi-task aux losses, per-position genome similarity, and HSTU-style gated attention. Apr27 ran 10 cycles / ~63 trials with zero keeps. Future progress likely requires bigger architectural shifts (transformer encoder, full sequential model) or external data (IMDB summaries, posters).
+13. **HSTU paper's pointwise-normalization (`silu(QKᵀ/√D) / N_valid`) does NOT transfer to ml-25m scale.** Apr27 cycle-10 swept N=1..4 paper-faithful layers — all within noise of baseline. Cycle-7's softmax-lite variant (+0.000599 ridge, sub-threshold) outperformed the paper-faithful form at every depth. Softmax contrast is doing useful work at MovieLens scale; HSTU's gains likely require billion-scale data.

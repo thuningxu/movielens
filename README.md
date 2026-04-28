@@ -2,19 +2,21 @@
 
 Predict whether a user will rate a movie >= 4 stars (positive engagement). Hybrid task with hard negatives (rated < 4) and easy negatives (random unrated). ~500 experiments on ml-25m.
 
-**Best historical single model: val_auc = 0.821**
+**Current restart baseline: val_auc = 0.8272 on ml-25m (apr26 cycle-8)**
+**Best historical single model: val_auc = 0.821 (apr04 architecture summarized below)**
+**Best historical ensemble: val_auc = 0.854 (HistGBM stacking of 59 diverse models, 3-fold CV)**
 
-The checked-in `train.py` is the restart baseline and may differ from the best historical single-model architecture summarized below. Treat the code as the source of truth for the current implementation, and treat this README as a summary of the best historical results.
+The checked-in `train.py` is the restart baseline (squeeze-and-excitation field reweighting + scalar-dot user-genome alignment) and differs from the apr04 best historical single-model architecture summarized below. Treat the code as the source of truth for the current implementation, and this README as a summary of historical results.
 
 ## AUC Progress
 
 ```mermaid
 %%{init: {'theme': 'default'}}%%
 xychart-beta
-    title "AUC Improvement Over Time (~250 single-model experiments)"
-    x-axis ["apr01", "apr01", "apr01", "apr01", "apr02", "apr02", "apr02", "apr02", "apr03c", "apr03c", "apr03e", "apr03e", "apr03e", "apr03e", "apr04"]
+    title "AUC Improvement Over Time (~500 single-model experiments)"
+    x-axis ["apr01", "apr01", "apr01", "apr01", "apr02", "apr02", "apr02", "apr02", "apr03c", "apr03c", "apr03e", "apr03e", "apr03e", "apr03e", "apr04", "apr25", "apr26"]
     y-axis "val_auc" 0.76 --> 0.83
-    line "Single Model" [0.770, 0.781, 0.793, 0.799, 0.802, 0.804, 0.806, 0.806, 0.811, 0.814, 0.817, 0.820, 0.821, 0.821, 0.821]
+    line "Single Model" [0.770, 0.781, 0.793, 0.799, 0.802, 0.804, 0.806, 0.806, 0.811, 0.814, 0.817, 0.820, 0.821, 0.821, 0.821, 0.8263, 0.8272]
 ```
 
 ### Key milestones
@@ -25,7 +27,9 @@ xychart-beta
 | Apr 1 | 0.799 | ~30 | HISTORY_LEN=100, 3 GDCN layers, causal self-attention |
 | Apr 2 | 0.806 | ~120 | Rating histograms, 4 GDCN layers, embed_dim=28 |
 | Apr 3 | 0.814 | ~170 | Tag genome with learned bottleneck compression |
-| **Apr 4** | **0.821** | **~250** | **NEG_RATIO=1, WD=5e-5, ACCUM=4, LR=8e-5** |
+| Apr 4 | 0.821 | ~250 | NEG_RATIO=1, WD=5e-5, ACCUM=4, LR=8e-5 (historical FinalMLP two-stream) |
+| Apr 25 | 0.8263 | ~430 | Restart on SE field-reweighting baseline: anchor-pos-catalog negatives + post-recency neg resample + rating-pooled causal histories |
+| **Apr 26** | **0.8272** | **~440** | **Per-user genome profile + scalar-dot user×item content alignment routed into `genome_field` (cycle-8 win, +0.000944 over 0.82628)** |
 
 ## Best Historical Single-Model Architecture
 
