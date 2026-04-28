@@ -44,7 +44,21 @@ Operating rules:
 - Training: batch=16384, sub-epoch eval 3×, patience=3, max 20 epochs.
 - HP defaults inherited from legacy where multi-seed-verified (NEG_RATIO=1, anchor_pos_catalog).
 
-**Pending**: first ml-25m run.
+**Result (commit 53924d4, SEED=42)**: **val_auc = 0.784776 on ml-25m**. 6.2M params (~6.1M in user+item embeddings, the rest is the genre projection + Linear head). Training: 38.7s, total 91.7s. Peak memory 5.7 GB.
+
+For context vs legacy progression:
+- Apr 1 DLRM baseline: 0.770 (legacy mermaid chart)
+- Apr 1 + history + 3 GDCN + causal SA: 0.799
+- Apr 4 best historical single-model: 0.821
+- Apr 26 cycle-8: 0.8272
+- **Apr 27b sweep winner (current legacy ceiling): 0.8284**
+- **Apr 28 linear baseline (this restart): 0.7848** — Δ=-0.0436 below the legacy ceiling
+
+The linear head can't capture feature interactions, so the gap (~0.04 AUC) is the upper bound on what hidden layers + attention + interactions are worth. Remember: legacy's first ~50 experiments lifted from 0.770 → 0.821 (+0.05 AUC); the apr01 → apr04 path shows the kind of gains available before HP and architecture saturation set in.
+
+Note: val_logloss is 1.42, unusually high — the linear head produces over-confident probabilities. Calibration matters less than ranking for the AUC metric, but worth noting for any downstream threshold-based use.
+
+**No multi-seed verification yet** — the linear baseline is deterministic at SEED=42; multi-seed will be done once we have a candidate to verify.
 
 ## Research backlog
 
