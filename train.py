@@ -73,6 +73,11 @@ ITEM_HIST_LAST_POSITION = int(os.environ.get("ITEM_HIST_LAST_POSITION", "0"))
 # Pivot used by rating_centered pool mode. Default 0.6 = 3 stars / 5 (current behavior).
 POOL_PIVOT = float(os.environ.get("POOL_PIVOT", "0.6"))
 
+# Optional per-side learnable timestamp decay multiplier on the rating-centered weight.
+# Off-state (default 0): no Parameter constructed, no decay logic in forward — byte-equivalent.
+USER_HIST_DECAY = int(os.environ.get("USER_HIST_DECAY", "0"))
+ITEM_HIST_DECAY = int(os.environ.get("ITEM_HIST_DECAY", "0"))
+
 # ─── Device ────────────────────────────────────────────────────────
 torch.manual_seed(SEED)
 if torch.cuda.is_available():
@@ -106,7 +111,7 @@ log.info(f"Dataset: {DATASET} | Users: {num_users} | Items: {num_items} | "
 #   - per sample: timestamp normalized
 
 _cache_key = hashlib.md5(json.dumps({
-    "feature_version": "restart-1",       # bones-only, separate from legacy
+    "feature_version": "restart-2",       # restart-2 adds per-position timestamps
     "dataset": DATASET, "neg_ratio": NEG_RATIO,
     "history_len": HISTORY_LEN, "item_hist_len": ITEM_HIST_LEN,
     "num_users": num_users, "num_items": num_items,
@@ -120,8 +125,10 @@ if _cache_path.exists():
     num_genres = movie_genres.shape[1]
     user_histories = _c["user_histories"]
     user_hist_ratings = _c["user_hist_ratings"]
+    user_hist_timestamps = _c["user_hist_timestamps"]
     item_histories = _c["item_histories"]
     item_hist_ratings = _c["item_hist_ratings"]
+    item_hist_timestamps = _c["item_hist_timestamps"]
     ts_min = float(_c["ts_min"])
     ts_range = float(_c["ts_range"])
     movie_year = _c["movie_year"]
@@ -158,8 +165,10 @@ else:
         sort_idx = np.lexsort((timestamps, ids))
         s_ids, s_targets = ids[sort_idx], targets[sort_idx]
         s_ratings = ratings[sort_idx].astype(np.float32) / 5.0
+        s_ts = timestamps[sort_idx].astype(np.int64)
         hist = np.full((n_entities, max_len), pad_idx, dtype=np.int64)
         hist_rat = np.zeros((n_entities, max_len), dtype=np.float32)
+        hist_ts = np.zeros((n_entities, max_len), dtype=np.int32)
         boundaries = np.where(np.diff(s_ids) != 0)[0] + 1
         starts = np.concatenate([[0], boundaries])
         ends = np.concatenate([boundaries, [len(s_ids)]])
@@ -168,12 +177,13 @@ else:
             length = min(e - s, max_len)
             hist[eid, -length:] = s_targets[e - length:e]
             hist_rat[eid, -length:] = s_ratings[e - length:e]
-        return hist, hist_rat
+            hist_ts[eid, -length:] = s_ts[e - length:e].astype(np.int32)
+        return hist, hist_rat, hist_ts
 
-    user_histories, user_hist_ratings = _build_history(_uids, _mids, _ratings, _ts,
-                                                       num_users, PAD_IDX, HISTORY_LEN)
-    item_histories, item_hist_ratings = _build_history(_mids, _uids, _ratings, _ts,
-                                                       num_items, USER_PAD_IDX, ITEM_HIST_LEN)
+    user_histories, user_hist_ratings, user_hist_timestamps = _build_history(
+        _uids, _mids, _ratings, _ts, num_users, PAD_IDX, HISTORY_LEN)
+    item_histories, item_hist_ratings, item_hist_timestamps = _build_history(
+        _mids, _uids, _ratings, _ts, num_items, USER_PAD_IDX, ITEM_HIST_LEN)
     del _uids, _mids, _ratings, _ts
 
     # Timestamp normalization
@@ -235,7 +245,9 @@ else:
     np.savez_compressed(_cache_path,
         movie_genres=movie_genres,
         user_histories=user_histories, user_hist_ratings=user_hist_ratings,
+        user_hist_timestamps=user_hist_timestamps,
         item_histories=item_histories, item_hist_ratings=item_hist_ratings,
+        item_hist_timestamps=item_hist_timestamps,
         ts_min=np.array(ts_min), ts_range=np.array(ts_range),
         movie_year=movie_year,
         genome_matrix=genome_matrix,
@@ -248,8 +260,10 @@ USER_PAD_IDX = num_users
 # Move lookup tables to GPU
 _user_hist_t = torch.from_numpy(user_histories).to(DEVICE)
 _user_hist_rat_t = torch.from_numpy(user_hist_ratings).to(DEVICE)
+_user_hist_ts_t = torch.from_numpy(user_hist_timestamps).to(DEVICE)
 _item_hist_t = torch.from_numpy(item_histories).to(DEVICE)
 _item_hist_rat_t = torch.from_numpy(item_hist_ratings).to(DEVICE)
+_item_hist_ts_t = torch.from_numpy(item_hist_timestamps).to(DEVICE)
 _movie_genres_t = torch.from_numpy(movie_genres).to(DEVICE)
 _genome_t = torch.from_numpy(genome_matrix).to(DEVICE)
 _movie_year_t = torch.from_numpy(movie_year).to(DEVICE)
@@ -260,14 +274,16 @@ def _build_sample_tensors(df):
     uids = df["userId"].values.astype(np.int64)
     mids = df["movieId"].values.astype(np.int64)
     labels = df["label"].values.astype(np.float32)
-    ts_norm = ((df["timestamp"].values - ts_min) / ts_range).astype(np.float32).reshape(-1, 1)
+    ts_raw = df["timestamp"].values.astype(np.int64)
+    ts_norm = ((ts_raw - ts_min) / ts_range).astype(np.float32).reshape(-1, 1)
     return (torch.from_numpy(uids).to(DEVICE),
             torch.from_numpy(mids).to(DEVICE),
             torch.from_numpy(ts_norm).to(DEVICE),
+            torch.from_numpy(ts_raw).to(DEVICE),
             torch.from_numpy(labels).to(DEVICE))
 
 log.info("Precomputing training tensors...")
-train_uids, train_mids, train_ts, train_labels = _build_sample_tensors(train_df)
+train_uids, train_mids, train_ts, train_ts_raw, train_labels = _build_sample_tensors(train_df)
 n_train = len(train_labels)
 
 # ─── Eval set: val pos + val hard neg + sampled easy neg ──────────
@@ -297,7 +313,7 @@ _eval_df = pd.DataFrame({
     "label": np.concatenate([np.ones(_n_val_pos), np.zeros(len(_val_hard_neg)), np.zeros(_n_val_pos)]),
 })
 log.info("Precomputing eval tensors...")
-eval_uids, eval_mids, eval_ts, eval_labels_t = _build_sample_tensors(_eval_df)
+eval_uids, eval_mids, eval_ts, eval_ts_raw, eval_labels_t = _build_sample_tensors(_eval_df)
 n_eval = len(eval_uids)
 log.info(f"Eval set: {_n_val_pos} pos + {len(_val_hard_neg)} hard neg + {_n_val_pos} easy neg = {n_eval}")
 
@@ -306,13 +322,21 @@ log.info(f"Eval set: {_n_val_pos} pos + {len(_val_hard_neg)} hard neg + {_n_val_
 # MODEL — single Linear head on concatenated features
 # ═══════════════════════════════════════════════════════════════════
 
-def _pool_history(embed, ratings, valid, mode):
+def _pool_history(embed, ratings, valid, mode,
+                  decay_theta=None, sample_ts=None, hist_ts=None, ts_range=None):
     """Pool a (B, L, D) embedding sequence over valid positions.
 
     embed:   (B, L, D)
     ratings: (B, L)       — already normalized to [0, 1] (rating / 5.0)
     valid:   (B, L)       — float, 1.0 for non-PAD, 0.0 for PAD
     mode: 'mean' | 'rating' | 'rating_centered'
+
+    Optional decay (only valid with mode='rating_centered'):
+      decay_theta: scalar nn.Parameter; rate = softplus(theta) >= 0.
+      sample_ts:   (B,)   raw per-sample timestamp (int64 or float).
+      hist_ts:     (B, L) raw per-position history timestamp (int32/float).
+      ts_range:    scalar, denominator for normalizing time gaps.
+
     Returns (B, D).
     """
     valid_e = valid.unsqueeze(-1)                                     # (B, L, 1)
@@ -327,6 +351,13 @@ def _pool_history(embed, ratings, valid, mode):
     if mode == "rating_centered":
         # Allow negative weights; normalize by sum of absolute weights.
         w = (ratings - POOL_PIVOT) * valid                            # (B, L)
+        if decay_theta is not None:
+            # softplus-parameterized non-negative rate; init theta=-10 -> rate≈4.5e-5
+            rate = nn.functional.softplus(decay_theta)
+            time_gap = (sample_ts.float().unsqueeze(-1) - hist_ts.float()) / ts_range
+            time_gap = time_gap.clamp(min=0.0)                        # safety
+            recency = torch.exp(-rate * time_gap)                     # (B, L), in (0, 1]
+            w = w * recency
         w_e = w.unsqueeze(-1)
         denom = w.abs().sum(dim=1, keepdim=True).clamp(min=1e-6)
         return (embed * w_e).sum(dim=1) / denom
@@ -358,7 +389,15 @@ class LinearBaseline(nn.Module):
         self.in_dim = 4 * D + 2 + num_genres + 2 + genome_dim + addon_fields * D
         self.head = nn.Linear(self.in_dim, 1)
 
-    def forward(self, uids, mids, ts):
+        # Optional learnable per-side timestamp-decay rate.
+        # Constructed AFTER all default-init layers so the off-state RNG sequence
+        # is byte-identical to before. softplus(-10) ≈ 4.5e-5 → near-no-decay at init.
+        if USER_HIST_DECAY:
+            self.user_decay_theta = nn.Parameter(torch.tensor(-10.0))
+        if ITEM_HIST_DECAY:
+            self.item_decay_theta = nn.Parameter(torch.tensor(-10.0))
+
+    def forward(self, uids, mids, ts, ts_raw=None):
         u_e = self.user_embed(uids)
         i_e = self.item_embed(mids)
 
@@ -368,7 +407,14 @@ class LinearBaseline(nn.Module):
         u_hist_e = self.item_embed(u_hist)                # (B, L, D)
         u_valid = (u_hist != PAD_IDX).float()             # (B, L)
         u_count = u_valid.sum(dim=1).clamp(min=1.0)       # (B,)
-        u_hist_pool = _pool_history(u_hist_e, u_hist_rat, u_valid, USER_HIST_POOL)
+        if USER_HIST_DECAY:
+            u_hist_ts = _user_hist_ts_t[uids]             # (B, L) int32
+            u_hist_pool = _pool_history(
+                u_hist_e, u_hist_rat, u_valid, USER_HIST_POOL,
+                decay_theta=self.user_decay_theta,
+                sample_ts=ts_raw, hist_ts=u_hist_ts, ts_range=ts_range)
+        else:
+            u_hist_pool = _pool_history(u_hist_e, u_hist_rat, u_valid, USER_HIST_POOL)
         u_hist_rat_mean = (u_hist_rat * u_valid).sum(dim=1) / u_count
         u_hist_rat_mean = u_hist_rat_mean.unsqueeze(-1)                        # (B, 1)
 
@@ -378,7 +424,14 @@ class LinearBaseline(nn.Module):
         i_hist_e = self.user_embed(i_hist)                # (B, IL, D)
         i_valid = (i_hist != USER_PAD_IDX).float()        # (B, IL)
         i_count = i_valid.sum(dim=1).clamp(min=1.0)
-        i_hist_pool = _pool_history(i_hist_e, i_hist_rat, i_valid, ITEM_HIST_POOL)
+        if ITEM_HIST_DECAY:
+            i_hist_ts = _item_hist_ts_t[mids]             # (B, IL) int32
+            i_hist_pool = _pool_history(
+                i_hist_e, i_hist_rat, i_valid, ITEM_HIST_POOL,
+                decay_theta=self.item_decay_theta,
+                sample_ts=ts_raw, hist_ts=i_hist_ts, ts_range=ts_range)
+        else:
+            i_hist_pool = _pool_history(i_hist_e, i_hist_rat, i_valid, ITEM_HIST_POOL)
         i_hist_rat_mean = (i_hist_rat * i_valid).sum(dim=1) / i_count
         i_hist_rat_mean = i_hist_rat_mean.unsqueeze(-1)
 
@@ -437,7 +490,8 @@ def run_eval():
     with torch.no_grad():
         for s in range(0, n_eval, eval_batch):
             e = min(s + eval_batch, n_eval)
-            logits = model(eval_uids[s:e], eval_mids[s:e], eval_ts[s:e])
+            logits = model(eval_uids[s:e], eval_mids[s:e], eval_ts[s:e],
+                           ts_raw=eval_ts_raw[s:e])
             scores.append(torch.sigmoid(logits).cpu().numpy())
     model.train()
     scores = np.concatenate(scores)
@@ -460,7 +514,8 @@ for epoch in range(MAX_EPOCHS):
     perm = torch.randperm(n_train, device=DEVICE)
     for b in range(n_batches_per_epoch):
         idx = perm[b * BATCH_SIZE:(b + 1) * BATCH_SIZE]
-        logits = model(train_uids[idx], train_mids[idx], train_ts[idx])
+        logits = model(train_uids[idx], train_mids[idx], train_ts[idx],
+                       ts_raw=train_ts_raw[idx])
         loss = loss_fn(logits, train_labels[idx])
         opt.zero_grad()
         loss.backward()
