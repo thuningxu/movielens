@@ -715,6 +715,13 @@ The model may be stuck in a local minimum due to over-parameterization. Evidence
 - Wall-clock 1.7× baseline (above Critic 1.3× kill threshold) — disqualifying even if signal existed.
 - Verdict: dead. The per-position content gate is redundant with what `hist_embed` (end-to-end content learning) + the existing rating-pool aggregation already capture.
 
+**Cycle 10: Full HSTU rewrite (multi-layer, paper-faithful pointwise normalization)** — 6 trials.
+- Per block: `Linear(D, 4D) → split [U,V,Q,K] → silu(QKᵀ/√D)/N_valid_per_row + sigmoid(U)*attn@V → residual`. Stacked N layers with shared weights. Optional relative-position bias.
+- Sweep: N ∈ {1,2,3,4} with `l_div` norm + 1× clamp_sum + 1× no-rel-pos.
+- Results: ALL within ±0.000136 of baseline (clamp_sum was -0.000701, slightly worse).
+- Wall-clock: N=1 → 1.16× baseline, N=2 → 1.87×, N=3 → 2.47×, N=4 → 3.10×.
+- Verdict: dead. **The HSTU paper's pointwise normalization (`silu/N_valid` count-divide) genuinely doesn't transfer to ml-25m scale** — softmax in cycle 7 was actually doing useful contrast that pointwise-norm loses. Cycle 7's softmax-lite (+0.000599) was the strict best of the HSTU family.
+
 ### Key learnings (apr27)
 
 35. **The genome-alignment channel is information-bottlenecked at one scalar.** Multiple aggregation methods (mean, weighted, dislike, item-rater) all collapse to the same scalar dot signal. Two scalars conflict; element-wise vector overflows.
@@ -723,6 +730,7 @@ The model may be stuck in a local minimum due to over-parameterization. Evidence
 38. **`nn.Linear.__init__` draws RNG at construction**, polluting downstream xavier inits even when modules are registered last. Use `nn.Parameter(torch.zeros(...))` for new heads when off-state byte-equivalence matters.
 39. **Validators should test off-state byte-equivalence with `flag=ε` (tiny but >0)**, not just `flag=0`. The `flag=0` skips construction entirely; `flag=ε` exercises the construction path.
 40. **The 0.8272 baseline is near-saturated** for content-alignment additions, field-interaction redesigns, and label-prediction aux losses. Future progress likely requires either bigger architectural shifts (full HSTU rewrite, transformer encoder) or external data.
+41. **HSTU paper's pointwise-normalization claim does NOT transfer to ml-25m scale.** Cycle 10 swept N=1..4 layers of the paper-faithful `silu(QKᵀ/√D) / N_valid` count-divide form — all trials within noise of baseline, strictly worse than cycle 7's softmax-lite at the same depth (which gave +0.000599 ridge). Softmax's strong contrast is doing useful work at this dataset scale; HSTU paper's gains likely require billion-scale data the paper actually used.
 
 ### Useful references
 
