@@ -75,8 +75,12 @@ POOL_PIVOT = float(os.environ.get("POOL_PIVOT", "0.6"))
 
 # Optional per-side learnable timestamp decay multiplier on the rating-centered weight.
 # Off-state (default 0): no Parameter constructed, no decay logic in forward — byte-equivalent.
+# When on, theta is initialized to USER_HIST_DECAY_INIT / ITEM_HIST_DECAY_INIT (default -10
+# = near-no-decay; large gradient-starved zone — pick init in [-2, +5] range to actually exercise).
 USER_HIST_DECAY = int(os.environ.get("USER_HIST_DECAY", "0"))
 ITEM_HIST_DECAY = int(os.environ.get("ITEM_HIST_DECAY", "0"))
+USER_HIST_DECAY_INIT = float(os.environ.get("USER_HIST_DECAY_INIT", "-10.0"))
+ITEM_HIST_DECAY_INIT = float(os.environ.get("ITEM_HIST_DECAY_INIT", "-10.0"))
 
 # ─── Device ────────────────────────────────────────────────────────
 torch.manual_seed(SEED)
@@ -393,9 +397,9 @@ class LinearBaseline(nn.Module):
         # Constructed AFTER all default-init layers so the off-state RNG sequence
         # is byte-identical to before. softplus(-10) ≈ 4.5e-5 → near-no-decay at init.
         if USER_HIST_DECAY:
-            self.user_decay_theta = nn.Parameter(torch.tensor(-10.0))
+            self.user_decay_theta = nn.Parameter(torch.tensor(USER_HIST_DECAY_INIT))
         if ITEM_HIST_DECAY:
-            self.item_decay_theta = nn.Parameter(torch.tensor(-10.0))
+            self.item_decay_theta = nn.Parameter(torch.tensor(ITEM_HIST_DECAY_INIT))
 
     def forward(self, uids, mids, ts, ts_raw=None):
         u_e = self.user_embed(uids)
