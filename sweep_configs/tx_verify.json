@@ -1,0 +1,6 @@
+[
+  {"name": "tx_verify_t11_s43", "env": {"SEED": "43", "TX_ENCODER_LAYERS": "2", "TX_ENCODER_HEADS": "2", "TX_FFN_RATIO": "2", "TX_POOL": "target", "TX_POS": "learned", "TX_DROPOUT": "0.1", "USER_HIST_MODE": "off"}},
+  {"name": "tx_verify_t11_s44", "env": {"SEED": "44", "TX_ENCODER_LAYERS": "2", "TX_ENCODER_HEADS": "2", "TX_FFN_RATIO": "2", "TX_POOL": "target", "TX_POS": "learned", "TX_DROPOUT": "0.1", "USER_HIST_MODE": "off"}},
+  {"name": "tx_verify_t11_s45", "env": {"SEED": "45", "TX_ENCODER_LAYERS": "2", "TX_ENCODER_HEADS": "2", "TX_FFN_RATIO": "2", "TX_POOL": "target", "TX_POS": "learned", "TX_DROPOUT": "0.1", "USER_HIST_MODE": "off"}},
+  {"name": "tx_verify_t11_s46", "env": {"SEED": "46", "TX_ENCODER_LAYERS": "2", "TX_ENCODER_HEADS": "2", "TX_FFN_RATIO": "2", "TX_POOL": "target", "TX_POS": "learned", "TX_DROPOUT": "0.1", "USER_HIST_MODE": "off"}}
+]

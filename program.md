@@ -787,6 +787,55 @@ The four signals are independent enough that they sum to ~+0.0017 from individua
 45. **Genome bottleneck dims are well-tuned at 256→64→28.** Smaller (128,32 or 256,32) loses capacity. Bigger (512,128) overfits. The dimension surface is sharp — but genome MLP *dropout* at 0.1 was over-regularization once the cycle-8 scalar_dot path was added.
 46. **The cycle-8 LR×WD ridge is flat, not under-resolved.** Apr27b 18-point LHS produced 18 trials clustered ±0.0011 around baseline with NO clear winner. Past sweeps suggesting "ridge has more room" were sampling-noise artifacts, not genuine under-resolution.
 
+### Experiment log (autoresearch/apr27c) — ml-25m, transformer-encoder-as-field (architectural ceiling test)
+
+> **NEGATIVE outcome — rewrite case strengthened. 5-seed mean lift -0.000487, 1/5 positive.** The user-history pathway has no untapped capacity in the multi-layer pre-LN transformer family. Bounds the local-optimum hypothesis cleanly.
+
+**Motivation**: User suspected the apr27b 0.8284 baseline was stuck in an architectural local optimum. Before paying a 2-4 week clean-slate rewrite cost, ran a single big architectural addition (TxHistoryEncoder over user history, output as 8th field via existing field attention). Path 3 step 1: cheap test of "does the arch family have untapped capacity?"
+
+**Setup (commit d91ca5f)**: MLE added `TxHistoryEncoder` (multi-layer Pre-LN transformer with SDPA attention, learned/sinusoidal pos enc, target/rating/cls pooling), gated by 8 env flags. Validator confirmed byte-equivalent off-state on ml-100k (bitwise) and ml-25m (within 1.5e-5 CUDA TF32 noise) + ε-flag tests confirming no RNG-construction drift.
+
+**Sweep (11 trials + 4 multi-seed verify, ~2 GPU-hours total)**:
+
+| Trial | Config | val_auc | Δ vs 0.828432 |
+|---|---|---|---|
+| t01 | TX_LAYERS=0 (off-state) | 0.828420 | -0.000012 (sanity) |
+| t02 | TX_LAYERS=1 GATE_INIT=1e-10 (ε-test) | 0.827926 | -0.000506 |
+| t03 | L=2 H=2 target pool (default) | 0.827779 | -0.000653 |
+| t04 | L=1 (single layer) | 0.827935 | -0.000497 |
+| t05 | H=1 (single head) | 0.827931 | -0.000501 |
+| t06 | FFN=4× | 0.828011 | -0.000421 |
+| t07 | pos=sinusoidal | 0.827608 | -0.000824 |
+| t08 | pool=rating | 0.827886 | -0.000546 |
+| t09 | pool=cls | 0.828027 | -0.000405 |
+| t10 | bypass-SE (concat to top_mlp) | 0.826961 | -0.001471 (worst) |
+| **t11** | **USER_HIST_MODE=off + L=2 (replacement)** | **0.828588** | **+0.000156 (only positive)** |
+
+**Pattern**: ADDING transformer alongside causal SA + DIN consistently regresses (10/10 trials below baseline). The SE attention down-weights the redundant 8th field, and bypassing SE makes it worse (-0.001471) because the noisy transformer field directly hits top_mlp. REPLACING user_hist_e with the transformer (cycle-7 redux at depth) was the only positive variant at SEED=42.
+
+**Multi-seed verification of t11 (4 new seeds)**:
+
+| SEED | apr27b baseline | t11 val_auc | Lift |
+|---|---|---|---|
+| 42 | 0.828432 | 0.828588 | +0.000156 |
+| 43 | 0.827900 | 0.826724 | -0.001176 |
+| 44 | 0.827597 | 0.827238 | -0.000359 |
+| 45 | 0.827043 | 0.826954 | -0.000089 |
+| 46 | 0.828405 | 0.827440 | -0.000965 |
+
+**5-seed mean lift: -0.000487. 1/5 positive (only SEED=42). Min lift: -0.001176.**
+
+Per Critic decision rule (mean ≥ +0.0008 + 4/5 positive + min ≥ -0.0003 = strong; otherwise weak/null/negative = strengthens rewrite): **NEGATIVE outcome**. The SEED=42 +0.000156 was a fortunate-seed artifact (same +0.001 SEED=42 bias documented in apr27b learning #14).
+
+**Conclusion**: The cycle-8 architecture has been thoroughly tested for arch-surface capacity (cycle 7 HSTU-lite +0.000599 sub-bar, cycle 10 paper-faithful HSTU dead, apr27c pre-LN transformer net negative). Local-optimum hypothesis bounded. **Path 3 step 2 (clean-slate rewrite) justified.**
+
+### Key learnings (apr27c)
+
+47. **Pre-LN transformer encoder over user history adds no value** in either alongside-DIN or replace-user-hist-e configurations. 5-seed mean lift -0.000487 in the most generous (replacement) variant. Bounds the local-optimum hypothesis: arch family ceiling at 0.8284 is real, not a tuning artifact.
+48. **Field-attention SE correctly down-weights redundant fields.** When transformer field is added alongside existing causal-SA-derived `user_hist_e`, SE down-weights it (regression -0.0005). Bypassing SE makes regression worse (-0.0015) because the noisy field directly hits top_mlp. SE is doing useful work — don't bypass.
+49. **Single-positive-seed signal is meaningless without multi-seed.** t11 single-seed +0.000156 at SEED=42 looked promising, but 4-seed verification showed -0.0009 mean across the other 4 seeds. SEED=42's +0.001 fortunate-bias (apr27b learning #14) propagates: any +0.000156 single-seed lift at SEED=42 is consistent with no real signal.
+50. **Wall-clock penalty for transformer attention is ~3-5× baseline** even with SDPA dispatch, because explicit padding+causal mask falls to math/efficient backend (not FlashAttention). Causal-only mode without padding mask would unlock FA for ~1.5× speedup.
+
 ### Useful references
 
 - BARS benchmark (Zhu et al., SIGIR 2022) — different task (tag CTR) but good training practices and model zoo

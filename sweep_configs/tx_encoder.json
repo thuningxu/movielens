@@ -1,0 +1,13 @@
+[
+  {"name": "tx_t01_off_state", "env": {"TX_ENCODER_LAYERS": "0"}},
+  {"name": "tx_t02_eps_test", "env": {"TX_ENCODER_LAYERS": "1", "TX_GATE_INIT": "1e-10"}},
+  {"name": "tx_t03_default_L2_H2_target", "env": {"TX_ENCODER_LAYERS": "2", "TX_ENCODER_HEADS": "2", "TX_FFN_RATIO": "2", "TX_POOL": "target", "TX_POS": "learned", "TX_DROPOUT": "0.1"}},
+  {"name": "tx_t04_layer_L1", "env": {"TX_ENCODER_LAYERS": "1", "TX_ENCODER_HEADS": "2", "TX_FFN_RATIO": "2", "TX_POOL": "target", "TX_POS": "learned", "TX_DROPOUT": "0.1"}},
+  {"name": "tx_t05_heads_H1", "env": {"TX_ENCODER_LAYERS": "2", "TX_ENCODER_HEADS": "1", "TX_FFN_RATIO": "2", "TX_POOL": "target", "TX_POS": "learned", "TX_DROPOUT": "0.1"}},
+  {"name": "tx_t06_ffn4x", "env": {"TX_ENCODER_LAYERS": "2", "TX_ENCODER_HEADS": "2", "TX_FFN_RATIO": "4", "TX_POOL": "target", "TX_POS": "learned", "TX_DROPOUT": "0.1"}},
+  {"name": "tx_t07_pos_sinusoidal", "env": {"TX_ENCODER_LAYERS": "2", "TX_ENCODER_HEADS": "2", "TX_FFN_RATIO": "2", "TX_POOL": "target", "TX_POS": "sinusoidal", "TX_DROPOUT": "0.1"}},
+  {"name": "tx_t08_pool_rating", "env": {"TX_ENCODER_LAYERS": "2", "TX_ENCODER_HEADS": "2", "TX_FFN_RATIO": "2", "TX_POOL": "rating", "TX_POS": "learned", "TX_DROPOUT": "0.1"}},
+  {"name": "tx_t09_pool_cls", "env": {"TX_ENCODER_LAYERS": "2", "TX_ENCODER_HEADS": "2", "TX_FFN_RATIO": "2", "TX_POOL": "cls", "TX_POS": "learned", "TX_DROPOUT": "0.1"}},
+  {"name": "tx_t10_bypass_SE", "env": {"TX_ENCODER_LAYERS": "2", "TX_ENCODER_HEADS": "2", "TX_FFN_RATIO": "2", "TX_POOL": "target", "TX_POS": "learned", "TX_DROPOUT": "0.1", "TX_BYPASS_SE": "1"}},
+  {"name": "tx_t11_replace_user_hist", "env": {"TX_ENCODER_LAYERS": "2", "TX_ENCODER_HEADS": "2", "TX_FFN_RATIO": "2", "TX_POOL": "target", "TX_POS": "learned", "TX_DROPOUT": "0.1", "USER_HIST_MODE": "off"}}
+]
