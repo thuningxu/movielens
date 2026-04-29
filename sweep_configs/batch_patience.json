@@ -1,0 +1,6 @@
+[
+  {"name": "bs8192_s42", "env": {"BATCH_SIZE": "8192"}},
+  {"name": "bs32768_s42", "env": {"BATCH_SIZE": "32768"}},
+  {"name": "patience4_s42", "env": {"PATIENCE": "4"}},
+  {"name": "patience5_s42", "env": {"PATIENCE": "5"}}
+]
