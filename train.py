@@ -155,6 +155,15 @@ USER_FREQ_WD_LAMBDA = float(os.environ.get("USER_FREQ_WD_LAMBDA", "0.0"))
 # Off-state (default 0): no field appended; byte-equivalent to baseline.
 USER_GENRE_AFFINITY_CROSS = int(os.environ.get("USER_GENRE_AFFINITY_CROSS", "0"))
 
+# Per-movie genre × genome alignment scalar. For each movie, computes how well
+# its genome aligns with the prototype genome of its claimed genres (averaged
+# genome of all movies in that genre). Single scalar per movie, precomputed at
+# script load time on GPU (no cache change). Tests whether the linear head
+# benefits from an explicit per-movie content-coherence signal that genre and
+# genome can't synthesize separately.
+# Off-state (default 0): no field appended; byte-equivalent to baseline.
+CROSS_GENRE_GENOME = int(os.environ.get("CROSS_GENRE_GENOME", "0"))
+
 # ─── Device ────────────────────────────────────────────────────────
 torch.manual_seed(SEED)
 if torch.cuda.is_available():
@@ -404,6 +413,19 @@ _user_genome_agg_t = torch.from_numpy(user_genome_agg).to(DEVICE)
 _user_genre_affinity_t = torch.from_numpy(user_genre_affinity).to(DEVICE)
 _movie_year_t = torch.from_numpy(movie_year).to(DEVICE)
 
+# Per-movie genre × genome content coherence scalar, computed once on GPU.
+# genre_prototype[g] = mean genome of movies with genre g. Then for each movie:
+#   gg_align[m] = sum_g (movie_genres[m, g] * (genome[m] · genre_prototype[g]))
+#               / movie_genres[m].sum()
+# i.e., average alignment with each of the movie's claimed genres' genome
+# prototypes. Per-movie scalar; no learnable params; cheap.
+_genre_count_t = _movie_genres_t.sum(dim=0).clamp(min=1.0).unsqueeze(-1)        # (num_genres, 1)
+_genre_prototype_t = (_movie_genres_t.t() @ _genome_t) / _genre_count_t          # (num_genres, GENOME_DIM)
+_per_movie_per_genre_align = _genome_t @ _genre_prototype_t.t()                  # (num_items, num_genres)
+_movie_genre_count_t = _movie_genres_t.sum(dim=-1).clamp(min=1.0)                # (num_items,)
+_gg_align_t = (_movie_genres_t * _per_movie_per_genre_align).sum(dim=-1) / _movie_genre_count_t  # (num_items,)
+del _genre_count_t, _genre_prototype_t, _per_movie_per_genre_align, _movie_genre_count_t
+
 # Frequency weights for the optional FREQ_WD_LAMBDA penalty on item_embed.
 # Shape (num_items + 1,) including the PAD row at index num_items (count=0).
 _item_freq_weight_t = torch.from_numpy(
@@ -585,6 +607,9 @@ class LinearBaseline(nn.Module):
         # Optional user × candidate genre Hadamard cross (num_genres-d field).
         if USER_GENRE_AFFINITY_CROSS:
             in_dim_total += num_genres
+        # Optional per-movie genre × genome alignment scalar (1-d field).
+        if CROSS_GENRE_GENOME:
+            in_dim_total += 1
         self.in_dim = in_dim_total
         # Head: either the default Linear(in, 1) or a 1-hidden-layer MLP. The replacement
         # happens at the SAME __init__ point so any downstream RNG draws are unchanged at
@@ -726,6 +751,9 @@ class LinearBaseline(nn.Module):
         if USER_GENRE_AFFINITY_CROSS:
             u_gaff = _user_genre_affinity_t[uids]                     # (B, num_genres)
             parts.append(u_gaff * genre_raw)                          # (B, num_genres)
+        # Optional per-movie genre × genome alignment scalar (per-movie, no user).
+        if CROSS_GENRE_GENOME:
+            parts.append(_gg_align_t[mids].unsqueeze(-1))             # (B, 1)
 
         x = torch.cat(parts, dim=-1)
         main_logit = self.head(x).squeeze(-1)
