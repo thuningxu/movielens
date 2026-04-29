@@ -47,6 +47,26 @@ Brief notes on cycles run on the restart. Detailed per-trial data lives in `resu
 
 Legacy DLRM ceiling: 0.8284. Restart linear-head model now within 0.0002 of legacy with much simpler architecture.
 
+### `autoresearch/apr28r` — two-tower α-residual scoring — null
+
+**Null** (`4694396`, `041557b`). Researcher proposed adding a parallel scoring path: separate user/item MLPs whose outputs are dotted and added to the main logit via a learnable scalar α. User tower input = u_e + u_hist_pool + u_hist_rat_mean (57d); item tower input = i_e + i_hist_pool + i_hist_rat_mean + genre + year + genome (1206d). Each tower: `Linear(D_in, H) → ReLU → Linear(H, T, bias=False)`.
+
+**Init bug caught in smoke** (apr28p replay): first attempt zero-initialized BOTH towers' second linear → `u_vec=i_vec=0 → dot=0` forever, killing all tower gradients (verified: ml-100k smoke produced identical val_auc to off-state). Fix: ASYMMETRIC zero-init — only user_tower's W2 zeroed; item_tower's W2 keeps default kaiming. Then at step 0: `u_vec=0, i_vec≠0 → dot=0` (logit unchanged), but `∂dot/∂(user_W2) = i_vec · ReLU ≠ 0` → user trains step 1+; once `user_W2` drifts, item starts training step 2+. Validator confirmed: ml-100k off=0.5881 unchanged, TWO_TOWER=1=0.7256 (gradients now flow).
+
+Pre-screen 3-cell sweep on ml-25m at SEED=42 (vs 0.828188 baseline):
+
+| Cell | val_auc | Δ |
+|---|---|---|
+| H=32, T=32 | 0.814878 | -0.0133 |
+| H=64, T=32 | 0.812463 | -0.0157 |
+| H=64, T=64 | 0.810243 | -0.0179 |
+
+All cells regress; bigger tower → worse (monotonic). All trials finished in 73-74s vs ~290s baseline — early stopping fired immediately because val_auc plateaus or regresses with the towers active.
+
+**Lesson:** Adding a parallel parametric scoring path (dot of MLP outputs) on top of the saturated linear head + 4 manual crosses + aux head is not orthogonal — it's redundant capacity that the optimizer cannot integrate without dropping out the existing concat-Linear signal. Same shape of failure as apr28p (DCN cross): more parametric capacity → more harm. The `α=0.1` residual gate doesn't help because the tower output's variance scales with `√(T · D_item)`; α · tower_score has comparable magnitude to the baseline logit, which forces the head to compensate.
+
+**Combined with apr28p (DCN cross), apr28q (multi-pool), apr28r (two-tower):** three different parametric capacity additions — all NULL or worse. Strong signal that the bottleneck is not at the scoring layer or the field-stack interaction layer; it's at the representation / new-information level.
+
 ### `autoresearch/apr28q` — multi-pool concat (mean / last-position) — null
 
 **Null** (`feb954d`). Researcher proposed adding plain mean-pool of item_embed (USER side) / user_embed (ITEM side) over valid history positions, alongside the existing rating-centered pool — testing whether mean-pool encodes signal that's orthogonal to the rating-centered pool. Critic raised the cosine-correlation concern (centered ≈ 0.85-0.95 cosine to mean on right-skewed ratings) and tightened the budget to ≥+0.0006 single-seed gate.

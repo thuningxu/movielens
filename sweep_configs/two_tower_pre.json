@@ -1,0 +1,5 @@
+[
+  {"name": "tt_h32_t32_s42", "env": {"TWO_TOWER": "1", "TOWER_HIDDEN": "32", "TOWER_OUT": "32"}},
+  {"name": "tt_h64_t32_s42", "env": {"TWO_TOWER": "1", "TOWER_HIDDEN": "64", "TOWER_OUT": "32"}},
+  {"name": "tt_h64_t64_s42", "env": {"TWO_TOWER": "1", "TOWER_HIDDEN": "64", "TOWER_OUT": "64"}}
+]
