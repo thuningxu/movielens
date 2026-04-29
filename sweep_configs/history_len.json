@@ -1,0 +1,5 @@
+[
+  {"name": "hist50_s42", "env": {"HISTORY_LEN": "50"}},
+  {"name": "hist150_s42", "env": {"HISTORY_LEN": "150"}},
+  {"name": "hist200_s42", "env": {"HISTORY_LEN": "200"}}
+]
