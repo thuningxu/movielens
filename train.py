@@ -129,6 +129,18 @@ FREQ_WD_LAMBDA = float(os.environ.get("FREQ_WD_LAMBDA", "1e-4"))
 # Off-state (default 0.0): no aux head constructed; byte-equivalent to baseline.
 AUX_RATING_WEIGHT = float(os.environ.get("AUX_RATING_WEIGHT", "25.0"))
 
+# Per-user tag-genome aggregate dotted with the candidate movie's genome,
+# appended to the concat as a SINGLE scalar field (1-d). Tests whether the
+# linear head benefits from a "user × candidate genome compatibility" signal
+# that no current cross provides — the existing concat has user-side features
+# in trained 28-d basis, but no path to the fixed 1128-d genome basis.
+# Per legacy learning #10: user-genome content alignment is information-
+# bottlenecked at ONE scalar; vector forms overfit. So we expose ONE scalar.
+# user_genome_agg is precomputed in the feature cache (rating-centered weighted
+# average of historical movies' genomes per user, 1128-d).
+# Off-state (default 0): no field appended; byte-equivalent to baseline.
+USER_GENOME_AGG_DOT = int(os.environ.get("USER_GENOME_AGG_DOT", "0"))
+
 # ─── Device ────────────────────────────────────────────────────────
 torch.manual_seed(SEED)
 if torch.cuda.is_available():
@@ -162,7 +174,7 @@ log.info(f"Dataset: {DATASET} | Users: {num_users} | Items: {num_items} | "
 #   - per sample: timestamp normalized
 
 _cache_key = hashlib.md5(json.dumps({
-    "feature_version": "restart-3",       # restart-3 adds per-item training-positive count
+    "feature_version": "restart-4",       # restart-4 adds precomputed per-user genome aggregate
     "dataset": DATASET, "neg_ratio": NEG_RATIO,
     "history_len": HISTORY_LEN, "item_hist_len": ITEM_HIST_LEN,
     "num_users": num_users, "num_items": num_items,
@@ -186,6 +198,7 @@ if _cache_path.exists():
     genome_matrix = _c["genome_matrix"]
     GENOME_DIM = genome_matrix.shape[1]
     item_count = _c["item_count"]
+    user_genome_agg = _c["user_genome_agg"]
     del _c
 else:
     log.info("Computing features (will cache for next run)...")
@@ -302,6 +315,26 @@ else:
         genome_matrix = np.zeros((num_items, 1128), dtype=np.float32)
     GENOME_DIM = genome_matrix.shape[1]
 
+    # Per-user tag-genome aggregate: rating-centered weighted average of each
+    # user's historical movies' genome vectors. Shape (num_users + 1, GENOME_DIM);
+    # row num_users is the PAD slot (zeros). Used only when USER_GENOME_AGG_DOT=1.
+    # Computed in chunks to avoid materializing (num_users, HISTORY_LEN, GENOME_DIM)
+    # at once (~73 GB on ml-25m would OOM CPU).
+    log.info("Precomputing per-user genome aggregates (restart-4)...")
+    user_genome_agg = np.zeros((num_users + 1, GENOME_DIM), dtype=np.float32)
+    # Pad genome with a zero row at index num_items (=PAD_IDX) so PAD slots
+    # contribute zero to both numerator and denominator.
+    genome_padded = np.zeros((num_items + 1, GENOME_DIM), dtype=np.float32)
+    genome_padded[:num_items] = genome_matrix
+    _chunk = 1024
+    _pivot = 0.6  # POOL_PIVOT default; users who watch with rating > pivot push toward genome
+    for _s in range(0, num_users, _chunk):
+        _e = min(_s + _chunk, num_users)
+        _h = genome_padded[user_histories[_s:_e]]                    # (chunk, L, G)
+        _w = (user_hist_ratings[_s:_e] - _pivot) * (user_histories[_s:_e] != PAD_IDX).astype(np.float32)
+        _denom = np.abs(_w).sum(axis=1, keepdims=True).clip(1e-6)
+        user_genome_agg[_s:_e] = (_h * _w[:, :, None]).sum(axis=1) / _denom
+
     np.savez_compressed(_cache_path,
         movie_genres=movie_genres,
         user_histories=user_histories, user_hist_ratings=user_hist_ratings,
@@ -312,6 +345,7 @@ else:
         movie_year=movie_year,
         genome_matrix=genome_matrix,
         item_count=item_count,
+        user_genome_agg=user_genome_agg,
     )
     log.info(f"Features cached to {_cache_path.name}")
 
@@ -327,6 +361,7 @@ _item_hist_rat_t = torch.from_numpy(item_hist_ratings).to(DEVICE)
 _item_hist_ts_t = torch.from_numpy(item_hist_timestamps).to(DEVICE)
 _movie_genres_t = torch.from_numpy(movie_genres).to(DEVICE)
 _genome_t = torch.from_numpy(genome_matrix).to(DEVICE)
+_user_genome_agg_t = torch.from_numpy(user_genome_agg).to(DEVICE)
 _movie_year_t = torch.from_numpy(movie_year).to(DEVICE)
 
 # Frequency weights for the optional FREQ_WD_LAMBDA penalty on item_embed.
@@ -501,6 +536,9 @@ class LinearBaseline(nn.Module):
         # Optional 4th cross field (ts * i_e); only meaningful with CROSS_FIELDS=1.
         if CROSS_TS_ITEM:
             in_dim_total += D
+        # Optional user × candidate genome compatibility scalar (1-d field).
+        if USER_GENOME_AGG_DOT:
+            in_dim_total += 1
         self.in_dim = in_dim_total
         # Head: either the default Linear(in, 1) or a 1-hidden-layer MLP. The replacement
         # happens at the SAME __init__ point so any downstream RNG draws are unchanged at
@@ -631,6 +669,13 @@ class LinearBaseline(nn.Module):
         # arithmetic assumes the 84-d cross block precedes this 28-d field).
         if CROSS_TS_ITEM:
             parts.append(ts * i_e)                                    # (B, D)
+        # Optional user × candidate genome compatibility scalar.
+        # user_genome_agg is precomputed (rating-centered weighted mean of historical
+        # movies' genomes); dot with the candidate's genome and normalize by 1/genome_dim.
+        if USER_GENOME_AGG_DOT:
+            u_gen = _user_genome_agg_t[uids]                          # (B, GENOME_DIM)
+            ug_dot = (u_gen * genome_e).sum(dim=-1, keepdim=True) / GENOME_DIM  # (B, 1)
+            parts.append(ug_dot)
 
         x = torch.cat(parts, dim=-1)
         main_logit = self.head(x).squeeze(-1)
