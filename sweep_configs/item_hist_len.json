@@ -1,0 +1,5 @@
+[
+  {"name": "ihist15_s42", "env": {"ITEM_HIST_LEN": "15"}},
+  {"name": "ihist60_s42", "env": {"ITEM_HIST_LEN": "60"}},
+  {"name": "ihist100_s42", "env": {"ITEM_HIST_LEN": "100"}}
+]
