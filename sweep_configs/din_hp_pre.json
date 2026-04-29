@@ -1,0 +1,6 @@
+[
+  {"name": "din_h32_s42", "env": {"USER_HIST_POOL": "din", "DIN_ATTN_HIDDEN": "32"}},
+  {"name": "din_h128_s42", "env": {"USER_HIST_POOL": "din", "DIN_ATTN_HIDDEN": "128"}},
+  {"name": "din_h64_lr3e4_s42", "env": {"USER_HIST_POOL": "din", "DIN_ATTN_HIDDEN": "64", "LR": "3e-4"}},
+  {"name": "din_h64_lr5e4_s42", "env": {"USER_HIST_POOL": "din", "DIN_ATTN_HIDDEN": "64", "LR": "5e-4"}}
+]
