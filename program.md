@@ -47,6 +47,26 @@ Brief notes on cycles run on the restart. Detailed per-trial data lives in `resu
 
 Legacy DLRM ceiling: 0.8284. Restart linear-head model now within 0.0002 of legacy with much simpler architecture.
 
+### `autoresearch/apr28s` — user × candidate genome scalar dot — null
+
+**Null** (`9a42a86`). After apr28p/q/r ruled out parametric capacity additions, Researcher pivoted to NEW INFORMATION: precompute per-user genome aggregate (rating-centered weighted average of historical movies' genomes, 1128-d per user) and expose `dot(user_genome_agg, candidate_genome) / GENOME_DIM` as a single scalar field appended to the concat.
+
+Critic rejected the original 2256-dim Hadamard cross variant on direct legacy evidence: legacy ran ~63 trials of this family, learning #10 says "user-genome content alignment is information-bottlenecked at ONE scalar; vector forms overfit catastrophically (apr27 cycle 8: -0.0175)." Counter-proposal: scalar-only.
+
+Cache version bumped `restart-3 → restart-4` to add `user_genome_agg` precompute. Off-state byte-equivalent (flag default 0). Implementation chunks the per-user aggregate to avoid the (162541, 100, 1128) ≈ 73 GB intermediate.
+
+Pre-screen single cell at SEED=42 (vs 0.828188 baseline):
+
+| Cell | val_auc | Δ |
+|---|---|---|
+| `USER_GENOME_AGG_DOT=1` | 0.828298 | +0.000110 |
+
+Below Critic's +0.0003 kill threshold. NULL, no verify.
+
+**Lesson:** Legacy's +0.000944 win on the DLRM does not transfer to the linear head. Two plausible reasons: (a) the linear head cannot exploit the user-genome compatibility scalar as efficiently as the DLRM's interaction layers did; (b) apr28o's stack already extracts most of the genome signal via the existing `genome` (raw 1128-d) field + `i_hist_pool ⊙ u_e` cross — the user-genome compatibility scalar is largely redundant once those are in the concat.
+
+**Combined signal across apr28p/q/r/s (four consecutive nulls):** the linear-head + 4-cross + aux-rating baseline at 0.828188 is genuinely close to the representation's ceiling for ml-25m. Future cycles need either (a) genuinely new input features (IMDB plot text — Tier 5 expensive), (b) a different prediction objective (sequential next-item — Tier 4 #15), or (c) accept the ~0.0002 gap to legacy DLRM as inherent to the simpler architecture.
+
 ### `autoresearch/apr28r` — two-tower α-residual scoring — null
 
 **Null** (`4694396`, `041557b`). Researcher proposed adding a parallel scoring path: separate user/item MLPs whose outputs are dotted and added to the main logit via a learnable scalar α. User tower input = u_e + u_hist_pool + u_hist_rat_mean (57d); item tower input = i_e + i_hist_pool + i_hist_rat_mean + genre + year + genome (1206d). Each tower: `Linear(D_in, H) → ReLU → Linear(H, T, bias=False)`.
