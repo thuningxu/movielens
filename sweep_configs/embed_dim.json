@@ -1,0 +1,6 @@
+[
+  {"name": "embed16_s42", "env": {"EMBED_DIM": "16"}},
+  {"name": "embed40_s42", "env": {"EMBED_DIM": "40"}},
+  {"name": "embed56_s42", "env": {"EMBED_DIM": "56"}},
+  {"name": "embed84_s42", "env": {"EMBED_DIM": "84"}}
+]
