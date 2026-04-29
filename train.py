@@ -107,6 +107,16 @@ MLP_HEAD = int(os.environ.get("MLP_HEAD", "0"))
 MLP_HIDDEN = int(os.environ.get("MLP_HIDDEN", "128"))
 MLP_HEAD_DROPOUT = float(os.environ.get("MLP_HEAD_DROPOUT", "0.2"))
 
+# Frequency-weighted L2 regularization on item embeddings. Tail items (rated
+# by few users) get MORE penalty (pushed toward zero), popular items LESS.
+#   freq_weight[i] = 1 / sqrt(item_count[i] + 5)
+#   penalty = FREQ_WD_LAMBDA * sum_i( freq_weight[i] * ||item_embed.weight[i]||^2 )
+# Note: this penalty is ADDITIVE on top of the standard Adam WD on item_embed.
+# Sweep FREQ_WD_LAMBDA values accordingly. PAD row is included in the penalty
+# (count=0 -> freq_weight ≈ 0.447); not special-cased.
+# Off-state (default 0.0): no penalty added; byte-equivalent to baseline.
+FREQ_WD_LAMBDA = float(os.environ.get("FREQ_WD_LAMBDA", "0.0"))
+
 # ─── Device ────────────────────────────────────────────────────────
 torch.manual_seed(SEED)
 if torch.cuda.is_available():
@@ -140,7 +150,7 @@ log.info(f"Dataset: {DATASET} | Users: {num_users} | Items: {num_items} | "
 #   - per sample: timestamp normalized
 
 _cache_key = hashlib.md5(json.dumps({
-    "feature_version": "restart-2",       # restart-2 adds per-position timestamps
+    "feature_version": "restart-3",       # restart-3 adds per-item training-positive count
     "dataset": DATASET, "neg_ratio": NEG_RATIO,
     "history_len": HISTORY_LEN, "item_hist_len": ITEM_HIST_LEN,
     "num_users": num_users, "num_items": num_items,
@@ -163,10 +173,19 @@ if _cache_path.exists():
     movie_year = _c["movie_year"]
     genome_matrix = _c["genome_matrix"]
     GENOME_DIM = genome_matrix.shape[1]
+    item_count = _c["item_count"]
     del _c
 else:
     log.info("Computing features (will cache for next run)...")
     real_train = train_df[train_df["rating"] > 0]
+
+    # Per-item training-positive count (rating >= 4). Used by frequency-weighted
+    # L2 regularization on item embeddings (FREQ_WD_LAMBDA). PAD index num_items
+    # gets count=0 and is included with the rest in the penalty.
+    item_count = np.zeros(num_items + 1, dtype=np.float32)
+    _pos_mids = real_train.loc[real_train["rating"] >= 4, "movieId"].values.astype(np.int64)
+    if len(_pos_mids) > 0:
+        np.add.at(item_count, _pos_mids, 1.0)
 
     # Genre multi-hot
     all_genres_set = set()
@@ -280,6 +299,7 @@ else:
         ts_min=np.array(ts_min), ts_range=np.array(ts_range),
         movie_year=movie_year,
         genome_matrix=genome_matrix,
+        item_count=item_count,
     )
     log.info(f"Features cached to {_cache_path.name}")
 
@@ -296,6 +316,12 @@ _item_hist_ts_t = torch.from_numpy(item_hist_timestamps).to(DEVICE)
 _movie_genres_t = torch.from_numpy(movie_genres).to(DEVICE)
 _genome_t = torch.from_numpy(genome_matrix).to(DEVICE)
 _movie_year_t = torch.from_numpy(movie_year).to(DEVICE)
+
+# Frequency weights for the optional FREQ_WD_LAMBDA penalty on item_embed.
+# Shape (num_items + 1,) including the PAD row at index num_items (count=0).
+_item_freq_weight_t = torch.from_numpy(
+    1.0 / np.sqrt(np.asarray(item_count, dtype=np.float32) + 5.0)
+).to(DEVICE)
 
 
 # Per-sample dense features (just timestamp; year is per-movie, looked up at forward time)
@@ -619,6 +645,12 @@ for epoch in range(MAX_EPOCHS):
         logits = model(train_uids[idx], train_mids[idx], train_ts[idx],
                        ts_raw=train_ts_raw[idx])
         loss = loss_fn(logits, train_labels[idx])
+        if FREQ_WD_LAMBDA > 0:
+            # Frequency-weighted L2 on item_embed. Tail items get more penalty.
+            # Additive on top of the standard Adam WD applied to item_embed.weight.
+            l2_per_item = (model.item_embed.weight ** 2).sum(dim=-1)  # (num_items + 1,)
+            freq_penalty = FREQ_WD_LAMBDA * (l2_per_item * _item_freq_weight_t).sum()
+            loss = loss + freq_penalty
         opt.zero_grad()
         loss.backward()
         opt.step()
