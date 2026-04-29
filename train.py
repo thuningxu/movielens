@@ -117,6 +117,13 @@ MLP_HEAD_DROPOUT = float(os.environ.get("MLP_HEAD_DROPOUT", "0.2"))
 # Off-state (default 0.0): no penalty added; byte-equivalent to baseline.
 FREQ_WD_LAMBDA = float(os.environ.get("FREQ_WD_LAMBDA", "0.0"))
 
+# Auxiliary rating-residual regression head. When > 0, a parallel Linear(in_dim, 1)
+# head predicts the normalized rating (0.5..5.0 -> 0.1..1.0) for samples with a
+# real rating. Random unrated easy negatives (rating=0) are masked out of the
+# aux loss. Combined: total_loss = bce_loss + AUX_RATING_WEIGHT * masked_mse.
+# Off-state (default 0.0): no aux head constructed; byte-equivalent to baseline.
+AUX_RATING_WEIGHT = float(os.environ.get("AUX_RATING_WEIGHT", "0.0"))
+
 # ─── Device ────────────────────────────────────────────────────────
 torch.manual_seed(SEED)
 if torch.cuda.is_available():
@@ -331,14 +338,22 @@ def _build_sample_tensors(df):
     labels = df["label"].values.astype(np.float32)
     ts_raw = df["timestamp"].values.astype(np.int64)
     ts_norm = ((ts_raw - ts_min) / ts_range).astype(np.float32).reshape(-1, 1)
+    # Normalized rating in [0.1, 1.0] for each sample (rating / 5.0). Random
+    # unrated easy negatives have df["rating"]==0 and stay at 0.0, used as the
+    # mask sentinel for AUX_RATING_WEIGHT.
+    if "rating" in df.columns:
+        ratings_norm = (df["rating"].values.astype(np.float32) / 5.0)
+    else:
+        ratings_norm = np.zeros(len(df), dtype=np.float32)
     return (torch.from_numpy(uids).to(DEVICE),
             torch.from_numpy(mids).to(DEVICE),
             torch.from_numpy(ts_norm).to(DEVICE),
             torch.from_numpy(ts_raw).to(DEVICE),
-            torch.from_numpy(labels).to(DEVICE))
+            torch.from_numpy(labels).to(DEVICE),
+            torch.from_numpy(ratings_norm).to(DEVICE))
 
 log.info("Precomputing training tensors...")
-train_uids, train_mids, train_ts, train_ts_raw, train_labels = _build_sample_tensors(train_df)
+train_uids, train_mids, train_ts, train_ts_raw, train_labels, train_ratings_norm = _build_sample_tensors(train_df)
 n_train = len(train_labels)
 
 # ─── Eval set: val pos + val hard neg + sampled easy neg ──────────
@@ -368,7 +383,7 @@ _eval_df = pd.DataFrame({
     "label": np.concatenate([np.ones(_n_val_pos), np.zeros(len(_val_hard_neg)), np.zeros(_n_val_pos)]),
 })
 log.info("Precomputing eval tensors...")
-eval_uids, eval_mids, eval_ts, eval_ts_raw, eval_labels_t = _build_sample_tensors(_eval_df)
+eval_uids, eval_mids, eval_ts, eval_ts_raw, eval_labels_t, _eval_ratings_norm = _build_sample_tensors(_eval_df)
 n_eval = len(eval_uids)
 log.info(f"Eval set: {_n_val_pos} pos + {len(_val_hard_neg)} hard neg + {_n_val_pos} easy neg = {n_eval}")
 
@@ -509,6 +524,12 @@ class LinearBaseline(nn.Module):
                 nn.Linear(DIN_ATTN_HIDDEN, 1),
             )
 
+        # Optional auxiliary rating-residual regression head.
+        # Constructed LAST so off-state RNG sequence is byte-identical (no nn.Linear
+        # constructor invoked at AUX_RATING_WEIGHT==0 — see learning #11).
+        if AUX_RATING_WEIGHT > 0:
+            self.aux_head = nn.Linear(in_dim_total, 1)
+
     def forward(self, uids, mids, ts, ts_raw=None):
         u_e = self.user_embed(uids)
         i_e = self.item_embed(mids)
@@ -595,7 +616,13 @@ class LinearBaseline(nn.Module):
             parts.append(ts * i_e)                                    # (B, D)
 
         x = torch.cat(parts, dim=-1)
-        return self.head(x).squeeze(-1)
+        main_logit = self.head(x).squeeze(-1)
+        # Aux head is constructed only when AUX_RATING_WEIGHT > 0 (off-state byte-equiv).
+        # When off, aux_pred is None and forward returns just main_logit (unchanged).
+        if AUX_RATING_WEIGHT > 0:
+            aux_pred = self.aux_head(x).squeeze(-1)
+            return main_logit, aux_pred
+        return main_logit
 
 
 model = LinearBaseline(num_users, num_items, num_genres, GENOME_DIM, EMBED_DIM).to(DEVICE)
@@ -618,8 +645,9 @@ def run_eval():
     with torch.no_grad():
         for s in range(0, n_eval, eval_batch):
             e = min(s + eval_batch, n_eval)
-            logits = model(eval_uids[s:e], eval_mids[s:e], eval_ts[s:e],
-                           ts_raw=eval_ts_raw[s:e])
+            out = model(eval_uids[s:e], eval_mids[s:e], eval_ts[s:e],
+                        ts_raw=eval_ts_raw[s:e])
+            logits = out[0] if isinstance(out, tuple) else out
             scores.append(torch.sigmoid(logits).cpu().numpy())
     model.train()
     scores = np.concatenate(scores)
@@ -642,9 +670,23 @@ for epoch in range(MAX_EPOCHS):
     perm = torch.randperm(n_train, device=DEVICE)
     for b in range(n_batches_per_epoch):
         idx = perm[b * BATCH_SIZE:(b + 1) * BATCH_SIZE]
-        logits = model(train_uids[idx], train_mids[idx], train_ts[idx],
-                       ts_raw=train_ts_raw[idx])
+        out = model(train_uids[idx], train_mids[idx], train_ts[idx],
+                    ts_raw=train_ts_raw[idx])
+        if isinstance(out, tuple):
+            logits, aux_pred = out
+        else:
+            logits, aux_pred = out, None
         loss = loss_fn(logits, train_labels[idx])
+        if AUX_RATING_WEIGHT > 0 and aux_pred is not None:
+            # MSE between predicted rating and true normalized rating, masked
+            # to samples that have a real rating (rating > 0; random easy
+            # negatives stored as 0 are skipped). Denominator clamped to 1
+            # to handle the all-easy-negative degenerate case.
+            true_rating = train_ratings_norm[idx]
+            mask = (true_rating > 0).float()
+            sq = (aux_pred - true_rating) ** 2
+            masked_mse = (mask * sq).sum() / mask.sum().clamp(min=1.0)
+            loss = loss + AUX_RATING_WEIGHT * masked_mse
         if FREQ_WD_LAMBDA > 0:
             # Frequency-weighted L2 on item_embed. Tail items get more penalty.
             # Additive on top of the standard Adam WD applied to item_embed.weight.
