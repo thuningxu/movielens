@@ -82,6 +82,20 @@ ITEM_HIST_DECAY = int(os.environ.get("ITEM_HIST_DECAY", "0"))
 USER_HIST_DECAY_INIT = float(os.environ.get("USER_HIST_DECAY_INIT", "-10.0"))
 ITEM_HIST_DECAY_INIT = float(os.environ.get("ITEM_HIST_DECAY_INIT", "-10.0"))
 
+# Optional multiplicative cross-feature fields appended to the concat (each shape (B, D)):
+#   cross_user_item   = u_e * i_e                   (28-d)
+#   cross_uhist_item  = u_hist_pool * i_e           (28-d)
+#   cross_ihist_user  = i_hist_pool * u_e           (28-d)
+# Off-state (default 0): no extra fields, no head widening — byte-equivalent.
+CROSS_FIELDS = int(os.environ.get("CROSS_FIELDS", "0"))
+
+# Optional MLP prediction head replacing the default Linear(in, 1):
+#   Linear(in, MLP_HIDDEN) -> ReLU -> Dropout(MLP_HEAD_DROPOUT) -> Linear(MLP_HIDDEN, 1)
+# Off-state (default 0): the existing Linear(in, 1) head is constructed exactly as before.
+MLP_HEAD = int(os.environ.get("MLP_HEAD", "0"))
+MLP_HIDDEN = int(os.environ.get("MLP_HIDDEN", "128"))
+MLP_HEAD_DROPOUT = float(os.environ.get("MLP_HEAD_DROPOUT", "0.2"))
+
 # ─── Device ────────────────────────────────────────────────────────
 torch.manual_seed(SEED)
 if torch.cuda.is_available():
@@ -391,7 +405,22 @@ class LinearBaseline(nn.Module):
                         + USER_HIST_LAST_POSITION
                         + ITEM_HIST_LAST_POSITION)
         self.in_dim = 4 * D + 2 + num_genres + 2 + genome_dim + addon_fields * D
-        self.head = nn.Linear(self.in_dim, 1)
+        # Multiplicative cross-feature fields (3 × D) appended when CROSS_FIELDS=1.
+        # Adds in_dim only — the cross computation itself has no learnable params.
+        in_dim_total = self.in_dim + (3 * D if CROSS_FIELDS else 0)
+        self.in_dim = in_dim_total
+        # Head: either the default Linear(in, 1) or a 1-hidden-layer MLP. The replacement
+        # happens at the SAME __init__ point so any downstream RNG draws are unchanged at
+        # off-state, and at off-state only the Linear is constructed.
+        if MLP_HEAD:
+            self.head = nn.Sequential(
+                nn.Linear(in_dim_total, MLP_HIDDEN),
+                nn.ReLU(),
+                nn.Dropout(MLP_HEAD_DROPOUT),
+                nn.Linear(MLP_HIDDEN, 1),
+            )
+        else:
+            self.head = nn.Linear(in_dim_total, 1)
 
         # Optional learnable per-side timestamp-decay rate.
         # Constructed AFTER all default-init layers so the off-state RNG sequence
@@ -469,6 +498,13 @@ class LinearBaseline(nn.Module):
             last_e = i_hist_e[:, -1, :]                               # (B, D)
             last_valid = i_valid[:, -1].unsqueeze(-1)                 # (B, 1)
             parts.append(last_e * last_valid)
+
+        # Multiplicative cross-feature fields (no learnable params here; the head's
+        # Linear layer absorbs the +84 dims when CROSS_FIELDS=1).
+        if CROSS_FIELDS:
+            parts.append(u_e * i_e)                                   # (B, D)
+            parts.append(u_hist_pool * i_e)                           # (B, D)
+            parts.append(i_hist_pool * u_e)                           # (B, D)
 
         x = torch.cat(parts, dim=-1)
         return self.head(x).squeeze(-1)
