@@ -89,6 +89,13 @@ ITEM_HIST_DECAY_INIT = float(os.environ.get("ITEM_HIST_DECAY_INIT", "-10.0"))
 # Off-state (default 0): no extra fields, no head widening — byte-equivalent.
 CROSS_FIELDS = int(os.environ.get("CROSS_FIELDS", "1"))
 
+# Optional 4th multiplicative cross field testing temporal drift in item preference:
+#   cross_ts_item = ts * i_e                        (28-d, ts broadcast over D)
+# Only meaningful when CROSS_FIELDS=1 (the head's in_dim arithmetic assumes the 84-d
+# cross block is already present); kept as an independent flag for sweep clarity.
+# Off-state (default 0): no extra field, no head widening — byte-equivalent.
+CROSS_TS_ITEM = int(os.environ.get("CROSS_TS_ITEM", "0"))
+
 # Optional MLP prediction head replacing the default Linear(in, 1):
 #   Linear(in, MLP_HIDDEN) -> ReLU -> Dropout(MLP_HEAD_DROPOUT) -> Linear(MLP_HIDDEN, 1)
 # Off-state (default 0): the existing Linear(in, 1) head is constructed exactly as before.
@@ -408,6 +415,9 @@ class LinearBaseline(nn.Module):
         # Multiplicative cross-feature fields (3 × D) appended when CROSS_FIELDS=1.
         # Adds in_dim only — the cross computation itself has no learnable params.
         in_dim_total = self.in_dim + (3 * D if CROSS_FIELDS else 0)
+        # Optional 4th cross field (ts * i_e); only meaningful with CROSS_FIELDS=1.
+        if CROSS_TS_ITEM:
+            in_dim_total += D
         self.in_dim = in_dim_total
         # Head: either the default Linear(in, 1) or a 1-hidden-layer MLP. The replacement
         # happens at the SAME __init__ point so any downstream RNG draws are unchanged at
@@ -505,6 +515,11 @@ class LinearBaseline(nn.Module):
             parts.append(u_e * i_e)                                   # (B, D)
             parts.append(u_hist_pool * i_e)                           # (B, D)
             parts.append(i_hist_pool * u_e)                           # (B, D)
+        # Optional 4th cross field: time-modulated item embedding (ts broadcast over D).
+        # Independent flag, but only meaningful when CROSS_FIELDS=1 (the head's in_dim
+        # arithmetic assumes the 84-d cross block precedes this 28-d field).
+        if CROSS_TS_ITEM:
+            parts.append(ts * i_e)                                    # (B, D)
 
         x = torch.cat(parts, dim=-1)
         return self.head(x).squeeze(-1)
