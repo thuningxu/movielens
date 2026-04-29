@@ -1,0 +1,5 @@
+[
+  {"name": "neg0p5_s42", "env": {"NEG_RATIO": "0"}},
+  {"name": "neg2_s42", "env": {"NEG_RATIO": "2"}},
+  {"name": "neg4_s42", "env": {"NEG_RATIO": "4"}}
+]
