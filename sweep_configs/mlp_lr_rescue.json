@@ -1,0 +1,6 @@
+[
+  {"name": "mlp_h32_d05_c0_lr3e4_s42", "env": {"MLP_HEAD": "1", "MLP_HIDDEN": "32", "MLP_HEAD_DROPOUT": "0.5", "CROSS_FIELDS": "0", "LR": "3e-4"}},
+  {"name": "mlp_h32_d05_c0_lr1e4_s42", "env": {"MLP_HEAD": "1", "MLP_HIDDEN": "32", "MLP_HEAD_DROPOUT": "0.5", "CROSS_FIELDS": "0", "LR": "1e-4"}},
+  {"name": "mlp_h32_d05_c1_lr3e4_s42", "env": {"MLP_HEAD": "1", "MLP_HIDDEN": "32", "MLP_HEAD_DROPOUT": "0.5", "CROSS_FIELDS": "1", "LR": "3e-4"}},
+  {"name": "mlp_h32_d05_c1_lr1e4_s42", "env": {"MLP_HEAD": "1", "MLP_HIDDEN": "32", "MLP_HEAD_DROPOUT": "0.5", "CROSS_FIELDS": "1", "LR": "1e-4"}}
+]

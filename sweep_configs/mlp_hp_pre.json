@@ -1,0 +1,8 @@
+[
+  {"name": "mlp_h32_d05_cross1_s42", "env": {"MLP_HEAD": "1", "MLP_HIDDEN": "32", "MLP_HEAD_DROPOUT": "0.5"}},
+  {"name": "mlp_h32_d03_cross1_s42", "env": {"MLP_HEAD": "1", "MLP_HIDDEN": "32", "MLP_HEAD_DROPOUT": "0.3"}},
+  {"name": "mlp_h64_d05_cross1_s42", "env": {"MLP_HEAD": "1", "MLP_HIDDEN": "64", "MLP_HEAD_DROPOUT": "0.5"}},
+  {"name": "mlp_h64_d03_cross1_s42", "env": {"MLP_HEAD": "1", "MLP_HIDDEN": "64", "MLP_HEAD_DROPOUT": "0.3"}},
+  {"name": "mlp_h32_d05_cross0_s42", "env": {"MLP_HEAD": "1", "MLP_HIDDEN": "32", "MLP_HEAD_DROPOUT": "0.5", "CROSS_FIELDS": "0"}},
+  {"name": "mlp_h64_d05_cross0_s42", "env": {"MLP_HEAD": "1", "MLP_HIDDEN": "64", "MLP_HEAD_DROPOUT": "0.5", "CROSS_FIELDS": "0"}}
+]
