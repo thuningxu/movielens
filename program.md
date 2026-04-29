@@ -47,6 +47,33 @@ Brief notes on cycles run on the restart. Detailed per-trial data lives in `resu
 
 Legacy DLRM ceiling: 0.8284. Restart linear-head model now within 0.0002 of legacy with much simpler architecture.
 
+### `autoresearch/apr28t-x` — final cheap-cycle batch — all null
+
+Per user direction "finish all cheap cycles," ran 5 sub-cycles (~2 hours of GPU time) covering the remaining cheap candidates from the backlog. All NULL. Eight consecutive null cycles total (apr28p-x). 0.828188 is established as the final linear-head baseline.
+
+**Cumulative summary at SEED=42 vs 0.828188:**
+
+| Sub-cycle | Mechanism | Best cell | Δ | Verdict |
+|---|---|---|---|---|
+| apr28t | POOL_PIVOT re-sweep at apr28o stack | pivot=0.65 | -0.0005 | pivot=0.6 still optimal |
+| apr28u | USER_FREQ_WD_LAMBDA | 1e-5 | -0.0001 | Monotonic regression |
+| apr28v | USER_GENRE_AFFINITY_CROSS (20-d Hadamard) | on | -0.0020 | apr28p/r-pattern regression |
+| apr28w | BATCH × LR cotune | b65k_lr12e4 | +0.000353 single → +0.000123 5-seed | RNG artifact at SEED=42 |
+| apr28x | CROSS_GENRE_GENOME (per-movie content scalar) | on | -0.0001 | Sub-noise |
+
+apr28w was the only signing single-seed cell (+0.000353); 5-seed verify collapsed to +0.000123 (3/5 positive). Same shape as apr28q's RNG artifact: lift σ across seeds (~0.00018) is large relative to the mean lift, so SEED=42 routinely produces a false-positive single-seed signal.
+
+**Lesson set across apr28p-x (8 nulls):**
+- Parametric capacity additions on existing fields (apr28p DCN cross, apr28r two-tower, apr28v genre-affinity cross): all regress monotonically with capacity. The linear head + 4 manual crosses + aux head is at saturation.
+- Aggregator-side parallel pools (apr28q multi-pool): alias rating-centered pool on right-skewed rating distribution.
+- Single-scalar new-information signals (apr28s user-genome, apr28x genre-genome): sub-noise; the existing fields already capture the marginal information at this representation.
+- HP retunes (apr28t pivot, apr28u user-freq-WD, apr28w batch-LR): all sub-noise; the apr28o-tuned HPs are at the right optimum for this representation.
+- The +0.0007 multi-seed bar is probably never going to be cleared by any single mechanism on this representation. Even apr28o's win came from STACKING three sub-noise mechanisms super-additively.
+
+**Takeaway:** the 8-null streak doesn't mean apr28 is wrong; it means the representation has been mined exhaustively. Future lift requires NEW input information (IMDB plot summaries, Tier 5 #17, prior 0.40, ~2-week build) or a structurally different prediction objective. Both are out of single-cycle scope and warrant their own roadmaps.
+
+**Cheap-cycle phase: closed at 0.828188.**
+
 ### `autoresearch/apr28s` — user × candidate genome scalar dot — null
 
 **Null** (`9a42a86`). After apr28p/q/r ruled out parametric capacity additions, Researcher pivoted to NEW INFORMATION: precompute per-user genome aggregate (rating-centered weighted average of historical movies' genomes, 1128-d per user) and expose `dot(user_genome_agg, candidate_genome) / GENOME_DIM` as a single scalar field appended to the concat.

@@ -1,0 +1,6 @@
+[
+  {"name": "b65k_lr12e4_s43", "env": {"BATCH_SIZE": "65536", "LR": "1.2e-3", "SEED": "43"}},
+  {"name": "b65k_lr12e4_s44", "env": {"BATCH_SIZE": "65536", "LR": "1.2e-3", "SEED": "44"}},
+  {"name": "b65k_lr12e4_s45", "env": {"BATCH_SIZE": "65536", "LR": "1.2e-3", "SEED": "45"}},
+  {"name": "b65k_lr12e4_s46", "env": {"BATCH_SIZE": "65536", "LR": "1.2e-3", "SEED": "46"}}
+]
