@@ -73,6 +73,11 @@ DIN_ATTN_HIDDEN = int(os.environ.get("DIN_ATTN_HIDDEN", "64"))
 USER_HIST_DISLIKE_POOL = int(os.environ.get("USER_HIST_DISLIKE_POOL", "0"))
 USER_HIST_LAST_POSITION = int(os.environ.get("USER_HIST_LAST_POSITION", "0"))
 ITEM_HIST_LAST_POSITION = int(os.environ.get("ITEM_HIST_LAST_POSITION", "0"))
+# Plain unweighted mean-pool over valid history positions, appended *alongside*
+# the existing centered/etc pool. Tests whether mean-pool encodes signal that's
+# orthogonal to the rating-centered pool (e.g., unsigned co-watch frequency).
+USER_HIST_MEAN_POOL = int(os.environ.get("USER_HIST_MEAN_POOL", "0"))
+ITEM_HIST_MEAN_POOL = int(os.environ.get("ITEM_HIST_MEAN_POOL", "0"))
 
 # Pivot used by rating_centered pool mode. Default 0.6 = 3 stars / 5 (current behavior).
 POOL_PIVOT = float(os.environ.get("POOL_PIVOT", "0.6"))
@@ -482,9 +487,13 @@ class LinearBaseline(nn.Module):
         #   USER_HIST_DISLIKE_POOL: parallel "dislike" pool over user history
         #   USER_HIST_LAST_POSITION: most recent valid item embedding
         #   ITEM_HIST_LAST_POSITION: most recent valid rater embedding
+        #   USER_HIST_MEAN_POOL: plain unweighted mean of item_embed over valid positions
+        #   ITEM_HIST_MEAN_POOL: plain unweighted mean of user_embed over valid positions
         addon_fields = (USER_HIST_DISLIKE_POOL
                         + USER_HIST_LAST_POSITION
-                        + ITEM_HIST_LAST_POSITION)
+                        + ITEM_HIST_LAST_POSITION
+                        + USER_HIST_MEAN_POOL
+                        + ITEM_HIST_MEAN_POOL)
         self.in_dim = 4 * D + 2 + num_genres + 2 + genome_dim + addon_fields * D
         # Multiplicative cross-feature fields (3 × D) appended when CROSS_FIELDS=1.
         # Adds in_dim only — the cross computation itself has no learnable params.
@@ -602,6 +611,14 @@ class LinearBaseline(nn.Module):
             last_e = i_hist_e[:, -1, :]                               # (B, D)
             last_valid = i_valid[:, -1].unsqueeze(-1)                 # (B, 1)
             parts.append(last_e * last_valid)
+        if USER_HIST_MEAN_POOL:
+            denom = u_valid.sum(dim=1, keepdim=True).clamp(min=1e-6)
+            mean_pool = (u_hist_e * u_valid.unsqueeze(-1)).sum(dim=1) / denom
+            parts.append(mean_pool)
+        if ITEM_HIST_MEAN_POOL:
+            denom = i_valid.sum(dim=1, keepdim=True).clamp(min=1e-6)
+            mean_pool = (i_hist_e * i_valid.unsqueeze(-1)).sum(dim=1) / denom
+            parts.append(mean_pool)
 
         # Multiplicative cross-feature fields (no learnable params here; the head's
         # Linear layer absorbs the +84 dims when CROSS_FIELDS=1).
