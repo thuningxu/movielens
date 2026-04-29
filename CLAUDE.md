@@ -8,7 +8,7 @@ Restart (apr28) of the MovieLens hybrid engagement prediction project. Same task
 
 The legacy project at `legacy/` reached **val_auc = 0.8284** but two separate ceiling tests (apr27, apr27c) confirmed the architecture family is saturated. This restart begins from the **simplest possible model — a single Linear head on concatenated features — with the same input features**, so future architectural decisions can be motivated by clean ablations rather than 540 experiments of inherited assumptions.
 
-Current baseline: **0.8246 on ml-25m** (5-seed mean +0.00258 over the prior 0.8219 mean-pool baseline; σ ≈ 0.00008 across SEEDs 42-46). Reached by replacing the plain mean-pool over user/item history with a rating-centered weighted pool — items rated above 3 stars push the pool toward their embedding, items below push away. Zero new parameters; the win is in the choice of aggregator.
+Current baseline: **0.8282 on ml-25m at SEED=42** (5-seed mean +0.00175 over the prior 0.8263 LR/WD-retuned baseline; σ ≈ 0.0001 across SEEDs 42-46). Reached by stacking three individually sub-threshold mechanisms — rating-centered pool, multiplicative cross fields including `ts ⊙ i_e`, and an auxiliary rating-residual regression head — that compound super-additively. The progression is documented in `program.md`'s cumulative table.
 
 ## Commands
 
@@ -72,8 +72,10 @@ grep "^val_auc:\|^peak_memory_mb:" run.log
     u_e ⊙ i_e                                      → cross_ui (28)
     u_hist_pool ⊙ i_e                              → cross_uhist_item (28)
     i_hist_pool ⊙ u_e                              → cross_ihist_user (28)
+- Cross field (CROSS_TS_ITEM=1, default on):
+    ts_norm ⊙ i_e                                  → cross_ts_item (28)
 
-concat → Linear(in_dim, 1) → sigmoid    # in_dim = 1264 + 84 = 1348 (ml-25m, with default cross fields)
+concat → Linear(in_dim, 1) → sigmoid    # in_dim = 4*28 + 2 + 20 + 2 + 1128 + 4*28 = 1376 (ml-25m, with default cross fields and ts-item cross)
 
 Loss: BCEWithLogitsLoss + AUX_RATING_WEIGHT (=25) × masked_mse on rating regression head
 Optimizer: Adam, lr=3e-4, weight_decay=5e-5
