@@ -1,0 +1,6 @@
+[
+  {"name": "wd1e6_s42", "env": {"WEIGHT_DECAY": "1e-6"}},
+  {"name": "wd1e4_s42", "env": {"WEIGHT_DECAY": "1e-4"}},
+  {"name": "wd1e3_s42", "env": {"WEIGHT_DECAY": "1e-3"}},
+  {"name": "wd5e4_s42", "env": {"WEIGHT_DECAY": "5e-4"}}
+]
