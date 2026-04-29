@@ -1,0 +1,5 @@
+[
+  {"name": "user_freq1e5_s42", "env": {"USER_FREQ_WD_LAMBDA": "1e-5"}},
+  {"name": "user_freq1e4_s42", "env": {"USER_FREQ_WD_LAMBDA": "1e-4"}},
+  {"name": "user_freq1e3_s42", "env": {"USER_FREQ_WD_LAMBDA": "1e-3"}}
+]

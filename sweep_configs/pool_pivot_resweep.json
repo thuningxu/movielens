@@ -1,0 +1,6 @@
+[
+  {"name": "pivot050_s42", "env": {"POOL_PIVOT": "0.50"}},
+  {"name": "pivot055_s42", "env": {"POOL_PIVOT": "0.55"}},
+  {"name": "pivot065_s42", "env": {"POOL_PIVOT": "0.65"}},
+  {"name": "pivot070_s42", "env": {"POOL_PIVOT": "0.70"}}
+]

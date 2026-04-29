@@ -141,6 +141,20 @@ AUX_RATING_WEIGHT = float(os.environ.get("AUX_RATING_WEIGHT", "25.0"))
 # Off-state (default 0): no field appended; byte-equivalent to baseline.
 USER_GENOME_AGG_DOT = int(os.environ.get("USER_GENOME_AGG_DOT", "0"))
 
+# Frequency-weighted L2 on user_embed (mirror of FREQ_WD_LAMBDA on item_embed).
+# Tail users (few ratings) get more penalty. Penalty = LAMBDA * sum_u w_u * |u_e_u|^2
+# where w_u = 1 / sqrt(user_count_u + 5). Off-state (default 0.0): no penalty.
+USER_FREQ_WD_LAMBDA = float(os.environ.get("USER_FREQ_WD_LAMBDA", "0.0"))
+
+# Per-user genre affinity Hadamard-crossed with the candidate movie's genres.
+# user_genre_affinity is the rating-centered weighted average of historical
+# movies' genre multi-hot vectors (num_genres-d per user, precomputed). The
+# cross `user_genre_affinity ⊙ candidate_genre` (num_genres-d) lets the linear
+# head learn "this user's affinity for genre G times this movie's membership
+# in G", a per-user × per-movie genre-match signal.
+# Off-state (default 0): no field appended; byte-equivalent to baseline.
+USER_GENRE_AFFINITY_CROSS = int(os.environ.get("USER_GENRE_AFFINITY_CROSS", "0"))
+
 # ─── Device ────────────────────────────────────────────────────────
 torch.manual_seed(SEED)
 if torch.cuda.is_available():
@@ -174,7 +188,7 @@ log.info(f"Dataset: {DATASET} | Users: {num_users} | Items: {num_items} | "
 #   - per sample: timestamp normalized
 
 _cache_key = hashlib.md5(json.dumps({
-    "feature_version": "restart-4",       # restart-4 adds precomputed per-user genome aggregate
+    "feature_version": "restart-5",       # restart-5 adds per-user count + per-user genre affinity
     "dataset": DATASET, "neg_ratio": NEG_RATIO,
     "history_len": HISTORY_LEN, "item_hist_len": ITEM_HIST_LEN,
     "num_users": num_users, "num_items": num_items,
@@ -199,6 +213,8 @@ if _cache_path.exists():
     GENOME_DIM = genome_matrix.shape[1]
     item_count = _c["item_count"]
     user_genome_agg = _c["user_genome_agg"]
+    user_count = _c["user_count"]
+    user_genre_affinity = _c["user_genre_affinity"]
     del _c
 else:
     log.info("Computing features (will cache for next run)...")
@@ -335,6 +351,27 @@ else:
         _denom = np.abs(_w).sum(axis=1, keepdims=True).clip(1e-6)
         user_genome_agg[_s:_e] = (_h * _w[:, :, None]).sum(axis=1) / _denom
 
+    # Per-user training-positive count (rating >= 4). Mirror of item_count, used
+    # by USER_FREQ_WD_LAMBDA. Shape (num_users + 1,) including PAD row at num_users.
+    user_count = np.zeros(num_users + 1, dtype=np.float32)
+    _pos_uids = real_train.loc[real_train["rating"] >= 4, "userId"].values.astype(np.int64)
+    if len(_pos_uids) > 0:
+        np.add.at(user_count, _pos_uids, 1.0)
+
+    # Per-user genre affinity: rating-centered weighted average of each user's
+    # historical movies' genre multi-hot vectors. Shape (num_users + 1, num_genres).
+    # Row num_users is the PAD slot (zeros). Same weighting as user_genome_agg.
+    log.info("Precomputing per-user genre affinity (restart-5)...")
+    user_genre_affinity = np.zeros((num_users + 1, num_genres), dtype=np.float32)
+    genres_padded = np.zeros((num_items + 1, num_genres), dtype=np.float32)
+    genres_padded[:num_items] = movie_genres
+    for _s in range(0, num_users, _chunk):
+        _e = min(_s + _chunk, num_users)
+        _h = genres_padded[user_histories[_s:_e]]                    # (chunk, L, num_genres)
+        _w = (user_hist_ratings[_s:_e] - _pivot) * (user_histories[_s:_e] != PAD_IDX).astype(np.float32)
+        _denom = np.abs(_w).sum(axis=1, keepdims=True).clip(1e-6)
+        user_genre_affinity[_s:_e] = (_h * _w[:, :, None]).sum(axis=1) / _denom
+
     np.savez_compressed(_cache_path,
         movie_genres=movie_genres,
         user_histories=user_histories, user_hist_ratings=user_hist_ratings,
@@ -346,6 +383,8 @@ else:
         genome_matrix=genome_matrix,
         item_count=item_count,
         user_genome_agg=user_genome_agg,
+        user_count=user_count,
+        user_genre_affinity=user_genre_affinity,
     )
     log.info(f"Features cached to {_cache_path.name}")
 
@@ -362,12 +401,16 @@ _item_hist_ts_t = torch.from_numpy(item_hist_timestamps).to(DEVICE)
 _movie_genres_t = torch.from_numpy(movie_genres).to(DEVICE)
 _genome_t = torch.from_numpy(genome_matrix).to(DEVICE)
 _user_genome_agg_t = torch.from_numpy(user_genome_agg).to(DEVICE)
+_user_genre_affinity_t = torch.from_numpy(user_genre_affinity).to(DEVICE)
 _movie_year_t = torch.from_numpy(movie_year).to(DEVICE)
 
 # Frequency weights for the optional FREQ_WD_LAMBDA penalty on item_embed.
 # Shape (num_items + 1,) including the PAD row at index num_items (count=0).
 _item_freq_weight_t = torch.from_numpy(
     1.0 / np.sqrt(np.asarray(item_count, dtype=np.float32) + 5.0)
+).to(DEVICE)
+_user_freq_weight_t = torch.from_numpy(
+    1.0 / np.sqrt(np.asarray(user_count, dtype=np.float32) + 5.0)
 ).to(DEVICE)
 
 
@@ -539,6 +582,9 @@ class LinearBaseline(nn.Module):
         # Optional user × candidate genome compatibility scalar (1-d field).
         if USER_GENOME_AGG_DOT:
             in_dim_total += 1
+        # Optional user × candidate genre Hadamard cross (num_genres-d field).
+        if USER_GENRE_AFFINITY_CROSS:
+            in_dim_total += num_genres
         self.in_dim = in_dim_total
         # Head: either the default Linear(in, 1) or a 1-hidden-layer MLP. The replacement
         # happens at the SAME __init__ point so any downstream RNG draws are unchanged at
@@ -676,6 +722,10 @@ class LinearBaseline(nn.Module):
             u_gen = _user_genome_agg_t[uids]                          # (B, GENOME_DIM)
             ug_dot = (u_gen * genome_e).sum(dim=-1, keepdim=True) / GENOME_DIM  # (B, 1)
             parts.append(ug_dot)
+        # Optional user × candidate genre Hadamard cross.
+        if USER_GENRE_AFFINITY_CROSS:
+            u_gaff = _user_genre_affinity_t[uids]                     # (B, num_genres)
+            parts.append(u_gaff * genre_raw)                          # (B, num_genres)
 
         x = torch.cat(parts, dim=-1)
         main_logit = self.head(x).squeeze(-1)
@@ -755,6 +805,10 @@ for epoch in range(MAX_EPOCHS):
             l2_per_item = (model.item_embed.weight ** 2).sum(dim=-1)  # (num_items + 1,)
             freq_penalty = FREQ_WD_LAMBDA * (l2_per_item * _item_freq_weight_t).sum()
             loss = loss + freq_penalty
+        if USER_FREQ_WD_LAMBDA > 0:
+            l2_per_user = (model.user_embed.weight ** 2).sum(dim=-1)  # (num_users + 1,)
+            user_freq_penalty = USER_FREQ_WD_LAMBDA * (l2_per_user * _user_freq_weight_t).sum()
+            loss = loss + user_freq_penalty
         opt.zero_grad()
         loss.backward()
         opt.step()
