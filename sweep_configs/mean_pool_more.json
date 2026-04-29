@@ -1,0 +1,5 @@
+[
+  {"name": "imean_s42", "env": {"ITEM_HIST_MEAN_POOL": "1"}},
+  {"name": "ulast_s42", "env": {"USER_HIST_LAST_POSITION": "1"}},
+  {"name": "umean_imean_s42", "env": {"USER_HIST_MEAN_POOL": "1", "ITEM_HIST_MEAN_POOL": "1"}}
+]

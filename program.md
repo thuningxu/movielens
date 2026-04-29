@@ -47,6 +47,35 @@ Brief notes on cycles run on the restart. Detailed per-trial data lives in `resu
 
 Legacy DLRM ceiling: 0.8284. Restart linear-head model now within 0.0002 of legacy with much simpler architecture.
 
+### `autoresearch/apr28q` — multi-pool concat (mean / last-position) — null
+
+**Null** (`feb954d`). Researcher proposed adding plain mean-pool of item_embed (USER side) / user_embed (ITEM side) over valid history positions, alongside the existing rating-centered pool — testing whether mean-pool encodes signal that's orthogonal to the rating-centered pool. Critic raised the cosine-correlation concern (centered ≈ 0.85-0.95 cosine to mean on right-skewed ratings) and tightened the budget to ≥+0.0006 single-seed gate.
+
+Pre-screen at SEED=42 vs 0.828188 baseline:
+
+| Cell | val_auc | Δ |
+|---|---|---|
+| `USER_HIST_MEAN_POOL=1` | 0.828839 | **+0.000651** |
+| `USER + ITEM mean` | 0.828265 | +0.000077 |
+| `USER_HIST_LAST_POSITION=1` | 0.828109 | -0.000079 |
+| `ITEM_HIST_MEAN_POOL=1` | 0.827798 | -0.000390 |
+
+Only USER mean alone signed; ITEM mean regresses; combining the two dilutes USER mean's lift down to noise — item-side mean-pool is actively harmful, not just neutral. Last-position is null (consistent with apr28l's recency-saturation finding).
+
+5-seed verify of `USER_HIST_MEAN_POOL=1`:
+
+| SEED | baseline | umean | lift |
+|---|---|---|---|
+| 42 | 0.828188 | 0.828839 | +0.000651 |
+| 43 | 0.828073 | 0.827828 | **-0.000245** |
+| 44 | 0.828024 | 0.828105 | +0.000081 |
+| 45 | 0.828098 | 0.828454 | +0.000356 |
+| 46 | 0.828266 | 0.828361 | +0.000095 |
+
+Mean lift **+0.000188**, 4/5 positive, min -0.000245, lift-σ 0.000336, t ≈ 0.56. Below all three multi-seed bars; the SEED=42 single-seed +0.000651 was an RNG artifact. The Critic's cosine-correlation prediction was effectively right.
+
+**Lesson:** Mean-pool and rating-centered pool are not as orthogonal as the math suggests; on a right-skewed rating distribution they alias each other to the point where the head can't extract additional signal beyond the centered pool's. Last-position is bracketed by recency saturation. Item-side multi-pool is actively harmful, suggesting the item-side rating-centered pool already has the right inductive bias and adding mean-pool there just adds noise.
+
 ### `autoresearch/apr28p` — DCN/DCNv2/DCNv3 cross network — null
 
 **Null** (`73d4262`). The Researcher noticed our concat already includes 4 manual Hadamard crosses (`u_e⊙i_e`, `u_hist_pool⊙i_e`, `i_hist_pool⊙u_e`, `ts_norm⊙i_e`) and proposed a DCN cross network on the 4-field 112-d stack to learn higher-order interactions automatically. Critic vetted; pre-screen 5-cell sweep on ml-25m at SEED=42 (vs 0.828188 baseline):
