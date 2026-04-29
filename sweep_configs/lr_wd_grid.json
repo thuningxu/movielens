@@ -1,0 +1,9 @@
+[
+  {"name": "lr3e4_wd1e5", "env": {"LR": "3e-4", "WEIGHT_DECAY": "1e-5"}},
+  {"name": "lr3e4_wd5e5", "env": {"LR": "3e-4", "WEIGHT_DECAY": "5e-5"}},
+  {"name": "lr3e4_wd1e4", "env": {"LR": "3e-4", "WEIGHT_DECAY": "1e-4"}},
+  {"name": "lr1e3_wd5e5", "env": {"LR": "1e-3", "WEIGHT_DECAY": "5e-5"}},
+  {"name": "lr3e3_wd1e5", "env": {"LR": "3e-3", "WEIGHT_DECAY": "1e-5"}},
+  {"name": "lr3e3_wd5e5", "env": {"LR": "3e-3", "WEIGHT_DECAY": "5e-5"}},
+  {"name": "lr3e3_wd1e4", "env": {"LR": "3e-3", "WEIGHT_DECAY": "1e-4"}}
+]

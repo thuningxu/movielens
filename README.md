@@ -111,6 +111,9 @@ DATASET=ml-25m uv run python train.py
 - The 16 architectural-cycle's worth of dropouts, gates, residuals, and conditional flags
 - Anything in `legacy/train.py` past the feature-engineering section
 
-Current baseline AUC: **0.8251 on ml-25m** (deterministic, SEED=42; 5-seed mean +0.00072 over the prior 0.8246 centered-pool baseline). Reached by appending three multiplicative cross-feature fields to the concat: `u_e ⊙ i_e`, `u_hist_pool ⊙ i_e`, `i_hist_pool ⊙ u_e` — Hadamard products that the linear head literally cannot synthesize on its own. No new learnable parameters; the head's `Linear(in_dim, 1)` just widens by 84 input dims.
+Current baseline AUC: **0.8263 on ml-25m** (deterministic, SEED=42; 5-seed mean +0.00115 over the prior 0.8251 cross-fields baseline). Reached by tuning `LR=3e-4` and `WEIGHT_DECAY=5e-5` (down from `1e-3` and `1e-5`) — pure HP retune, no architectural change.
 
-The prior centered-pool baseline (0.8246) reached its win by switching user-history and item-history pools from plain mean to a rating-centered weighted pool (`weight = (rating - 0.6) * is_valid`, normalize by sum-of-absolute-weights): items rated above 3 stars push the pool *toward* their embedding, items below 3 stars push *away*. Both wins (centered pool + cross fields) are pure aggregator/feature changes, no new layers.
+Three wins so far on the restart, all pure aggregator/feature/HP changes (no new layers):
+- **Centered pool** (0.8246 from 0.8219): switched user-history and item-history pools from plain mean to a rating-centered weighted pool. Items rated above 3 stars push *toward* their embedding; items below 3 stars push *away*. Sign matters.
+- **Cross fields** (0.8251 from 0.8246): appended three Hadamard products to the concat — `u_e ⊙ i_e`, `u_hist_pool ⊙ i_e`, `i_hist_pool ⊙ u_e`. The linear head literally cannot synthesize multiplicative interactions on its own.
+- **LR + WD retune** (0.8263 from 0.8251): `LR=3e-4`, `WD=5e-5`. The new richer-feature baseline benefits from a softer, more regularized optimizer.

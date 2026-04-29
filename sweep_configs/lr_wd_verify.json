@@ -1,0 +1,11 @@
+[
+  {"name": "verify_lr3e4_wd5e5_s43", "env": {"LR": "3e-4", "WEIGHT_DECAY": "5e-5", "SEED": "43"}},
+  {"name": "verify_lr3e4_wd5e5_s44", "env": {"LR": "3e-4", "WEIGHT_DECAY": "5e-5", "SEED": "44"}},
+  {"name": "verify_lr3e4_wd5e5_s45", "env": {"LR": "3e-4", "WEIGHT_DECAY": "5e-5", "SEED": "45"}},
+  {"name": "verify_lr3e4_wd5e5_s46", "env": {"LR": "3e-4", "WEIGHT_DECAY": "5e-5", "SEED": "46"}},
+
+  {"name": "verify_lr1e3_wd5e5_s43", "env": {"LR": "1e-3", "WEIGHT_DECAY": "5e-5", "SEED": "43"}},
+  {"name": "verify_lr1e3_wd5e5_s44", "env": {"LR": "1e-3", "WEIGHT_DECAY": "5e-5", "SEED": "44"}},
+  {"name": "verify_lr1e3_wd5e5_s45", "env": {"LR": "1e-3", "WEIGHT_DECAY": "5e-5", "SEED": "45"}},
+  {"name": "verify_lr1e3_wd5e5_s46", "env": {"LR": "1e-3", "WEIGHT_DECAY": "5e-5", "SEED": "46"}}
+]

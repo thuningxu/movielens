@@ -34,6 +34,29 @@ Operating rules:
 
 Brief notes on cycles run on the restart. Detailed per-trial data lives in `results.tsv` and `sweep_*.log`.
 
+### `autoresearch/apr28g` — LR × WD retune
+
+After 4 consecutive null cycles (apr28c-f explored ts × i_e cross, MLP head HP/LR, DIN attention, WD-only sweep — all sub-threshold or regressing), a 7-cell LR × WD grid found that the new richer-feature baseline benefits from a softer optimizer.
+
+Top 2 configs at SEED=42:
+- LR=3e-4, WD=5e-5: 0.826251 (+0.00113)
+- LR=1e-3, WD=5e-5: 0.826036 (+0.00092)
+
+5-seed multi-seed verify (SEED 42-46):
+- LR=3e-4, WD=5e-5: **mean lift +0.001152, 5/5 positive, min +0.000850**
+- LR=1e-3, WD=5e-5: mean lift +0.000861, 5/5 positive, min +0.000650
+
+Both clean keeps. Promoted (LR=3e-4, WD=5e-5) as new defaults — the stronger of the two and the dominant factor (WD=5e-5) is captured by both.
+
+### `autoresearch/apr28c-f` — null cycles
+
+Brief log of cycles between cross-fields and LR×WD wins:
+
+- **apr28c — ts × i_e cross**: mean lift +0.000486, 5/5 positive but below +0.0007 bar. Sub-threshold.
+- **apr28d — MLP head HP + LR rescue**: 10 trials across (hidden ∈ {32, 64, 128}) × (dropout ∈ {0.3, 0.5}) × (LR ∈ {1e-3, 3e-4, 1e-4}). All regress -0.003 to -0.013. Default LR causes overfit-in-67s; lower LR doesn't rescue. MLP head as currently designed is dead.
+- **apr28e — DIN target-aware attention**: 5 configs across (attn_hidden ∈ {32, 64, 128}) × LR variants. All regress -0.002 to -0.025; best -0.0021. Trial wall-clock 4-10× baseline due to (B, L, 3*D) attn features tensor. DIN as currently implemented can't beat the rating-centered + cross-fields baseline.
+- **apr28f — WD sweep alone**: tested WD ∈ {1e-6, 1e-4, 5e-4, 1e-3} at LR=1e-3. WD=1e-4 within noise of default (1e-5); extremes hurt. Combined with LR variation in apr28g revealed the (3e-4, 5e-5) optimum.
+
 ### `autoresearch/apr28b` — multiplicative cross fields cycle
 
 Started from the apr28 baseline (0.824570). Researcher + Critic debated the backlog over 4 rounds and converged on a joint 2×2 sweep: cross fields × MLP head.

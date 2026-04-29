@@ -76,7 +76,7 @@ grep "^val_auc:\|^peak_memory_mb:" run.log
 concat → Linear(in_dim, 1) → sigmoid    # in_dim = 1264 + 84 = 1348 (ml-25m, with default cross fields)
 
 Loss: BCEWithLogitsLoss
-Optimizer: Adam, lr=1e-3, weight_decay=1e-5
+Optimizer: Adam, lr=3e-4, weight_decay=5e-5
 Training: batch=16384, sub-epoch eval 3×, patience=3 evals, max 20 epochs
 ```
 
