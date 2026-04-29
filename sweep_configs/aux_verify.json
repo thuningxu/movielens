@@ -1,0 +1,6 @@
+[
+  {"name": "verify_aux20_s43", "env": {"AUX_RATING_WEIGHT": "20.0", "SEED": "43"}},
+  {"name": "verify_aux20_s44", "env": {"AUX_RATING_WEIGHT": "20.0", "SEED": "44"}},
+  {"name": "verify_aux20_s45", "env": {"AUX_RATING_WEIGHT": "20.0", "SEED": "45"}},
+  {"name": "verify_aux20_s46", "env": {"AUX_RATING_WEIGHT": "20.0", "SEED": "46"}}
+]

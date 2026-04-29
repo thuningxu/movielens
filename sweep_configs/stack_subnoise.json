@@ -1,0 +1,6 @@
+[
+  {"name": "stack_aux_freq_s42", "env": {"AUX_RATING_WEIGHT": "25.0", "FREQ_WD_LAMBDA": "1e-4"}},
+  {"name": "stack_aux_ts_s42", "env": {"AUX_RATING_WEIGHT": "25.0", "CROSS_TS_ITEM": "1"}},
+  {"name": "stack_freq_ts_s42", "env": {"FREQ_WD_LAMBDA": "1e-4", "CROSS_TS_ITEM": "1"}},
+  {"name": "stack_all3_s42", "env": {"AUX_RATING_WEIGHT": "25.0", "FREQ_WD_LAMBDA": "1e-4", "CROSS_TS_ITEM": "1"}}
+]

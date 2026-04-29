@@ -98,7 +98,7 @@ CROSS_FIELDS = int(os.environ.get("CROSS_FIELDS", "1"))
 # Only meaningful when CROSS_FIELDS=1 (the head's in_dim arithmetic assumes the 84-d
 # cross block is already present); kept as an independent flag for sweep clarity.
 # Off-state (default 0): no extra field, no head widening — byte-equivalent.
-CROSS_TS_ITEM = int(os.environ.get("CROSS_TS_ITEM", "0"))
+CROSS_TS_ITEM = int(os.environ.get("CROSS_TS_ITEM", "1"))
 
 # Optional MLP prediction head replacing the default Linear(in, 1):
 #   Linear(in, MLP_HIDDEN) -> ReLU -> Dropout(MLP_HEAD_DROPOUT) -> Linear(MLP_HIDDEN, 1)
@@ -115,14 +115,14 @@ MLP_HEAD_DROPOUT = float(os.environ.get("MLP_HEAD_DROPOUT", "0.2"))
 # Sweep FREQ_WD_LAMBDA values accordingly. PAD row is included in the penalty
 # (count=0 -> freq_weight ≈ 0.447); not special-cased.
 # Off-state (default 0.0): no penalty added; byte-equivalent to baseline.
-FREQ_WD_LAMBDA = float(os.environ.get("FREQ_WD_LAMBDA", "0.0"))
+FREQ_WD_LAMBDA = float(os.environ.get("FREQ_WD_LAMBDA", "1e-4"))
 
 # Auxiliary rating-residual regression head. When > 0, a parallel Linear(in_dim, 1)
 # head predicts the normalized rating (0.5..5.0 -> 0.1..1.0) for samples with a
 # real rating. Random unrated easy negatives (rating=0) are masked out of the
 # aux loss. Combined: total_loss = bce_loss + AUX_RATING_WEIGHT * masked_mse.
 # Off-state (default 0.0): no aux head constructed; byte-equivalent to baseline.
-AUX_RATING_WEIGHT = float(os.environ.get("AUX_RATING_WEIGHT", "0.0"))
+AUX_RATING_WEIGHT = float(os.environ.get("AUX_RATING_WEIGHT", "25.0"))
 
 # ─── Device ────────────────────────────────────────────────────────
 torch.manual_seed(SEED)

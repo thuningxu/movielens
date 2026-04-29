@@ -75,8 +75,10 @@ grep "^val_auc:\|^peak_memory_mb:" run.log
 
 concat → Linear(in_dim, 1) → sigmoid    # in_dim = 1264 + 84 = 1348 (ml-25m, with default cross fields)
 
-Loss: BCEWithLogitsLoss
+Loss: BCEWithLogitsLoss + AUX_RATING_WEIGHT (=25) × masked_mse on rating regression head
 Optimizer: Adam, lr=3e-4, weight_decay=5e-5
+Item-embed regularization: Adam WD + FREQ_WD_LAMBDA (=1e-4) × per-item L2 weighted 1/sqrt(count+5)
+Cross fields: 4 Hadamard products (u_e⊙i_e, u_hist⊙i_e, i_hist⊙u_e, ts⊙i_e)
 Training: batch=16384, sub-epoch eval 3×, patience=3 evals, max 20 epochs
 ```
 

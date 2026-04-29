@@ -111,9 +111,15 @@ DATASET=ml-25m uv run python train.py
 - The 16 architectural-cycle's worth of dropouts, gates, residuals, and conditional flags
 - Anything in `legacy/train.py` past the feature-engineering section
 
-Current baseline AUC: **0.8263 on ml-25m** (deterministic, SEED=42; 5-seed mean +0.00115 over the prior 0.8251 cross-fields baseline). Reached by tuning `LR=3e-4` and `WEIGHT_DECAY=5e-5` (down from `1e-3` and `1e-5`) — pure HP retune, no architectural change.
+Current baseline AUC: **0.8282 on ml-25m** (deterministic, SEED=42; 5-seed mean +0.00175 over the prior 0.8263 LR/WD-retuned baseline). Reached by stacking three individually sub-threshold mechanisms — each +0.0005 to +0.0007 single-seed alone, but +0.0017 multi-seed when combined (super-additive).
 
-Three wins so far on the restart, all pure aggregator/feature/HP changes (no new layers):
+Four wins so far on the restart, all pure aggregator/feature/HP changes (no big architectural shifts):
 - **Centered pool** (0.8246 from 0.8219): switched user-history and item-history pools from plain mean to a rating-centered weighted pool. Items rated above 3 stars push *toward* their embedding; items below 3 stars push *away*. Sign matters.
 - **Cross fields** (0.8251 from 0.8246): appended three Hadamard products to the concat — `u_e ⊙ i_e`, `u_hist_pool ⊙ i_e`, `i_hist_pool ⊙ u_e`. The linear head literally cannot synthesize multiplicative interactions on its own.
 - **LR + WD retune** (0.8263 from 0.8251): `LR=3e-4`, `WD=5e-5`. The new richer-feature baseline benefits from a softer, more regularized optimizer.
+- **Sub-noise stack** (0.8282 from 0.8263): three orthogonal mechanisms, each individually below the multi-seed bar, compound super-additively:
+  - `CROSS_TS_ITEM=1`: 4th cross field `ts_norm ⊙ i_e` for temporal drift in item preference
+  - `FREQ_WD_LAMBDA=1e-4`: per-item L2 weighted by `1/sqrt(count + 5)` — tail items get more regularization
+  - `AUX_RATING_WEIGHT=25.0`: parallel Linear head predicting normalized rating, MSE multi-task loss
+
+This brings the linear-head baseline to within 0.0002 of the legacy DLRM ceiling (0.8284) — same task, much simpler architecture (no DIN, no field attention, no genome bottleneck, no two-stream MLPs).

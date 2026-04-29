@@ -1,0 +1,6 @@
+[
+  {"name": "verify_all3_s43", "env": {"AUX_RATING_WEIGHT": "25.0", "FREQ_WD_LAMBDA": "1e-4", "CROSS_TS_ITEM": "1", "SEED": "43"}},
+  {"name": "verify_all3_s44", "env": {"AUX_RATING_WEIGHT": "25.0", "FREQ_WD_LAMBDA": "1e-4", "CROSS_TS_ITEM": "1", "SEED": "44"}},
+  {"name": "verify_all3_s45", "env": {"AUX_RATING_WEIGHT": "25.0", "FREQ_WD_LAMBDA": "1e-4", "CROSS_TS_ITEM": "1", "SEED": "45"}},
+  {"name": "verify_all3_s46", "env": {"AUX_RATING_WEIGHT": "25.0", "FREQ_WD_LAMBDA": "1e-4", "CROSS_TS_ITEM": "1", "SEED": "46"}}
+]
