@@ -12,7 +12,7 @@ The prior project (see `legacy/`) reached val_auc = 0.8284 on ml-25m via several
 - **`prepare.py`**: do not modify (`evaluate()` is the ground-truth metric).
 - **`train.py`**: the experimentation file. Currently the linear baseline; will grow.
 - **Multi-seed discipline**: estimate the seed-noise floor empirically before declaring any win. A few baseline seeds give you σ; require multi-seed verification with mean lift comfortably above that floor and a positive sign at every seed.
-- **Feature cache**: `data/features_<hash>.npz` is built on first ml-25m run and reused. Cache key is `restart-2` (includes per-position `hist_ts` for optional decay experiments).
+- **Feature cache**: `data/features_<hash>.npz` is built on first ml-25m run and reused. Cache key is `restart-3` (includes per-position `hist_ts` plus per-item training-positive count for `FREQ_WD_LAMBDA`).
 
 ## Current operating mode (autonomous loop)
 
@@ -33,6 +33,50 @@ Operating rules:
 ## Experiment log
 
 Brief notes on cycles run on the restart. Detailed per-trial data lives in `results.tsv` and `sweep_*.log`.
+
+### Cumulative progress
+
+| Stage | val_auc (SEED=42) | Cum. lift |
+|---|---|---|
+| Linear baseline scaffold | 0.7848 | 0 |
+| Stripped pre-computed user/item stats | 0.8217 | +0.037 |
+| Centered pool stack (apr28b) | 0.8246 | +0.040 |
+| Cross fields (apr28b) | 0.8251 | +0.040 |
+| LR=3e-4, WD=5e-5 (apr28g) | 0.8263 | +0.042 |
+| **Sub-noise stack of 3 (apr28o)** | **0.8282** | **+0.043** |
+
+Legacy DLRM ceiling: 0.8284. Restart linear-head model now within 0.0002 of legacy with much simpler architecture.
+
+### `autoresearch/apr28o` — sub-noise stacking win
+
+**Win** (`b983125`). Three individually sub-threshold mechanisms compound super-additively:
+
+- `AUX_RATING_WEIGHT=25.0` — auxiliary Linear head predicting normalized rating; combined with main BCE head via `bce + 25 × masked_mse`. The aux MSE is masked to skip random unrated easy negatives. Standalone aux sweep peaked at weight=20-25 with single-seed +0.000750 (5-seed mean +0.000634, sub-threshold alone).
+- `FREQ_WD_LAMBDA=1e-4` — per-item L2 weighted by `1/sqrt(item_count + 5)`; tail items get more regularization. Smooth unimodal sweep, peak at lambda=1e-4 with single-seed +0.000200 (sub-threshold alone).
+- `CROSS_TS_ITEM=1` — 4th cross field `ts_norm ⊙ i_e` for temporal drift in item preference. Standalone single-seed +0.000358 (5-seed mean +0.000528, sub-threshold alone).
+
+Stack 5-seed verify (vs LR/WD baseline 0.826251):
+- SEED=42: +0.001937
+- SEED=43: +0.001764
+- SEED=44: +0.001569
+- SEED=45: +0.001730
+- SEED=46: +0.001737
+
+Mean lift **+0.001747**, 5/5 positive, min +0.001569 — ~17.5σ above the σ ≈ 0.0001 noise floor. New baseline at SEED=42: **0.828188**.
+
+This validates the **legacy "sub-noise stacking" lesson** (apr27b's 4-knob HP stack). Mechanisms that individually sit just below the noise bar can still represent real, orthogonal contributions; compounding 3-4 of them clears the bar by a wide margin.
+
+### `autoresearch/apr28h-n` — null cycles between LR/WD and aux
+
+After the apr28g LR×WD win, ran 7 cheap-HP and code-change cycles. All sub-threshold individually but the apr28o stack uses the surviving signal from apr28h (CROSS_TS_ITEM) and apr28n (FREQ_WD_LAMBDA):
+
+- **apr28h** — `CROSS_TS_ITEM=1` redo at new defaults: 5-seed mean +0.000528, sub-threshold (same as apr28c at old baseline; HP shift didn't move it across alone — but it's a real signal that the stack uses).
+- **apr28i** — EMBED_DIM ∈ {16, 28, 40, 56, 84}: all within ±0.00015 of baseline. Flat.
+- **apr28j** — NEG_RATIO ∈ {2, 4}: monotonic regression from 1; 1 confirmed optimal.
+- **apr28k** — BATCH_SIZE × PATIENCE: all within ±0.00003. PATIENCE=4/5 produce *identical* val_auc to default (model converges before extended patience matters).
+- **apr28l** — HISTORY_LEN ∈ {50, 150, 200}: 50 ≈ default; longer slightly regresses. 100 is fine.
+- **apr28m** — ITEM_HIST_LEN ∈ {15, 60, 100}: all within ±0.00005. 30 fine.
+- **apr28n** — `FREQ_WD_LAMBDA` sweep: smooth unimodal peak at 1e-4 with single-seed +0.000200 (sub-threshold alone but useful in the apr28o stack).
 
 ### `autoresearch/apr28g` — LR × WD retune
 
@@ -97,6 +141,13 @@ Linear-baseline noise floor: **σ ≈ 0.00008** across SEED ∈ {42,43,44,45,46}
 The decay infrastructure (env flags, cache fields, parameter construction) is left in place — defaults are byte-equivalent, infrastructure is available if a future cycle wants to combine decay with a different pool operator.
 
 ## Research backlog
+
+**Status as of apr28o**: Most Tier 1-2 ideas have been explored. The remaining backlog is increasingly skewed toward Tier 3-5 (bigger architectural shifts, new data sources). The cheap HP/aggregator space is largely saturated at the current architecture.
+
+**Surviving ideas worth running** (after apr28o):
+- **Tier 4-5**: IMDB plot summaries (genuinely new signal, deferred), transformer encoder + target attention (deferred), generative retrieval / TIGER (speculative).
+- **Re-explore**: User-level tag genome with learned aggregation (originally removed in the strip; mechanism may now fit).
+- **Speculative**: MLP head with smarter optimization (zero-init last layer, head-only LR via param groups, gradient warmup) — apr28d's null was at default LR; may be rescuable.
 
 Ideas organized by approximate cost. Each entry specifies a sweep budget — **don't declare an idea dead until at least the listed number of trials are run, with multi-seed verification of any single-seed qualifier**.
 

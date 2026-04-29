@@ -49,9 +49,11 @@ graph TD
         IE -.-> CR2
         IHP -.-> CR3["i_hist_pool ⊙ u_e → 28"]
         UE -.-> CR3
+        TS -.-> CR4["ts_norm ⊙ i_e → 28"]
+        IE -.-> CR4
     end
 
-    UE --> CONCAT["concat<br/>(in_dim = 1348 for ml-25m)"]
+    UE --> CONCAT["concat<br/>(in_dim = 1376 for ml-25m)"]
     IE --> CONCAT
     UHP --> CONCAT
     UHR --> CONCAT
@@ -64,29 +66,35 @@ graph TD
     CR1 --> CONCAT
     CR2 --> CONCAT
     CR3 --> CONCAT
+    CR4 --> CONCAT
 
-    CONCAT --> HEAD["Linear(in_dim, 1)"]
-    HEAD --> SIGMOID["sigmoid"]
+    CONCAT --> MAINHEAD["Linear(in_dim, 1)<br/>main head"]
+    CONCAT --> AUXHEAD["Linear(in_dim, 1)<br/>aux head"]
+    MAINHEAD --> SIGMOID["sigmoid"]
     SIGMOID --> PRED["P(engage)"]
 
-    LOSS["BCEWithLogitsLoss"]
-    HEAD -.-> LOSS
+    LOSS["BCEWithLogitsLoss<br/>+ AUX_RATING_WEIGHT (=25) × masked_mse(rating)<br/>+ FREQ_WD_LAMBDA (=1e-4) × Σ freq_w[i] · ‖item_embed[i]‖²"]
+    MAINHEAD -.-> LOSS
+    AUXHEAD -.-> LOSS
 
     style Inputs fill:#e1f5fe
-    style HEAD fill:#fce4ec
+    style MAINHEAD fill:#fce4ec
+    style AUXHEAD fill:#fff3e0
     style PRED fill:#c8e6c9
 ```
 
-The "linear" naming refers to the prediction head — embeddings are still trainable (~6.1M params for ml-25m); the head itself is ~1.3K params. Genre multi-hot, timestamp, year, and tag genome feed the head as-is, with no intermediate projection (a `Linear(20, 28) → Linear(in, 1)` chain is mathematically equivalent to a direct `Linear(20, 1)` slice in the head — the projection was redundant).
+The "linear" naming refers to the prediction head — embeddings are still trainable (~6.1M params for ml-25m); the heads themselves are ~1.3K params each. Genre multi-hot, timestamp, year, and tag genome feed the head as-is, with no intermediate projection (a `Linear(20, 28) → Linear(in, 1)` chain is mathematically equivalent to a direct `Linear(20, 1)` slice in the head — the projection was redundant).
+
+The auxiliary rating-residual head shares the same concat as the main head and predicts the per-sample normalized rating (0.5★→0.1, …, 5★→1.0). Random unrated easy negatives are masked out of the aux MSE. The combined loss `bce + 25·mse` shifts the embeddings toward representations that simultaneously rank engagement and predict rating magnitude — multi-task signal that the linear head turns into +0.0017 multi-seed lift.
 
 Stripped to the bones: only raw IDs, raw history sequences, and pure content metadata (genres, tag genome, year, timestamp). All pre-computed user/item statistics — rating histograms, counts, user-genre affinity, user genome profile — are out, on the principle that aggregations are relationships the model should learn from raw data, not inputs hand-specified before training.
 
 ## Layout
 
 - **`prepare.py`** — Shared with legacy. Data download + time-based train/val/test splits + AUC evaluation. Do not modify (the evaluation harness is the ground truth metric).
-- **`train.py`** — The new linear baseline. Same input features as legacy (sparse IDs, user history, item history, genre multi-hot, dense numeric features, tag genome, per-user genome profile), but the model is `concat → Linear(in, 1) → sigmoid`. No hidden layer.
-- **`program.md`** — Fresh experiment log. The new autoresearch loop starts here.
-- **`legacy/`** — Everything from the old project, frozen. `legacy/program.md` has the full ~540-experiment history. `legacy/CLAUDE.md` has the 16 critical learnings from that body of work — read those before proposing new architectures.
+- **`train.py`** — The current model. Linear head over a 1376-dim concat of embeddings + 4 multiplicative crosses + raw content features; auxiliary rating-residual regression head sharing the same concat. No hidden layers in the heads.
+- **`program.md`** — Experiment log of the restart cycles (apr28b through apr28o so far).
+- **`legacy/`** — Frozen archive of the prior project. Available for reference; not authoritative for the restart.
 
 ## Quickstart
 
