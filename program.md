@@ -47,6 +47,26 @@ Brief notes on cycles run on the restart. Detailed per-trial data lives in `resu
 
 Legacy DLRM ceiling: 0.8284. Restart linear-head model now within 0.0002 of legacy with much simpler architecture.
 
+### `autoresearch/apr28p` — DCN/DCNv2/DCNv3 cross network — null
+
+**Null** (`73d4262`). The Researcher noticed our concat already includes 4 manual Hadamard crosses (`u_e⊙i_e`, `u_hist_pool⊙i_e`, `i_hist_pool⊙u_e`, `ts_norm⊙i_e`) and proposed a DCN cross network on the 4-field 112-d stack to learn higher-order interactions automatically. Critic vetted; pre-screen 5-cell sweep on ml-25m at SEED=42 (vs 0.828188 baseline):
+
+| Cell | val_auc | Δ |
+|---|---|---|
+| dcnv2 r=4 add | 0.821182 | -0.0070 |
+| dcnv2 r=8 replace | 0.819523 | -0.0087 |
+| dcnv3 r=8 add | 0.819242 | -0.0089 |
+| dcnv2 r=8 add | 0.816820 | -0.0114 |
+| dcnv2 r=16 add | 0.816032 | -0.0122 |
+
+All cells regress; higher rank → worse; replace mode (strips manual crosses) is no better than smaller-rank add — the manual crosses are net positive on top of even the best DCN cell. dcnv3's gate dampens but doesn't reverse harm.
+
+**Implementation note** — initial sweep at `5edbff5` returned exact 0.827536 across all three low-rank cells (gradient-flow bug). Root cause: low-rank `W = U V^T` had **both** U.weight and V.weight zero-initialized. Then `∂loss/∂U = (∂loss/∂y)·V(x) = 0` (because V(x)=0 with V=0) **and** `∂loss/∂V = U^T·(∂loss/∂y) = 0` (because U=0). Adam never moved either; cross stayed at the passthrough identity forever.
+
+Fix at `73d4262`: keep V at default kaiming-uniform; zero only U.weight and U.bias. Then `y = U(V(x)) = 0` at step 0 (passthrough preserved), but `∂loss/∂U = V(x) ≠ 0` (V is random non-zero), so Adam moves U. After step 1, U≠0 makes `∂loss/∂V` non-zero too. Validator confirmed: ml-100k rank-distinctness test produces 4 distinct val_auc across r∈{4,8,16} and dcnv3 r=8, all > off-state — gradients flow.
+
+**Lesson:** when the baseline already includes hand-tuned Hadamard crosses on the natural pairs (user × item, user × item-history, item × user-history, ts × item), a parametric DCN cross over the same 4-field stack is redundant capacity that the linear head can't exploit. The linear-head + manual-cross combination saturates this 4-field interaction space.
+
 ### `autoresearch/apr28o` — sub-noise stacking win
 
 **Win** (`b983125`). Three individually sub-threshold mechanisms compound super-additively:

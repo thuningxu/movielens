@@ -1,0 +1,7 @@
+[
+  {"name": "dcnv2_r8_add_s42", "env": {"DCN_FIELD_LAYERS": "1", "DCN_FIELD_RANK": "8"}},
+  {"name": "dcnv2_r4_add_s42", "env": {"DCN_FIELD_LAYERS": "1", "DCN_FIELD_RANK": "4"}},
+  {"name": "dcnv2_r16_add_s42", "env": {"DCN_FIELD_LAYERS": "1", "DCN_FIELD_RANK": "16"}},
+  {"name": "dcnv3_r8_add_s42", "env": {"DCN_FIELD_LAYERS": "1", "DCN_FIELD_RANK": "8", "DCN_FIELD_VARIANT": "dcnv3"}},
+  {"name": "dcnv2_r8_replace_s42", "env": {"DCN_FIELD_LAYERS": "1", "DCN_FIELD_RANK": "8", "DCN_FIELD_REPLACE_MANUAL": "1"}}
+]
