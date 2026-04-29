@@ -68,8 +68,12 @@ grep "^val_auc:\|^peak_memory_mb:" run.log
 - timestamp_norm                                  → ts (1)
 - movie_year                                      → year (1)
 - Tag genome (1128, raw)                          → genome (1128)
+- Cross fields (CROSS_FIELDS=1, default on):
+    u_e ⊙ i_e                                      → cross_ui (28)
+    u_hist_pool ⊙ i_e                              → cross_uhist_item (28)
+    i_hist_pool ⊙ u_e                              → cross_ihist_user (28)
 
-concat → Linear(in_dim, 1) → sigmoid    # in_dim = 4*28 + 20 + 4 + 1128 = 1264 (ml-25m)
+concat → Linear(in_dim, 1) → sigmoid    # in_dim = 1264 + 84 = 1348 (ml-25m, with default cross fields)
 
 Loss: BCEWithLogitsLoss
 Optimizer: Adam, lr=1e-3, weight_decay=1e-5

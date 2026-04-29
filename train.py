@@ -87,7 +87,7 @@ ITEM_HIST_DECAY_INIT = float(os.environ.get("ITEM_HIST_DECAY_INIT", "-10.0"))
 #   cross_uhist_item  = u_hist_pool * i_e           (28-d)
 #   cross_ihist_user  = i_hist_pool * u_e           (28-d)
 # Off-state (default 0): no extra fields, no head widening — byte-equivalent.
-CROSS_FIELDS = int(os.environ.get("CROSS_FIELDS", "0"))
+CROSS_FIELDS = int(os.environ.get("CROSS_FIELDS", "1"))
 
 # Optional MLP prediction head replacing the default Linear(in, 1):
 #   Linear(in, MLP_HIDDEN) -> ReLU -> Dropout(MLP_HEAD_DROPOUT) -> Linear(MLP_HIDDEN, 1)

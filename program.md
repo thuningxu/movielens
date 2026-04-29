@@ -34,6 +34,25 @@ Operating rules:
 
 Brief notes on cycles run on the restart. Detailed per-trial data lives in `results.tsv` and `sweep_*.log`.
 
+### `autoresearch/apr28b` — multiplicative cross fields cycle
+
+Started from the apr28 baseline (0.824570). Researcher + Critic debated the backlog over 4 rounds and converged on a joint 2×2 sweep: cross fields × MLP head.
+
+**Win — cross fields with Linear head** (commit on this branch). Three Hadamard cross-feature vectors appended to the concat:
+- `u_e ⊙ i_e` (28-d): user × item embedding
+- `u_hist_pool ⊙ i_e` (28-d): user-history pool × item
+- `i_hist_pool ⊙ u_e` (28-d): item-history pool × user
+
+The linear head literally cannot represent multiplicative interactions; these crosses give it that capability for free (no new learnable params, just +84 dims to the head's input).
+
+5-seed multi-seed verification (SEED 42-46):
+- Cell A baseline: 0.824510 mean
+- Cell B (Linear + cross): 0.825234 mean → **mean lift +0.000724, 5/5 positive, min +0.000334** (just clears the +0.0007 bar at ~7σ above noise floor σ ≈ 0.0001)
+- Cell C (MLP head, no cross): -0.0098 mean — **catastrophic overfit at default HP** (HIDDEN=128, dropout=0.2). Training stops at ~67s vs 200s baseline.
+- Cell D (MLP + cross): -0.0136 mean — worse than C; cross fields compound the MLP's overfit.
+
+MLP head is a viable direction but requires HP tuning (smaller hidden width, more dropout, or head-only LR) — deferred to a follow-up cycle.
+
 ### `autoresearch/apr28` — history-aggregation cycle
 
 Starting baseline (post-scaffold, post-stripping, post-genre-projection drop): **val_auc = 0.821875** at SEED=42 with mean-pool over user/item history.

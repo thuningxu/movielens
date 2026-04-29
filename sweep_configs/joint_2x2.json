@@ -1,0 +1,21 @@
+[
+  {"name": "sanity_baseline_s42", "env": {}},
+
+  {"name": "cellB_cross_s42", "env": {"CROSS_FIELDS": "1"}},
+  {"name": "cellB_cross_s43", "env": {"CROSS_FIELDS": "1", "SEED": "43"}},
+  {"name": "cellB_cross_s44", "env": {"CROSS_FIELDS": "1", "SEED": "44"}},
+  {"name": "cellB_cross_s45", "env": {"CROSS_FIELDS": "1", "SEED": "45"}},
+  {"name": "cellB_cross_s46", "env": {"CROSS_FIELDS": "1", "SEED": "46"}},
+
+  {"name": "cellC_mlp_s42", "env": {"MLP_HEAD": "1"}},
+  {"name": "cellC_mlp_s43", "env": {"MLP_HEAD": "1", "SEED": "43"}},
+  {"name": "cellC_mlp_s44", "env": {"MLP_HEAD": "1", "SEED": "44"}},
+  {"name": "cellC_mlp_s45", "env": {"MLP_HEAD": "1", "SEED": "45"}},
+  {"name": "cellC_mlp_s46", "env": {"MLP_HEAD": "1", "SEED": "46"}},
+
+  {"name": "cellD_both_s42", "env": {"CROSS_FIELDS": "1", "MLP_HEAD": "1"}},
+  {"name": "cellD_both_s43", "env": {"CROSS_FIELDS": "1", "MLP_HEAD": "1", "SEED": "43"}},
+  {"name": "cellD_both_s44", "env": {"CROSS_FIELDS": "1", "MLP_HEAD": "1", "SEED": "44"}},
+  {"name": "cellD_both_s45", "env": {"CROSS_FIELDS": "1", "MLP_HEAD": "1", "SEED": "45"}},
+  {"name": "cellD_both_s46", "env": {"CROSS_FIELDS": "1", "MLP_HEAD": "1", "SEED": "46"}}
+]

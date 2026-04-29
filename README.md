@@ -42,7 +42,16 @@ graph TD
         IHIST --> IHR["mean rating → 1"]
     end
 
-    UE --> CONCAT["concat<br/>(in_dim = 1264 for ml-25m)"]
+    subgraph "Multiplicative crosses (no params)"
+        UE -.-> CR1["u_e ⊙ i_e → 28"]
+        IE -.-> CR1
+        UHP -.-> CR2["u_hist_pool ⊙ i_e → 28"]
+        IE -.-> CR2
+        IHP -.-> CR3["i_hist_pool ⊙ u_e → 28"]
+        UE -.-> CR3
+    end
+
+    UE --> CONCAT["concat<br/>(in_dim = 1348 for ml-25m)"]
     IE --> CONCAT
     UHP --> CONCAT
     UHR --> CONCAT
@@ -52,6 +61,9 @@ graph TD
     TS --> CONCAT
     YEAR --> CONCAT
     GENOME --> CONCAT
+    CR1 --> CONCAT
+    CR2 --> CONCAT
+    CR3 --> CONCAT
 
     CONCAT --> HEAD["Linear(in_dim, 1)"]
     HEAD --> SIGMOID["sigmoid"]
@@ -99,4 +111,6 @@ DATASET=ml-25m uv run python train.py
 - The 16 architectural-cycle's worth of dropouts, gates, residuals, and conditional flags
 - Anything in `legacy/train.py` past the feature-engineering section
 
-Current baseline AUC: **0.8246 on ml-25m** (deterministic, SEED=42; 5-seed mean +0.00258 over the prior 0.8219 mean-pool baseline). Reached by switching both user-history and item-history pools from a plain mean to a rating-centered weighted pool (`weight = (rating - 0.6) * is_valid`, normalize by sum-of-absolute-weights): items rated above 3 stars push the pool *toward* their embedding, items below 3 stars push *away*. No new params, no new layers — just a different aggregator.
+Current baseline AUC: **0.8251 on ml-25m** (deterministic, SEED=42; 5-seed mean +0.00072 over the prior 0.8246 centered-pool baseline). Reached by appending three multiplicative cross-feature fields to the concat: `u_e ⊙ i_e`, `u_hist_pool ⊙ i_e`, `i_hist_pool ⊙ u_e` — Hadamard products that the linear head literally cannot synthesize on its own. No new learnable parameters; the head's `Linear(in_dim, 1)` just widens by 84 input dims.
+
+The prior centered-pool baseline (0.8246) reached its win by switching user-history and item-history pools from plain mean to a rating-centered weighted pool (`weight = (rating - 0.6) * is_valid`, normalize by sum-of-absolute-weights): items rated above 3 stars push the pool *toward* their embedding, items below 3 stars push *away*. Both wins (centered pool + cross fields) are pure aggregator/feature changes, no new layers.
