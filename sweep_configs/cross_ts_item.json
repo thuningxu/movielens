@@ -1,0 +1,7 @@
+[
+  {"name": "ts_item_s42", "env": {"CROSS_TS_ITEM": "1"}},
+  {"name": "ts_item_s43", "env": {"CROSS_TS_ITEM": "1", "SEED": "43"}},
+  {"name": "ts_item_s44", "env": {"CROSS_TS_ITEM": "1", "SEED": "44"}},
+  {"name": "ts_item_s45", "env": {"CROSS_TS_ITEM": "1", "SEED": "45"}},
+  {"name": "ts_item_s46", "env": {"CROSS_TS_ITEM": "1", "SEED": "46"}}
+]
