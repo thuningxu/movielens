@@ -62,8 +62,12 @@ MAX_EPOCHS = int(os.environ.get("MAX_EPOCHS", "20"))
 # History pooling modes (mean is the byte-equivalent default).
 USER_HIST_POOL = os.environ.get("USER_HIST_POOL", "rating_centered")
 ITEM_HIST_POOL = os.environ.get("ITEM_HIST_POOL", "rating_centered")
-assert USER_HIST_POOL in {"mean", "rating", "rating_centered"}, USER_HIST_POOL
+assert USER_HIST_POOL in {"mean", "rating", "rating_centered", "din"}, USER_HIST_POOL
 assert ITEM_HIST_POOL in {"mean", "rating", "rating_centered"}, ITEM_HIST_POOL
+
+# DIN (Deep Interest Network) target-aware attention hidden size, only used when
+# USER_HIST_POOL='din'. Off-state (default rating_centered): no module constructed.
+DIN_ATTN_HIDDEN = int(os.environ.get("DIN_ATTN_HIDDEN", "64"))
 
 # Optional add-on fields (each appends one D-dim field to the concat).
 USER_HIST_DISLIKE_POOL = int(os.environ.get("USER_HIST_DISLIKE_POOL", "0"))
@@ -348,19 +352,24 @@ log.info(f"Eval set: {_n_val_pos} pos + {len(_val_hard_neg)} hard neg + {_n_val_
 # ═══════════════════════════════════════════════════════════════════
 
 def _pool_history(embed, ratings, valid, mode,
-                  decay_theta=None, sample_ts=None, hist_ts=None, ts_range=None):
+                  decay_theta=None, sample_ts=None, hist_ts=None, ts_range=None,
+                  din_module=None, target_embed=None):
     """Pool a (B, L, D) embedding sequence over valid positions.
 
     embed:   (B, L, D)
     ratings: (B, L)       — already normalized to [0, 1] (rating / 5.0)
     valid:   (B, L)       — float, 1.0 for non-PAD, 0.0 for PAD
-    mode: 'mean' | 'rating' | 'rating_centered'
+    mode: 'mean' | 'rating' | 'rating_centered' | 'din'
 
     Optional decay (only valid with mode='rating_centered'):
       decay_theta: scalar nn.Parameter; rate = softplus(theta) >= 0.
       sample_ts:   (B,)   raw per-sample timestamp (int64 or float).
       hist_ts:     (B, L) raw per-position history timestamp (int32/float).
       ts_range:    scalar, denominator for normalizing time gaps.
+
+    Required for mode='din':
+      din_module:    nn.Sequential mapping (B, L, 3*D) -> (B, L, 1) attention scores.
+      target_embed:  (B, D) — target item embedding used as the DIN query.
 
     Returns (B, D).
     """
@@ -386,6 +395,30 @@ def _pool_history(embed, ratings, valid, mode,
         w_e = w.unsqueeze(-1)
         denom = w.abs().sum(dim=1, keepdim=True).clamp(min=1e-6)
         return (embed * w_e).sum(dim=1) / denom
+    if mode == "din":
+        # Target-aware attention pool. Per-position features are
+        # [hist_l, target, hist_l * target]; an MLP scores each position;
+        # PAD positions get -inf score; softmax over L gives attention weights.
+        assert din_module is not None and target_embed is not None, \
+            "DIN pool requires din_module and target_embed"
+        B, L, D = embed.shape
+        tgt = target_embed.unsqueeze(1).expand(B, L, D)               # (B, L, D)
+        attn_in = torch.cat([embed, tgt, embed * tgt], dim=-1)        # (B, L, 3*D)
+        scores = din_module(attn_in).squeeze(-1)                      # (B, L)
+        # Mask PAD positions to -inf so softmax assigns them zero weight.
+        neg_inf = torch.finfo(scores.dtype).min
+        scores = scores.masked_fill(valid < 0.5, neg_inf)
+        # If a row has zero valid positions (all PAD), softmax of all -inf produces NaN.
+        # Detect and zero those rows after the weighted sum.
+        any_valid = (valid.sum(dim=1) > 0).float().unsqueeze(-1)      # (B, 1)
+        # Replace fully-invalid rows with a uniform 0 score before softmax to avoid NaN.
+        all_pad_mask = any_valid.squeeze(-1) < 0.5                    # (B,)
+        if all_pad_mask.any():
+            scores = torch.where(all_pad_mask.unsqueeze(-1),
+                                 torch.zeros_like(scores), scores)
+        attn = torch.softmax(scores, dim=1)                           # (B, L)
+        pooled = (embed * attn.unsqueeze(-1)).sum(dim=1)              # (B, D)
+        return pooled * any_valid
     raise ValueError(f"Unknown pool mode: {mode}")
 
 
@@ -440,6 +473,16 @@ class LinearBaseline(nn.Module):
         if ITEM_HIST_DECAY:
             self.item_decay_theta = nn.Parameter(torch.tensor(ITEM_HIST_DECAY_INIT))
 
+        # Optional DIN target-aware attention MLP for user history pooling.
+        # Constructed AFTER head/decay so the off-state RNG sequence is byte-identical.
+        # Only allocated when USER_HIST_POOL == 'din' — at off-state no module exists.
+        if USER_HIST_POOL == "din":
+            self.user_din_attn = nn.Sequential(
+                nn.Linear(3 * D, DIN_ATTN_HIDDEN),
+                nn.ReLU(),
+                nn.Linear(DIN_ATTN_HIDDEN, 1),
+            )
+
     def forward(self, uids, mids, ts, ts_raw=None):
         u_e = self.user_embed(uids)
         i_e = self.item_embed(mids)
@@ -456,6 +499,10 @@ class LinearBaseline(nn.Module):
                 u_hist_e, u_hist_rat, u_valid, USER_HIST_POOL,
                 decay_theta=self.user_decay_theta,
                 sample_ts=ts_raw, hist_ts=u_hist_ts, ts_range=ts_range)
+        elif USER_HIST_POOL == "din":
+            u_hist_pool = _pool_history(
+                u_hist_e, u_hist_rat, u_valid, USER_HIST_POOL,
+                din_module=self.user_din_attn, target_embed=i_e)
         else:
             u_hist_pool = _pool_history(u_hist_e, u_hist_rat, u_valid, USER_HIST_POOL)
         u_hist_rat_mean = (u_hist_rat * u_valid).sum(dim=1) / u_count
