@@ -93,7 +93,7 @@ Stripped to the bones: only raw IDs, raw history sequences, and pure content met
 
 - **`prepare.py`** — Shared with legacy. Data download + time-based train/val/test splits + AUC evaluation. Do not modify (the evaluation harness is the ground truth metric).
 - **`train.py`** — The current model. Linear head over a 1376-dim concat of embeddings + 4 multiplicative crosses + raw content features; auxiliary rating-residual regression head sharing the same concat. No hidden layers in the heads.
-- **`program.md`** — Experiment log of the restart cycles (apr28b through apr28o so far).
+- **`program.md`** — Experiment log of the restart cycles (apr28b through apr28x so far).
 - **`legacy/`** — Frozen archive of the prior project. Available for reference; not authoritative for the restart.
 
 ## Quickstart

@@ -12,7 +12,7 @@ The prior project (see `legacy/`) reached val_auc = 0.8284 on ml-25m via several
 - **`prepare.py`**: do not modify (`evaluate()` is the ground-truth metric).
 - **`train.py`**: the experimentation file. Currently the linear baseline; will grow.
 - **Multi-seed discipline**: estimate the seed-noise floor empirically before declaring any win. A few baseline seeds give you σ; require multi-seed verification with mean lift comfortably above that floor and a positive sign at every seed.
-- **Feature cache**: `data/features_<hash>.npz` is built on first ml-25m run and reused. Cache key is `restart-3` (includes per-position `hist_ts` plus per-item training-positive count for `FREQ_WD_LAMBDA`).
+- **Feature cache**: `data/features_<hash>.npz` is built on first ml-25m run and reused. Cache key is `restart-5` (`restart-3` added per-item training-positive count; `restart-4` added per-user genome aggregate; `restart-5` added per-user count + per-user genre affinity).
 
 ## Current operating mode (autonomous loop)
 
