@@ -1,0 +1,5 @@
+[
+  {"name": "aux3p0_s42", "env": {"AUX_RATING_WEIGHT": "3.0"}},
+  {"name": "aux5p0_s42", "env": {"AUX_RATING_WEIGHT": "5.0"}},
+  {"name": "aux10p0_s42", "env": {"AUX_RATING_WEIGHT": "10.0"}}
+]

@@ -1,0 +1,7 @@
+[
+  {"name": "aux0p05_s42", "env": {"AUX_RATING_WEIGHT": "0.05"}},
+  {"name": "aux0p1_s42", "env": {"AUX_RATING_WEIGHT": "0.1"}},
+  {"name": "aux0p5_s42", "env": {"AUX_RATING_WEIGHT": "0.5"}},
+  {"name": "aux1p0_s42", "env": {"AUX_RATING_WEIGHT": "1.0"}},
+  {"name": "aux2p0_s42", "env": {"AUX_RATING_WEIGHT": "2.0"}}
+]
