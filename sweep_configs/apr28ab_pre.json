@@ -1,0 +1,4 @@
+[
+  {"name": "ab_a_p05_s42", "env": {"COLD_CROSS_FIELDS": "i_e,genre", "WARM_MASK_P": "0.5", "WARM_GATED_UHIST": "1"}},
+  {"name": "ab_b_p03_s42", "env": {"COLD_CROSS_FIELDS": "i_e,genre", "WARM_MASK_P": "0.3", "WARM_GATED_UHIST": "1"}}
+]

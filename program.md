@@ -47,6 +47,39 @@ Brief notes on cycles run on the restart. Detailed per-trial data lives in `resu
 
 Legacy DLRM ceiling: 0.8284. Restart linear-head model now within 0.0002 of legacy with much simpler architecture.
 
+### `autoresearch/apr28ab` — routed cold-start MoE → dedicated cold-user model — null
+
+**Null** (`15b789b`). User proposed a routed mixture-of-experts: 4 separate models (warm + 3 cold variants) with eval-time routing by (user-in-train, item-in-train) stratum. Researcher/Critic 3-round debate refactored to single-model alternative: `is_cold_user × {i_e, genre}` conditional cross fields + `(1−is_cold) × u_hist_pool ⊙ i_e` warm-gated cross + stochastic warm-row masking during training (probability `WARM_MASK_P`).
+
+Pre-screen at SEED=42 (vs 0.828188):
+
+| Cell | val_auc | Δ |
+|---|---|---|
+| ab_a (p=0.5) | 0.827884 | -0.000304 |
+| ab_b (p=0.3) | 0.828414 | +0.000226 |
+
+Best cell B at +0.000226 — below +0.0007 threshold. Critic-predicted Simpson's paradox didn't materialize on ml-25m (warm stratum essentially flat at 0.803, cold_user also flat at 0.787). The conditional crosses don't extract more cold_user signal than the existing unconditional fields already do.
+
+**User then proposed** (correctly diagnosing shared-weight issues in the MoE): "train a dedicated cold user model and only evaluate it on cold users to see if there is lift." Implemented as `WARM_MASK_P=1.0` (mask 100% of warm training rows to cold-mode → model effectively trained as a content-only predictor).
+
+| Stratum | Dedicated cold (WARM_MASK_P=1.0) | Current full model |
+|---|---|---|
+| warm | 0.761738 | 0.802936 (-0.041, expected) |
+| **cold_user** | **0.787986** | **0.787036 (+0.0009 = noise)** |
+| cold_item | 0.842250 | 0.870221 (-0.028) |
+| cold_both | 0.905374 | 0.905583 (~zero) |
+
+**The dedicated cold model gives essentially identical cold_user AUC to the current model.** +0.0009 is within seed noise.
+
+**Lesson**: The current model is NOT wasting signal on cold rows. Its predictions for OOV users are already approximately what a dedicated content-only model would produce. The cold_user AUC ceiling at 0.787 is the **content-only fundamental limit** at this representation, not an architectural artifact. Routing can't break it.
+
+To improve cold_user AUC beyond 0.787, we'd need:
+- New input features (IMDB plot text, demographics)
+- Structurally richer item representation (transformer-based content encoder)
+- Inductive user bootstrapping (val-time history rebuild — real-deployment-time mechanism)
+
+**13 nulls now (apr28p-ab). Final apr28-restart baseline: 0.828188.**
+
 ### `autoresearch/apr28aa` — legacy recency port + anon-user fallback + OOV decomp — null
 
 **Null** (`cba61f2`). User-prompted exploration sequence after noticing two underexplored ideas: legacy's "fewer + more recent" trick (program.md learning #15: +0.00108 5-seed mean), and the cold-start problem (70.59% of ml-25m val users are OOV; 82.89% of val ratings touch an OOV user). Researcher/Critic 3-round debate converged on a 5-cell concurrent batch testing both mechanisms.
