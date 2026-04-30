@@ -1,0 +1,4 @@
+[
+  {"name": "tag_text_baseline_s42", "env": {}},
+  {"name": "tag_text_on_s42",       "env": {"MOVIE_TAG_TEXT": "1"}}
+]

@@ -47,6 +47,31 @@ Brief notes on cycles run on the restart. Detailed per-trial data lives in `resu
 
 Legacy DLRM ceiling: 0.8284. Restart linear-head model now within 0.0002 of legacy with much simpler architecture.
 
+### `autoresearch/apr28ac` — per-movie tag-text embedding (MiniLM 384-d) — null
+
+**Null** (`0947513`). After apr28ab confirmed cold_user 0.787 is content-only ceiling, user proposed adding new content via tags.csv (1.09M user-applied free-text tags across 45k of 59k rated movies; not used by current model). Encoded each movie's tag bag through `sentence-transformers/all-MiniLM-L6-v2` → 384-d L2-normalized embedding per movie, cached as `movie_tag_embed` (cache version restart-6).
+
+Single-cell pre-screen at SEED=42 (vs 0.828188):
+
+| Cell | val_auc | warm | **cold_user** | cold_item | cold_both |
+|---|---|---|---|---|---|
+| baseline | 0.828188 | 0.8029 | 0.7870 | 0.8702 | 0.9056 |
+| MOVIE_TAG_TEXT=1 | 0.827651 | 0.8019 | **0.7870** | 0.8663 | 0.8997 |
+| Δ | -0.0005 | -0.001 | **+0.000003 (noise)** | -0.004 | -0.006 |
+
+**Cold_user stratum essentially unchanged.** All other strata slightly regress.
+
+**Lesson — DEEPEST cold-start diagnostic so far**: The cold_user 0.787 ceiling is NOT about content quality. It is about the **structural absence of user-side info** for OOV users. For a cold user, we can't relate item content to *this user*; we can only predict "is this item generally appealing." Adding more item content (tags, plot text, etc.) is redundant with the existing 1128-d genome + 20-d genre + i_hist_pool + i_e — they all encode "what this movie is about" and saturate at the same content-only ceiling.
+
+To break 0.787 cold_user, need **USER-side info for cold users**, not better item content:
+- **Inductive user bootstrapping** (val-time history rebuild from val ratings prior to current sample's timestamp) — fundamentally different deployment model that breaks train/eval separation
+- **Demographics** (not in ml-25m; users are de-identified)
+- **Cross-platform identity resolution** (real-world recommender info, not in dataset)
+
+The IMDB plots roadmap (Tier 5 #17, prior 0.40) would face the **same structural limit** — it's still item content. Recommend deferring it; not a useful direction at this representation.
+
+**14 nulls now (apr28p-ac). Final apr28-restart baseline: 0.828188.**
+
 ### `autoresearch/apr28ab` — routed cold-start MoE → dedicated cold-user model — null
 
 **Null** (`15b789b`). User proposed a routed mixture-of-experts: 4 separate models (warm + 3 cold variants) with eval-time routing by (user-in-train, item-in-train) stratum. Researcher/Critic 3-round debate refactored to single-model alternative: `is_cold_user × {i_e, genre}` conditional cross fields + `(1−is_cold) × u_hist_pool ⊙ i_e` warm-gated cross + stochastic warm-row masking during training (probability `WARM_MASK_P`).
