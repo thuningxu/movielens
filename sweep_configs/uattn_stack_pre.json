@@ -1,0 +1,5 @@
+[
+  {"name": "stack_uattn_umean_b65k_s42", "env": {"USER_ATTN": "1", "USER_HIST_MEAN_POOL": "1", "BATCH_SIZE": "65536", "LR": "1.2e-3"}},
+  {"name": "stack_uattn_umean_s42",      "env": {"USER_ATTN": "1", "USER_HIST_MEAN_POOL": "1"}},
+  {"name": "stack_uattn_b65k_s42",       "env": {"USER_ATTN": "1", "BATCH_SIZE": "65536", "LR": "1.2e-3"}}
+]

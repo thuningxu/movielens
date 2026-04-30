@@ -1,0 +1,10 @@
+[
+  {"name": "uattn_a_s42",      "env": {"USER_ATTN": "1"}},
+  {"name": "uattn_b_s42",      "env": {"USER_ATTN": "1", "USER_ATTN_CROSS": "1"}},
+  {"name": "uattn_c_s42",      "env": {"USER_ATTN": "1", "USER_ATTN_RATING_MOD": "1"}},
+  {"name": "udin_par_h16_s42", "env": {"USER_DIN_PARALLEL": "1", "DIN_ATTN_HIDDEN": "16"}},
+  {"name": "udin_par_h32_s42", "env": {"USER_DIN_PARALLEL": "1", "DIN_ATTN_HIDDEN": "32"}},
+  {"name": "idin_par_h16_s42", "env": {"ITEM_DIN_PARALLEL": "1", "DIN_ATTN_HIDDEN": "16"}},
+  {"name": "udin_rep_h8_s42",  "env": {"USER_HIST_POOL": "din", "DIN_ATTN_HIDDEN": "8"}},
+  {"name": "udin_rep_h16_s42", "env": {"USER_HIST_POOL": "din", "DIN_ATTN_HIDDEN": "16"}}
+]

@@ -47,6 +47,55 @@ Brief notes on cycles run on the restart. Detailed per-trial data lives in `resu
 
 Legacy DLRM ceiling: 0.8284. Restart linear-head model now within 0.0002 of legacy with much simpler architecture.
 
+### `autoresearch/apr28z` — all DIN/attention variants — sub-noise null
+
+**Null** (`36896ae`). Per user's "try all DINs" directive, ran 8 cells covering every untested attention/DIN variant: user-side dot-product attention (mirror of apr28y), user-side DIN-MLP-parallel at hidden ∈ {16, 32}, item-side DIN-MLP-parallel, user-side DIN-replace at hidden ∈ {8, 16}, plus rating-modulation and cross variants on user-side dot-product attention.
+
+Pre-screen at SEED=42 (vs 0.828188):
+
+| Cell | val_auc | Δ |
+|---|---|---|
+| **uattn_a** (USER_ATTN=1) | 0.829011 | **+0.000823** |
+| uattn_c (USER_ATTN + RATING_MOD) | 0.828945 | +0.000757 |
+| uattn_b (USER_ATTN + CROSS) | 0.828892 | +0.000704 |
+| idin_par_h16 (item DIN-MLP) | 0.826308 | -0.001880 |
+| udin_rep_h16 (DIN-replace h=16) | 0.825905 | -0.002283 |
+| udin_par_h32 (user DIN-MLP h=32) | 0.823900 | -0.004288 |
+| udin_rep_h8 (DIN-replace h=8) | 0.822800 | -0.005388 |
+| udin_par_h16 (user DIN-MLP h=16) | 0.791600 | **-0.036588** (collapse) |
+
+Three USER_ATTN variants signed single-seed; all DIN-MLP and DIN-replace variants regressed. Pattern confirms apr28r/v/y lessons: parametric capacity adds at the apr28o stack hurt; only zero-param mechanisms can sign.
+
+5-seed verify of cell A (USER_ATTN=1):
+
+| SEED | baseline | uattn_a | lift |
+|---|---|---|---|
+| 42 | 0.828188 | 0.829011 | +0.000823 |
+| 43 | 0.828073 | 0.827671 | -0.000402 |
+| 44 | 0.828024 | 0.828563 | +0.000539 |
+| 45 | 0.828098 | 0.828462 | +0.000364 |
+| 46 | 0.828266 | 0.828509 | +0.000243 |
+
+Mean lift **+0.000313**, 4/5 positive, min **-0.000402**, lift-σ ≈ 0.000455. Below all three multi-seed bars (mean ≥ +0.0007, 5/5 positive, min ≥ -0.0003). Same RNG-collapse shape as apr28q (+0.000188 mean) and apr28w (+0.000123 mean), but largest sub-noise mean of any single mechanism in 11 cycles.
+
+**Stacking attempt** (apr28o-style super-additive): tested USER_ATTN with USER_HIST_MEAN_POOL (+0.000188 sub-noise from apr28q) and b65k_lr12e4 (+0.000123 sub-noise from apr28w):
+
+| Stack | single-seed Δ | vs USER_ATTN alone |
+|---|---|---|
+| USER_ATTN + UHMP | +0.000715 | -0.000108 (UHMP aliases) |
+| USER_ATTN + b65k_lr12e4 | +0.000245 | -0.000578 (b65k hurts) |
+| triple (all three) | +0.000020 | -0.000803 (collapse) |
+
+**No super-additivity.** UHMP aliases USER_ATTN (both pool over u_hist_e); large-batch + large-LR actively interferes with USER_ATTN's gradient flow. The apr28o stacking trick does NOT generalize — the apr28o components were structurally orthogonal (CROSS_TS_ITEM = new field, FREQ_WD_LAMBDA = regularization, AUX_RATING_WEIGHT = parallel objective); the apr28z candidates are all in similar mechanism families and interfere.
+
+**Lessons**:
+- USER_ATTN extracts a real but small signal (+0.000313 mean) at L=100 user history, where the existing diagonal cross misses non-linear similarity reweighting.
+- Item-side dot-product attention (apr28y) is null — IL=30 history is short enough that the existing cross saturates the available signal.
+- DIN with MLP scoring catastrophically fails at the apr28o stack (parametric capacity replay of apr28r/v).
+- The apr28o sub-noise stacking trick works only for orthogonal mechanism families; it does NOT generalize to multiple aggregator-side adds.
+
+**Final apr28-restart baseline: 0.828188.** No cycle has cleared the multi-seed bar since apr28o.
+
 ### `autoresearch/apr28y` — item-side target-aware attention — null
 
 **Null** (`95d0eb1`). User raised the structural concern that the item-history pool throws away an obvious signal: rater weights are unconditioned by user-rater similarity. Existing `i_hist_pool ⊙ u_e` cross gives the linear head `Σ_k w_k · ⟨a ⊙ u_e, rater_k⟩` (linear functional of per-rater similarities, weighted by rating-centered weight). Target attention would add user-conditional **non-linear** softmax reweighting on similarity.
