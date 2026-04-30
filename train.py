@@ -257,6 +257,19 @@ INCR_TUNE_MAX_PRIOR = int(os.environ.get("INCR_TUNE_MAX_PRIOR", "100"))  # cap p
 # methodology as val dynamic-history). Single-shot run; no iteration on test.
 RUN_TEST = int(os.environ.get("RUN_TEST", "0"))
 
+# apr28ak (a): recency decay on the dynamic-eval-history pool weights.
+# When alpha > 0 AND EVAL_DYNAMIC_HIST=1 AND eval-time, multiplies the rating-
+# centered weight by exp(-alpha * (sample_ts - hist_ts) / ts_range) — most-recent
+# val items dominate the pool. Eval-only; training uses static histories
+# unchanged. Off-state (default 0.0): byte-equivalent.
+EVAL_HIST_DECAY_ALPHA = float(os.environ.get("EVAL_HIST_DECAY_ALPHA", "0.0"))
+
+# apr28ak (c): per-movie log-popularity scalar appended to concat. Computed
+# from item_count (training-positive count). New users tend to rate popular
+# movies first; explicit popularity may help cold_user_later.
+# Off-state (default 0): no field appended; byte-equivalent.
+POPULARITY_PRIOR = int(os.environ.get("POPULARITY_PRIOR", "0"))
+
 # ─── Device ────────────────────────────────────────────────────────
 torch.manual_seed(SEED)
 if torch.cuda.is_available():
@@ -650,6 +663,14 @@ _user_freq_weight_t = torch.from_numpy(
     1.0 / np.sqrt(np.asarray(user_count, dtype=np.float32) + 5.0)
 ).to(DEVICE)
 
+# apr28ak (c): per-movie log-popularity scalar. Normalized by max count so the
+# field is in [0, 1]. PAD row (index num_items) has count=0 → log(1)/log(...)=0.
+_item_count_arr = np.asarray(item_count, dtype=np.float32)
+_max_count = max(float(_item_count_arr.max()), 1.0)
+_movie_popularity_t = torch.from_numpy(
+    np.log1p(_item_count_arr) / np.log1p(_max_count)
+).to(DEVICE).float()
+
 # Per-user "in train" boolean for is_cold_user lookup (apr28ab). Built from
 # the (post-recency-filter) training set: a uid is "in train" iff it has at
 # least one real rating in train_df. PAD row at index num_users is False (cold).
@@ -1021,6 +1042,9 @@ class LinearBaseline(nn.Module):
         # apr28ac per-movie tag-text embedding (384-d).
         if MOVIE_TAG_TEXT:
             in_dim_total += MOVIE_TAG_TEXT_DIM
+        # apr28ak (c): per-movie log-popularity scalar (1-d field).
+        if POPULARITY_PRIOR:
+            in_dim_total += 1
         self.in_dim = in_dim_total
         # Head: either the default Linear(in, 1) or a 1-hidden-layer MLP. The replacement
         # happens at the SAME __init__ point so any downstream RNG draws are unchanged at
@@ -1095,6 +1119,18 @@ class LinearBaseline(nn.Module):
             u_hist_rat = _user_hist_rat_t[uids]               # (B, L)
         u_hist_e = self.item_embed(u_hist)                # (B, L, D)
         u_valid = (u_hist != PAD_IDX).float()             # (B, L)
+        # apr28ak (a): recency decay on dynamic-eval-history weights. Multiplies
+        # u_valid (the weight-modulator) by exp(-alpha * Δt / ts_range), so most-
+        # recent val items dominate the rating-centered pool. Eval-time only.
+        if (EVAL_HIST_DECAY_ALPHA > 0.0
+                and (not self.training)
+                and hist_idx is not None
+                and EVAL_DYNAMIC_HIST):
+            _u_hist_ts_decay = _eval_user_hist_ts_t[hist_idx]                  # (B, L) int32
+            _sample_ts_b = ts_raw.unsqueeze(-1).float()                        # (B, 1)
+            _delta_t = (_sample_ts_b - _u_hist_ts_decay.float()).clamp(min=0.0) / ts_range
+            _decay = torch.exp(-EVAL_HIST_DECAY_ALPHA * _delta_t)              # (B, L)
+            u_valid = u_valid * _decay
         u_count = u_valid.sum(dim=1).clamp(min=1.0)       # (B,)
         # Anonymous-user fallback: replace u_e with anon_user_embed for samples
         # whose user has empty training history (cold-start). Blend AS EARLY AS
@@ -1231,6 +1267,9 @@ class LinearBaseline(nn.Module):
         # apr28ac per-movie tag-text embedding (384-d, all-MiniLM-L6-v2).
         if MOVIE_TAG_TEXT:
             parts.append(_movie_tag_embed_t[mids])                    # (B, 384)
+        # apr28ak (c): per-movie log-popularity scalar.
+        if POPULARITY_PRIOR:
+            parts.append(_movie_popularity_t[mids].unsqueeze(-1))     # (B, 1)
         # apr28ab cold-conditional cross fields. Each is `is_cold_user × <field>`.
         # Cold rows get the field's value; warm rows get zero. The head learns
         # cold-mode-specific weights for these fields without sharing with
