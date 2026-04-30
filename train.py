@@ -1451,6 +1451,14 @@ if INCR_TUNE_LR > 0.0:
                 _logits = _out[0] if isinstance(_out, tuple) else _out
                 _loss = _ft_loss_fn(_logits, _bl)
                 _loss.backward()
+                # Block cross-user gradient leakage via i_hist_e (Validator flag).
+                # Forward path's i_hist_e = self.user_embed(i_hist) means raters
+                # of items in this batch receive gradient too. We want only the
+                # SUPERVISED users' embedding rows to update.
+                if model.user_embed.weight.grad is not None:
+                    _supervised = torch.zeros(num_users + 1, device=DEVICE, dtype=torch.bool)
+                    _supervised[_bu] = True
+                    model.user_embed.weight.grad[~_supervised] = 0
                 _ft_optim.step()
                 _step_loss += float(_loss.item()) * (_e - _s)
                 _step_n += (_e - _s)
