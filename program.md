@@ -47,6 +47,31 @@ Brief notes on cycles run on the restart. Detailed per-trial data lives in `resu
 
 Legacy DLRM ceiling: 0.8284. Restart linear-head model now within 0.0002 of legacy with much simpler architecture.
 
+### `autoresearch/apr28y` — item-side target-aware attention — null
+
+**Null** (`95d0eb1`). User raised the structural concern that the item-history pool throws away an obvious signal: rater weights are unconditioned by user-rater similarity. Existing `i_hist_pool ⊙ u_e` cross gives the linear head `Σ_k w_k · ⟨a ⊙ u_e, rater_k⟩` (linear functional of per-rater similarities, weighted by rating-centered weight). Target attention would add user-conditional **non-linear** softmax reweighting on similarity.
+
+3-round Researcher/Critic debate converged on a 3-cell pre-screen of dot-product target attention as a parallel pooling field on item history. Zero learnable params (cells A, B); 1 scalar α for rating-modulation (cell C, init=0).
+
+```python
+scores = (u_e.unsqueeze(1) * i_hist_e).sum(-1) / sqrt(D)   # (B, IL=30)
+scores = scores.masked_fill(i_valid < 0.5, -inf)
+attn = softmax(scores, dim=1)
+attn_out = (i_hist_e * attn.unsqueeze(-1)).sum(1)          # (B, 28)
+```
+
+Pre-screen at SEED=42 (vs 0.828188):
+
+| Cell | val_auc | Δ |
+|---|---|---|
+| A — attn-only | 0.827898 | -0.000290 |
+| B — attn + cross | 0.827785 | -0.000403 |
+| C — rating-modulated (learnable α) | 0.827901 | -0.000287 |
+
+All 3 regress; below kill threshold (+0.0003). NULL, no verify.
+
+**Lesson**: Critic's orthogonality concern — that the existing diagonal-scaled rating-weighted cross already extracts the linear-functional version of the per-rater similarity signal — was correct. Non-linear softmax reweighting on similarity adds no detectable signal at the apr28o stack; it slightly hurts, likely from optimizer-time interference with the existing rating-centered pool path. Closes the "non-linear similarity reweighting on item history" door.
+
 ### `autoresearch/apr28t-x` — final cheap-cycle batch — all null
 
 Per user direction "finish all cheap cycles," ran 5 sub-cycles (~2 hours of GPU time) covering the remaining cheap candidates from the backlog. All NULL. Eight consecutive null cycles total (apr28p-x). 0.828188 is established as the final linear-head baseline.

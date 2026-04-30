@@ -1,0 +1,5 @@
+[
+  {"name": "iattn_a_s42", "env": {"ITEM_ATTN": "1"}},
+  {"name": "iattn_b_s42", "env": {"ITEM_ATTN": "1", "ITEM_ATTN_CROSS": "1"}},
+  {"name": "iattn_c_s42", "env": {"ITEM_ATTN": "1", "ITEM_ATTN_RATING_MOD": "1"}}
+]
