@@ -240,6 +240,17 @@ EVAL_DYNAMIC_ITEM_HIST = int(os.environ.get("EVAL_DYNAMIC_ITEM_HIST", "0"))
 # (which uses dynamic histories). Off-state (default 0): byte-equivalent.
 TRAIN_DYNAMIC_HIST = int(os.environ.get("TRAIN_DYNAMIC_HIST", "0"))
 
+# apr28ai per-user incremental fine-tune at eval. After model training, for each
+# val user u with prior real ratings, take INCR_TUNE_K SGD step(s) on
+# user_embed.weight[u] using their prior ratings (with ts < min(eval_row_ts) for
+# u) as supervised signal. Strictly causal per-user (Critic flag). Real hard negs
+# from val (rating < 4) used as label=0; no synthetic easy-neg sampling.
+# Updates ONLY user_embed (all other params frozen during the fine-tune step).
+# Off-state (default 0.0): no fine-tune; byte-equivalent to baseline.
+INCR_TUNE_LR = float(os.environ.get("INCR_TUNE_LR", "0.0"))
+INCR_TUNE_K = int(os.environ.get("INCR_TUNE_K", "1"))
+INCR_TUNE_MAX_PRIOR = int(os.environ.get("INCR_TUNE_MAX_PRIOR", "100"))  # cap per user
+
 # ─── Device ────────────────────────────────────────────────────────
 torch.manual_seed(SEED)
 if torch.cuda.is_available():
@@ -1347,6 +1358,109 @@ for epoch in range(MAX_EPOCHS):
 if best_state is not None:
     model.load_state_dict(best_state)
     log.info(f"Restored best model (AUC: {best_auc:.4f})")
+
+# ─── apr28ai: per-user incremental fine-tune at eval ────────────────
+# After model training (best_state restored), update user_embed.weight[u]
+# per-user using each user's strictly-prior ratings as labels. All other
+# params frozen. Per-user causal: cutoff = min(eval_row_ts) for that user.
+if INCR_TUNE_LR > 0.0:
+    log.info(f"Starting incremental per-user fine-tune (LR={INCR_TUNE_LR}, K={INCR_TUNE_K}, max_prior={INCR_TUNE_MAX_PRIOR})...")
+    # Pre-flight diagnostic: head coefficient norms on key u-side slices
+    _head_w = model.head.weight.detach()  # (1, in_dim)
+    _D = EMBED_DIM
+    log.info(
+        f"Pre-flight head norms — u_e: {_head_w[0, :_D].norm().item():.4f}, "
+        f"i_e: {_head_w[0, _D:2*_D].norm().item():.4f}, "
+        f"u_hist_pool: {_head_w[0, 2*_D:3*_D].norm().item():.4f}, "
+        f"i_hist_pool: {_head_w[0, 3*_D+1:4*_D+1].norm().item():.4f}, "
+        f"head_total: {_head_w.norm().item():.4f}"
+    )
+    # 1. Compute min eval row ts per user (numpy)
+    _min_eval_ts = np.full(num_users + 1, np.iinfo(np.int64).max, dtype=np.int64)
+    _eval_uids_np = eval_uids.cpu().numpy()
+    _eval_ts_raw_np = eval_ts_raw.cpu().numpy()
+    np.minimum.at(_min_eval_ts, _eval_uids_np, _eval_ts_raw_np)
+    # 2. Build per-user fine-tune set from train+val (rating > 0 means real, not easy-neg).
+    # For each user, take last MAX_PRIOR ratings with ts < min_eval_ts[u]. Label = (rating >= 4).
+    _comb = pd.concat([
+        train_df[train_df["rating"] > 0][["userId", "movieId", "rating", "timestamp"]],
+        val_df[val_df["rating"] > 0][["userId", "movieId", "rating", "timestamp"]],
+    ], ignore_index=True)
+    _comb = _comb.sort_values(["userId", "timestamp"]).reset_index(drop=True)
+    _ft_uid_arr = _comb["userId"].values.astype(np.int64)
+    _ft_mid_arr = _comb["movieId"].values.astype(np.int64)
+    _ft_rat_arr = _comb["rating"].values.astype(np.float32)
+    _ft_ts_arr = _comb["timestamp"].values.astype(np.int64)
+    _user_starts = np.searchsorted(_ft_uid_arr, np.arange(num_users + 1), side="left")
+    _ft_uids_kept = []
+    _ft_mids_kept = []
+    _ft_labels_kept = []
+    _ft_ts_kept = []
+    _n_users_with_ft = 0
+    for _uid in range(num_users):
+        _us, _ue = int(_user_starts[_uid]), int(_user_starts[_uid + 1])
+        if _us == _ue:
+            continue
+        _user_ts = _ft_ts_arr[_us:_ue]
+        _cutoff = _min_eval_ts[_uid]
+        if _cutoff == np.iinfo(np.int64).max:
+            continue  # user has no eval rows; skip
+        _cut = int(np.searchsorted(_user_ts, _cutoff, side="left"))
+        if _cut < 2:
+            continue  # need at least 2 prior ratings
+        _take = min(_cut, INCR_TUNE_MAX_PRIOR)
+        _slice = slice(_us + _cut - _take, _us + _cut)
+        _ft_uids_kept.append(np.full(_take, _uid, dtype=np.int64))
+        _ft_mids_kept.append(_ft_mid_arr[_slice])
+        _ft_labels_kept.append((_ft_rat_arr[_slice] >= 4.0).astype(np.float32))
+        _ft_ts_kept.append(_ft_ts_arr[_slice])
+        _n_users_with_ft += 1
+    if _n_users_with_ft == 0:
+        log.info("No users qualified for fine-tune (need ≥2 prior real ratings before earliest eval ts).")
+    else:
+        _ft_uids_t = torch.from_numpy(np.concatenate(_ft_uids_kept)).to(DEVICE)
+        _ft_mids_t = torch.from_numpy(np.concatenate(_ft_mids_kept)).to(DEVICE)
+        _ft_labels_t = torch.from_numpy(np.concatenate(_ft_labels_kept)).to(DEVICE)
+        _ft_ts_raw_t = torch.from_numpy(np.concatenate(_ft_ts_kept)).to(DEVICE)
+        _ft_ts_norm = ((_ft_ts_raw_t.float() - ts_min) / ts_range).unsqueeze(-1)
+        n_ft = len(_ft_uids_t)
+        log.info(f"Fine-tune set: {_n_users_with_ft} users, {n_ft} total rows")
+        # Freeze all params except user_embed.weight
+        _param_grad_state = {}
+        for _name, _p in model.named_parameters():
+            _param_grad_state[_name] = _p.requires_grad
+            _p.requires_grad = (_name == "user_embed.weight")
+        _ft_optim = torch.optim.SGD([model.user_embed.weight], lr=INCR_TUNE_LR)
+        _ft_loss_fn = nn.BCEWithLogitsLoss()
+        # Run K big-batch steps. With batch_size=BATCH_SIZE for fine-tune.
+        model.eval()  # disable any train-mode dropout etc; we only want grads on user_embed
+        _ft_batch = BATCH_SIZE
+        for _step in range(INCR_TUNE_K):
+            _step_loss = 0.0
+            _step_n = 0
+            _perm = torch.randperm(n_ft, device=DEVICE)
+            for _s in range(0, n_ft, _ft_batch):
+                _e = min(_s + _ft_batch, n_ft)
+                _idx = _perm[_s:_e]
+                _bu, _bm = _ft_uids_t[_idx], _ft_mids_t[_idx]
+                _bts = _ft_ts_norm[_idx]
+                _bts_raw = _ft_ts_raw_t[_idx]
+                _bl = _ft_labels_t[_idx]
+                _ft_optim.zero_grad()
+                _out = model(_bu, _bm, _bts, ts_raw=_bts_raw, hist_idx=None)
+                _logits = _out[0] if isinstance(_out, tuple) else _out
+                _loss = _ft_loss_fn(_logits, _bl)
+                _loss.backward()
+                _ft_optim.step()
+                _step_loss += float(_loss.item()) * (_e - _s)
+                _step_n += (_e - _s)
+            log.info(f"Fine-tune step {_step+1}/{INCR_TUNE_K}: avg loss = {_step_loss / max(_step_n, 1):.4f}")
+        # Restore param requires_grad state (not strictly needed since we don't train more)
+        for _name, _p in model.named_parameters():
+            _p.requires_grad = _param_grad_state[_name]
+        del _ft_uids_t, _ft_mids_t, _ft_labels_t, _ft_ts_raw_t, _ft_ts_norm
+        del _ft_uids_kept, _ft_mids_kept, _ft_labels_kept, _ft_ts_kept
+        del _comb, _ft_uid_arr, _ft_mid_arr, _ft_rat_arr, _ft_ts_arr, _user_starts, _min_eval_ts
 
 t_train_end = time.time()
 final_metrics = run_eval()
