@@ -251,6 +251,12 @@ INCR_TUNE_LR = float(os.environ.get("INCR_TUNE_LR", "0.0"))
 INCR_TUNE_K = int(os.environ.get("INCR_TUNE_K", "1"))
 INCR_TUNE_MAX_PRIOR = int(os.environ.get("INCR_TUNE_MAX_PRIOR", "100"))  # cap per user
 
+# apr28aj: run on the held-out test set (last 10% of ratings, 2018-2019).
+# After val eval, build a parallel test_eval_df + per-test-sample dynamic
+# histories from combined train+val+test-prior data (per-row causal — same
+# methodology as val dynamic-history). Single-shot run; no iteration on test.
+RUN_TEST = int(os.environ.get("RUN_TEST", "0"))
+
 # ─── Device ────────────────────────────────────────────────────────
 torch.manual_seed(SEED)
 if torch.cuda.is_available():
@@ -269,6 +275,7 @@ t_total_start = time.time()
 data = load_data_hybrid(DATASET, neg_ratio=NEG_RATIO,
                         train_neg_mode="anchor_pos_catalog")
 train_df, val_df = data["train"], data["val"]
+test_df = data["test"]  # held-out 10%; only consumed if RUN_TEST=1
 movies_df, stats = data["movies"], data["stats"]
 user_all_items = data["user_all_items"]
 num_users, num_items = stats["num_users"], stats["num_items"]
@@ -1524,6 +1531,161 @@ try:
         log.info(f"  val_auc_{name}: {auc:.6f}  n={int(mask.sum())}")
 except Exception as _e:
     log.info(f"OOV-decomp eval skipped: {_e}")
+
+# ─── apr28aj: held-out test set evaluation (single-shot reporting) ──
+# Single-shot: this is the only test-set evaluation. No iteration on test.
+if RUN_TEST:
+    log.info("===== apr28aj: held-out test set evaluation (single-shot) =====")
+    # Build _test_eval_df mirroring val construction:
+    # test pos + test hard neg + sampled easy neg anchored to test pos.
+    _test_pos_mask = test_df["label"] == 1
+    _test_pos = test_df[_test_pos_mask]
+    _test_hard_neg = test_df[~_test_pos_mask]
+    _n_test_pos = len(_test_pos)
+    log.info(f"Test set raw: {_n_test_pos} pos + {len(_test_hard_neg)} hard neg")
+    # Build per-user "all rated" set covering train+val+test (Critic flag 3)
+    _test_user_all = {uid: set(items) for uid, items in user_all_items.items()}
+    for uid, group in val_df.groupby("userId"):
+        _test_user_all.setdefault(uid, set()).update(group["movieId"].values)
+    for uid, group in test_df.groupby("userId"):
+        _test_user_all.setdefault(uid, set()).update(group["movieId"].values)
+    # Distinct RNG (Critic flag 2): SEED=42 baseline used 42 for val easy-negs;
+    # use 43 for test easy-negs to keep them independent.
+    _test_rng = np.random.RandomState(43)
+    _test_easy_users = _test_pos["userId"].values.astype(np.int64)
+    _test_easy_items = np.empty(_n_test_pos, dtype=np.int64)
+    for _i in range(_n_test_pos):
+        _rated = _test_user_all.get(_test_easy_users[_i], set())
+        _mid = _test_rng.randint(0, num_items)
+        while _mid in _rated:
+            _mid = _test_rng.randint(0, num_items)
+        _test_easy_items[_i] = _mid
+    _test_eval_df = pd.DataFrame({
+        "userId": np.concatenate([_test_pos["userId"].values, _test_hard_neg["userId"].values, _test_easy_users]),
+        "movieId": np.concatenate([_test_pos["movieId"].values, _test_hard_neg["movieId"].values, _test_easy_items]),
+        "timestamp": np.concatenate([_test_pos["timestamp"].values, _test_hard_neg["timestamp"].values, _test_pos["timestamp"].values]),
+        "label": np.concatenate([np.ones(_n_test_pos), np.zeros(len(_test_hard_neg)), np.zeros(_n_test_pos)]),
+    })
+    test_uids, test_mids, test_ts, test_ts_raw, test_labels_t, _ = _build_sample_tensors(_test_eval_df)
+    n_test = len(test_uids)
+    log.info(f"Test eval set: {_n_test_pos} pos + {len(_test_hard_neg)} hard neg + {_n_test_pos} easy neg = {n_test}")
+
+    # Build per-test-sample dynamic histories from combined train+val+test-prior
+    # (same per-row causal methodology as val's _eval_user_hist_t).
+    if EVAL_DYNAMIC_HIST:
+        log.info("Building test-time dynamic user histories...")
+        _comb = pd.concat([
+            train_df[train_df["rating"] > 0][["userId", "movieId", "rating", "timestamp"]],
+            val_df[val_df["rating"] > 0][["userId", "movieId", "rating", "timestamp"]],
+            test_df[test_df["rating"] > 0][["userId", "movieId", "rating", "timestamp"]],
+        ], ignore_index=True)
+        _comb = _comb.sort_values(["userId", "timestamp"]).reset_index(drop=True)
+        _all_uid = _comb["userId"].values.astype(np.int64)
+        _all_mid = _comb["movieId"].values.astype(np.int64)
+        _all_rat = (_comb["rating"].values.astype(np.float32) / 5.0)
+        _all_ts = _comb["timestamp"].values.astype(np.int64)
+        _uid_starts = np.searchsorted(_all_uid, np.arange(num_users), side="left")
+        _uid_ends = np.searchsorted(_all_uid, np.arange(num_users), side="right")
+        _test_user_hist_np = np.full((n_test, HISTORY_LEN), PAD_IDX, dtype=np.int64)
+        _test_user_hist_rat_np = np.zeros((n_test, HISTORY_LEN), dtype=np.float32)
+        _test_user_hist_ts_np = np.zeros((n_test, HISTORY_LEN), dtype=np.int32)
+        _test_uids_np_arr = test_uids.cpu().numpy()
+        _test_ts_np_arr = test_ts_raw.cpu().numpy()
+        _test_order = np.argsort(_test_uids_np_arr, kind="stable")
+        _test_uids_sorted = _test_uids_np_arr[_test_order]
+        _test_uid_starts = np.searchsorted(_test_uids_sorted, np.arange(num_users), side="left")
+        _test_uid_ends = np.searchsorted(_test_uids_sorted, np.arange(num_users), side="right")
+        for _uid in range(num_users):
+            _es, _ee = int(_test_uid_starts[_uid]), int(_test_uid_ends[_uid])
+            if _es == _ee:
+                continue
+            _us, _ue = int(_uid_starts[_uid]), int(_uid_ends[_uid])
+            if _us == _ue:
+                continue
+            _user_ts = _all_ts[_us:_ue]
+            _user_mid = _all_mid[_us:_ue]
+            _user_rat = _all_rat[_us:_ue]
+            _test_rows = _test_order[_es:_ee]
+            _row_ts = _test_ts_np_arr[_test_rows]
+            _cuts = np.searchsorted(_user_ts, _row_ts, side="left")
+            for _row_idx, _cut in zip(_test_rows, _cuts):
+                if _cut == 0:
+                    continue
+                _take = min(int(_cut), HISTORY_LEN)
+                _test_user_hist_np[_row_idx, -_take:] = _user_mid[_cut - _take:_cut]
+                _test_user_hist_rat_np[_row_idx, -_take:] = _user_rat[_cut - _take:_cut]
+                _test_user_hist_ts_np[_row_idx, -_take:] = _user_ts[_cut - _take:_cut].astype(np.int32)
+        # Override the global eval tensors so model.forward picks up the test versions.
+        # The forward branch uses _eval_user_hist_t[hist_idx]; we'll point it at the test data.
+        _eval_user_hist_t_test = torch.from_numpy(_test_user_hist_np).to(DEVICE)
+        _eval_user_hist_rat_t_test = torch.from_numpy(_test_user_hist_rat_np).to(DEVICE)
+        _eval_user_hist_ts_t_test = torch.from_numpy(_test_user_hist_ts_np).to(DEVICE)
+        # Save val versions, swap in test versions
+        _saved_eval_user_hist_t = _eval_user_hist_t
+        _saved_eval_user_hist_rat_t = _eval_user_hist_rat_t
+        _saved_eval_user_hist_ts_t = _eval_user_hist_ts_t
+        _eval_user_hist_t = _eval_user_hist_t_test
+        _eval_user_hist_rat_t = _eval_user_hist_rat_t_test
+        _eval_user_hist_ts_t = _eval_user_hist_ts_t_test
+        del _comb, _all_uid, _all_mid, _all_rat, _all_ts, _uid_starts, _uid_ends
+        del _test_user_hist_np, _test_user_hist_rat_np, _test_user_hist_ts_np
+        del _test_uids_np_arr, _test_ts_np_arr, _test_order, _test_uids_sorted
+        del _test_uid_starts, _test_uid_ends
+
+    # Run test eval forward
+    model.eval()
+    _test_scores = []
+    with torch.no_grad():
+        eval_batch = BATCH_SIZE * 2
+        for s in range(0, n_test, eval_batch):
+            e = min(s + eval_batch, n_test)
+            _hist_idx = torch.arange(s, e, device=DEVICE) if (EVAL_DYNAMIC_HIST or EVAL_DYNAMIC_ITEM_HIST) else None
+            out = model(test_uids[s:e], test_mids[s:e], test_ts[s:e],
+                        ts_raw=test_ts_raw[s:e], hist_idx=_hist_idx)
+            logits = out[0] if isinstance(out, tuple) else out
+            _test_scores.append(torch.sigmoid(logits).cpu().numpy())
+    model.train()
+    _test_scores = np.concatenate(_test_scores)
+    _test_labels = test_labels_t.cpu().numpy()
+    test_metrics = evaluate(_test_labels, _test_scores)
+    log.info(f"test_auc: {test_metrics['auc']:.6f}")
+
+    # OOV decomp on test (Critic flag 3: include cold_user_first_test stratum)
+    try:
+        from sklearn.metrics import roc_auc_score
+        _train_real = train_df[train_df["rating"] > 0]
+        _train_user_set = set(_train_real["userId"].unique().tolist())
+        _train_item_set = set(_train_real["movieId"].unique().tolist())
+        _val_real = val_df[val_df["rating"] > 0]
+        _val_user_set = set(_val_real["userId"].unique().tolist())
+        _test_uid_arr = _test_eval_df["userId"].values.astype(np.int64)
+        _test_mid_arr = _test_eval_df["movieId"].values.astype(np.int64)
+        _cold_user_mask = ~np.isin(_test_uid_arr, list(_train_user_set))
+        _cold_item_mask = ~np.isin(_test_mid_arr, list(_train_item_set))
+        _strata = [
+            ("warm",       ~_cold_user_mask & ~_cold_item_mask),
+            ("cold_user",   _cold_user_mask & ~_cold_item_mask),
+            ("cold_item",  ~_cold_user_mask &  _cold_item_mask),
+            ("cold_both",   _cold_user_mask &  _cold_item_mask),
+        ]
+        # cold_user_first_test: cold relative to BOTH train AND val (truly new at test)
+        _cold_user_test_only = ~np.isin(_test_uid_arr, list(_train_user_set | _val_user_set))
+        _strata.append(("cold_user_first_test", _cold_user_test_only & ~_cold_item_mask))
+        log.info("OOV-decomposed TEST AUC:")
+        for name, mask in _strata:
+            if mask.sum() == 0 or len(np.unique(_test_labels[mask])) < 2:
+                log.info(f"  test_auc_{name}: n/a (n={int(mask.sum())})")
+                continue
+            auc = roc_auc_score(_test_labels[mask], _test_scores[mask])
+            log.info(f"  test_auc_{name}: {auc:.6f}  n={int(mask.sum())}")
+    except Exception as _e:
+        log.info(f"Test OOV-decomp skipped: {_e}")
+
+    # Restore val tensors (defensive; not used after this point but clean state)
+    if EVAL_DYNAMIC_HIST:
+        _eval_user_hist_t = _saved_eval_user_hist_t
+        _eval_user_hist_rat_t = _saved_eval_user_hist_rat_t
+        _eval_user_hist_ts_t = _saved_eval_user_hist_ts_t
 
 if torch.cuda.is_available():
     peak_mem_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
