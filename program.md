@@ -51,6 +51,31 @@ Brief notes on cycles run on the restart. Detailed per-trial data lives in `resu
 
 Legacy DLRM ceiling: 0.8284 (val). Restart linear-head + `EVAL_DYNAMIC_HIST=1 FREQ_WD_LAMBDA=0 LR=1e-3` **exceeds the legacy ceiling by +0.031 on val and +0.023 on test**. Static-history linear baseline still matches legacy within 0.0002 (apr28o at 0.8282 val). Project headline: **test AUC 0.8455** with single linear-head model.
 
+### `autoresearch/apr28ak` — recency decay + popularity prior — null
+
+**Null** (`db43a7c`). Two mechanisms post-Phase-C, picked from a 7-idea brainstorm. Researcher proposed three; Critic dropped (b) warm-row dropout (re-implements apr28ab's already-null WARM_MASK_P).
+
+**(a) EVAL_HIST_DECAY_ALPHA**: at eval-time only, multiply u_valid by `exp(-α · Δt / ts_range)` so most-recent val items dominate the rating-centered pool. Eval-only, dynamic-history-only. Reuses `_eval_user_hist_ts_t`.
+
+**(c) POPULARITY_PRIOR**: append `log(item_count+1)/log(max+1)` scalar per movie.
+
+4-cell single-seed sweep at SEED=42 (vs apr28ah baseline 0.859384):
+
+| Cell | val_auc | Δ |
+|---|---|---|
+| α=0.5 | 0.859390 | +0.000006 |
+| α=1.0 | 0.859396 | +0.000012 |
+| α=2.0 | 0.859408 | +0.000024 |
+| POPULARITY_PRIOR=1 | 0.852531 | -0.006853 |
+
+**Recency decay** essentially bit-zero across α ∈ {0.5, 1.0, 2.0}. Diagnosis: ts_range is 24 years; even α=2.0 gives 66% weight to items 5 years old. Dynamic histories are already last-K-items recent-biased. To see real decay effect would need α=10+, contradicting Critic's "over-decay" warning. The mechanism doesn't add granularity beyond what the per-row strict-prior cutoff already provides.
+
+**Popularity prior** regresses -0.0069. Same shape as apr28x's CROSS_GENRE_GENOME failure: explicit content scalar is redundant with `i_hist_pool`'s implicit popularity (rated-count via mean of rater embeddings) AND adds 1-d head capacity that the head exploits as label-uncorrelated noise.
+
+**Lesson**: at the apr28ah regime, the dynamic-history pool's inherent recency-bias and the implicit popularity in `i_hist_pool` saturate what those signals can contribute. Refining them with explicit additions doesn't help.
+
+**Baseline unchanged at apr28ah: 5-seed mean 0.859289 / SEED=42 0.859384 / test 0.845497.**
+
 ### `autoresearch/apr28aj` — Phase C: held-out test set evaluation (single-shot)
 
 **Final reporting** (`35b38d5`). Test set (last 10% of ratings, 2018-2019) had been held out across all 19 prior cycles. Single-shot run, no iteration — Critic flag 4 explicit.
