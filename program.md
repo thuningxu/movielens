@@ -50,6 +50,33 @@ Brief notes on cycles run on the restart. Detailed per-trial data lives in `resu
 
 Legacy DLRM ceiling: 0.8284. Restart linear-head + `EVAL_DYNAMIC_HIST=1 FREQ_WD_LAMBDA=0 LR=1e-3` (apr28ah stack) **exceeds the legacy ceiling by +0.031**. Without `EVAL_DYNAMIC_HIST=1` the static-history linear baseline still matches legacy within 0.0002 (apr28o stack at 0.8282).
 
+### `autoresearch/apr28ai` — Phase B per-user incremental fine-tune at eval — null
+
+**Null** (`6b3a7ac` + grad-mask fix `901ba4d`). Phase B of post-apr28ad plan. Implements per-user incremental fine-tune: for each val user u, after model training, take K SGD steps on user_embed.weight[u] using their prior ratings as labels. Strictly causal per-user (cutoff = min(eval_row_ts) for u, per Critic round-2 leak fix). Real hard negs from val (rating < 4) used as label=0.
+
+**Validator caught a subtle bug** before sweep: `i_hist_e = self.user_embed(i_hist)` in forward means gradient leaks to OTHER users' embeddings (raters of items in fine-tune batch) via `i_hist_pool ⊙ u_e`. Fixed with a per-batch row-mask on `user_embed.weight.grad` to keep only supervised users' rows.
+
+3-cell pre-screen at SEED=42 (vs apr28ah baseline 0.859384):
+
+| Cell | val_auc | Δ |
+|---|---|---|
+| C0 baseline | 0.859384 | 0 |
+| C1 (LR=1e-2, K=1) | 0.859385 | +0.000001 |
+| C2 (LR=1e-2, K=10) | 0.859401 | +0.000017 |
+
+Both fine-tune cells bit-essentially-identical to baseline. NULL.
+
+**Diagnostic**:
+- Fine-tune set: 5,287 users / 465K rows. Only 3.3% of users qualified (need ≥2 prior ratings BEFORE earliest eval ts). Cold users (70% of val users) by definition CAN'T qualify — they're cold precisely because their first interaction is during val.
+- Pre-flight head norms: u_e=7.97 (largest), but warm-user updates don't reach the cold_user stratum bottleneck.
+- Fine-tune loss barely moves: 0.5868 → 0.5864 over 10 steps.
+
+**Lesson — fundamental limit of per-user fine-tune at eval**: it can only help users who have prior data BEFORE their first eval row. By design, cold users have no such data. apr28ad's pool aggregation already uses the available data (val ratings before current sample's ts) for cold users via dynamic history rebuild — including LATER val ratings within the user's window via the per-row causal cutoff. The per-user fine-tune wanted to extract signal from the SAME data via gradient instead of pooling, but only for users with strict-prior data. The strictly-causal-per-eval-sample version (Critic option A in round 2) would cost ~50× more and was deferred.
+
+The apr28ad mechanism (pool aggregation per row's strict-prior window) is already extracting the available signal. The Critic's "redundancy with apr28ad pool" prediction was correct.
+
+**Phase B closed. Baseline stays at apr28ah's 0.859289 5-seed mean. Phase C (test set eval) next.**
+
 ### `autoresearch/apr28ah` — HP retune at apr28ag regime — **WIN: LR 3e-4 → 1e-3** (+0.008 5-seed mean)
 
 **Win** (no code change). Phase A2 of the post-apr28ad plan. Re-tune LR × WD now that EVAL_DYNAMIC_HIST=1 and FREQ_WD_LAMBDA=0 changed the gradient/regularization landscape. apr28g's static-regime tune (LR=3e-4 WD=5e-5) was the input.
