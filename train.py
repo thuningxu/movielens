@@ -224,6 +224,22 @@ MOVIE_TAG_TEXT_DIM = 384  # all-MiniLM-L6-v2 output dim, fixed
 # Off-state (default 0): forward path unchanged; byte-equivalent.
 EVAL_DYNAMIC_HIST = int(os.environ.get("EVAL_DYNAMIC_HIST", "0"))
 
+# apr28af eval-time dynamic ITEM history. Mirror of EVAL_DYNAMIC_HIST on the
+# item axis: at eval time each sample uses a per-sample i_hist built from
+# combined train+val raters of the candidate movie with timestamp < sample's
+# own ts. Targets cold_item stratum (3.4% of val) AND warm items getting new
+# raters during val. Off-state (default 0): byte-equivalent.
+EVAL_DYNAMIC_ITEM_HIST = int(os.environ.get("EVAL_DYNAMIC_ITEM_HIST", "0"))
+
+# apr28ae train-time dynamic user history. Per-batch on-the-fly GPU lookup
+# (NOT host precompute — host RAM is only 29 GB). At forward time during
+# training, each sample's u_hist is built from train+val ratings strictly
+# before the sample's own timestamp. Eliminates the train-time time leak
+# (current static user_histories[uid] uses ALL train ratings including
+# future ones relative to the current sample) AND matches the eval distribution
+# (which uses dynamic histories). Off-state (default 0): byte-equivalent.
+TRAIN_DYNAMIC_HIST = int(os.environ.get("TRAIN_DYNAMIC_HIST", "0"))
+
 # ─── Device ────────────────────────────────────────────────────────
 torch.manual_seed(SEED)
 if torch.cuda.is_available():
@@ -753,6 +769,111 @@ if EVAL_DYNAMIC_HIST:
     del _eval_uids_np, _eval_ts_raw_np, _eval_order, _eval_uids_sorted
     del _eval_uid_starts, _eval_uid_ends, _cold_user_mask, _has_prior_hist
 
+# ─── apr28af: per-eval-sample dynamic ITEM history ──────────────────
+# Mirror of EVAL_DYNAMIC_HIST on item axis. For each eval row (mid, ts),
+# build i_hist from combined train+val raters of mid with timestamp < ts.
+if EVAL_DYNAMIC_ITEM_HIST:
+    log.info("Building eval-time dynamic item histories (apr28af)...")
+    _comb_real = pd.concat([
+        train_df[train_df["rating"] > 0][["userId", "movieId", "rating", "timestamp"]],
+        val_df[val_df["rating"] > 0][["userId", "movieId", "rating", "timestamp"]],
+    ], ignore_index=True)
+    # Sort by (movieId, timestamp) — mirror of user-side but grouped by item.
+    _comb_real = _comb_real.sort_values(["movieId", "timestamp"]).reset_index(drop=True)
+    _all_mid = _comb_real["movieId"].values.astype(np.int64)
+    _all_uid = _comb_real["userId"].values.astype(np.int64)
+    _all_rat = (_comb_real["rating"].values.astype(np.float32) / 5.0)
+    _all_ts = _comb_real["timestamp"].values.astype(np.int64)
+    _mid_starts = np.searchsorted(_all_mid, np.arange(num_items), side="left")
+    _mid_ends = np.searchsorted(_all_mid, np.arange(num_items), side="right")
+    _eval_item_hist_np = np.full((n_eval, ITEM_HIST_LEN), USER_PAD_IDX, dtype=np.int64)
+    _eval_item_hist_rat_np = np.zeros((n_eval, ITEM_HIST_LEN), dtype=np.float32)
+    _eval_item_hist_ts_np = np.zeros((n_eval, ITEM_HIST_LEN), dtype=np.int32)
+    _eval_mids_np = eval_mids.cpu().numpy()
+    _eval_ts_raw_np = eval_ts_raw.cpu().numpy()
+    _eval_order = np.argsort(_eval_mids_np, kind="stable")
+    _eval_mids_sorted = _eval_mids_np[_eval_order]
+    _eval_mid_starts = np.searchsorted(_eval_mids_sorted, np.arange(num_items), side="left")
+    _eval_mid_ends = np.searchsorted(_eval_mids_sorted, np.arange(num_items), side="right")
+    for _mid in range(num_items):
+        _es, _ee = int(_eval_mid_starts[_mid]), int(_eval_mid_ends[_mid])
+        if _es == _ee:
+            continue
+        _us, _ue = int(_mid_starts[_mid]), int(_mid_ends[_mid])
+        if _us == _ue:
+            continue
+        _item_ts = _all_ts[_us:_ue]
+        _item_uid = _all_uid[_us:_ue]
+        _item_rat = _all_rat[_us:_ue]
+        _eval_rows = _eval_order[_es:_ee]
+        _row_ts = _eval_ts_raw_np[_eval_rows]
+        _cuts = np.searchsorted(_item_ts, _row_ts, side="left")
+        for _row_idx, _cut in zip(_eval_rows, _cuts):
+            if _cut == 0:
+                continue
+            _take = min(int(_cut), ITEM_HIST_LEN)
+            _eval_item_hist_np[_row_idx, -_take:] = _item_uid[_cut - _take:_cut]
+            _eval_item_hist_rat_np[_row_idx, -_take:] = _item_rat[_cut - _take:_cut]
+            _eval_item_hist_ts_np[_row_idx, -_take:] = _item_ts[_cut - _take:_cut].astype(np.int32)
+    log.info(f"Dynamic eval item histories built")
+    _eval_item_hist_t = torch.from_numpy(_eval_item_hist_np).to(DEVICE)
+    _eval_item_hist_rat_t = torch.from_numpy(_eval_item_hist_rat_np).to(DEVICE)
+    _eval_item_hist_ts_t = torch.from_numpy(_eval_item_hist_ts_np).to(DEVICE)
+    del _comb_real, _all_mid, _all_uid, _all_rat, _all_ts, _mid_starts, _mid_ends
+    del _eval_item_hist_np, _eval_item_hist_rat_np, _eval_item_hist_ts_np
+    del _eval_mids_np, _eval_ts_raw_np, _eval_order, _eval_mids_sorted
+    del _eval_mid_starts, _eval_mid_ends
+
+# ─── apr28ae: per-batch on-the-fly dynamic TRAIN user history ───────
+# Compact per-user sorted arrays + per-train-sample cut positions; per-batch
+# GPU gather. Memory: ~720 MB GPU total (avoids the 24 GB host precompute
+# that wouldn't fit in 29 GB host RAM).
+if TRAIN_DYNAMIC_HIST:
+    log.info("Building train-time dynamic-history infrastructure (apr28ae)...")
+    _comb_real_train = pd.concat([
+        train_df[train_df["rating"] > 0][["userId", "movieId", "rating", "timestamp"]],
+        val_df[val_df["rating"] > 0][["userId", "movieId", "rating", "timestamp"]],
+    ], ignore_index=True)
+    _comb_real_train = _comb_real_train.sort_values(["userId", "timestamp"]).reset_index(drop=True)
+    _flat_uid = _comb_real_train["userId"].values.astype(np.int64)
+    _flat_mid = _comb_real_train["movieId"].values.astype(np.int32)
+    _flat_rat = (_comb_real_train["rating"].values.astype(np.float32) / 5.0)
+    _flat_ts = _comb_real_train["timestamp"].values.astype(np.int64)
+    # Per-user start offsets: starts[uid] is where uid's items begin in the flat array.
+    _user_starts_np = np.searchsorted(_flat_uid, np.arange(num_users + 1), side="left")
+    # Per-train-sample cut: number of (user's) items with ts < train sample's ts.
+    _train_uids_np = train_uids.cpu().numpy()
+    _train_ts_raw_np = train_ts_raw.cpu().numpy()
+    _train_order = np.argsort(_train_uids_np, kind="stable")
+    _train_uids_sorted = _train_uids_np[_train_order]
+    _train_uid_starts = np.searchsorted(_train_uids_sorted, np.arange(num_users), side="left")
+    _train_uid_ends = np.searchsorted(_train_uids_sorted, np.arange(num_users), side="right")
+    _train_sample_cut_np = np.zeros(n_train, dtype=np.int64)
+    for _uid in range(num_users):
+        _es, _ee = int(_train_uid_starts[_uid]), int(_train_uid_ends[_uid])
+        if _es == _ee:
+            continue
+        _us, _ue = int(_user_starts_np[_uid]), int(_user_starts_np[_uid + 1])
+        if _us == _ue:
+            continue
+        _user_ts = _flat_ts[_us:_ue]
+        _train_rows = _train_order[_es:_ee]
+        _row_ts = _train_ts_raw_np[_train_rows]
+        _cuts = np.searchsorted(_user_ts, _row_ts, side="left")
+        # Cut is RELATIVE within user's slice; convert to ABSOLUTE flat-array position.
+        _train_sample_cut_np[_train_rows] = _us + _cuts
+    log.info(f"Dynamic train history precompute done (n_train={n_train}, flat_size={len(_flat_uid)})")
+    # Move compact per-user arrays + per-sample cuts to GPU. Total ~720 MB on ml-25m.
+    _flat_user_mid_t = torch.from_numpy(_flat_mid).to(DEVICE)            # int32
+    _flat_user_rat_t = torch.from_numpy(_flat_rat).to(DEVICE)            # float32
+    _flat_user_ts_t = torch.from_numpy(_flat_ts).to(DEVICE)              # int64
+    _user_starts_t = torch.from_numpy(_user_starts_np).to(DEVICE)        # int64, length num_users+1
+    _train_sample_cut_t = torch.from_numpy(_train_sample_cut_np).to(DEVICE)  # int64
+    del _comb_real_train, _flat_uid, _flat_mid, _flat_rat, _flat_ts
+    del _user_starts_np, _train_uids_np, _train_ts_raw_np
+    del _train_order, _train_uids_sorted, _train_uid_starts, _train_uid_ends
+    del _train_sample_cut_np
+
 
 # ═══════════════════════════════════════════════════════════════════
 # MODEL — single Linear head on concatenated features
@@ -931,10 +1052,24 @@ class LinearBaseline(nn.Module):
         i_e = self.item_embed(mids)
 
         # User history: pool item_embed over valid (non-PAD) positions.
-        # When hist_idx is provided AND EVAL_DYNAMIC_HIST is on (eval-time only,
-        # apr28ad), use per-sample dynamic history built from train+val ratings
-        # with timestamp < sample's ts. Otherwise use the static per-user history.
-        if hist_idx is not None and EVAL_DYNAMIC_HIST:
+        # Three modes:
+        # 1. apr28ae TRAIN_DYNAMIC_HIST=1 + training: per-batch GPU gather from
+        #    flat per-user arrays at sample's cut position.
+        # 2. apr28ad EVAL_DYNAMIC_HIST=1 + eval (not training): per-sample
+        #    precomputed dynamic history.
+        # 3. Static (default): per-user fixed history from train.
+        if self.training and hist_idx is not None and TRAIN_DYNAMIC_HIST:
+            cuts = _train_sample_cut_t[hist_idx]                              # (B,) abs pos
+            user_starts = _user_starts_t[uids]                                # (B,) start of slice
+            _pos_off = torch.arange(HISTORY_LEN, device=DEVICE).unsqueeze(0)  # (1, L)
+            abs_pos = cuts.unsqueeze(1) - HISTORY_LEN + _pos_off              # (B, L)
+            valid_pos = (abs_pos >= user_starts.unsqueeze(1)) & (abs_pos < cuts.unsqueeze(1))
+            abs_pos_clamped = torch.where(valid_pos, abs_pos, torch.zeros_like(abs_pos))
+            u_hist = _flat_user_mid_t[abs_pos_clamped].long()                 # (B, L)
+            u_hist_rat = _flat_user_rat_t[abs_pos_clamped]                    # (B, L)
+            u_hist = torch.where(valid_pos, u_hist, torch.full_like(u_hist, PAD_IDX))
+            u_hist_rat = torch.where(valid_pos, u_hist_rat, torch.zeros_like(u_hist_rat))
+        elif hist_idx is not None and EVAL_DYNAMIC_HIST and not self.training:
             u_hist = _eval_user_hist_t[hist_idx]
             u_hist_rat = _eval_user_hist_rat_t[hist_idx]
         else:
@@ -988,9 +1123,15 @@ class LinearBaseline(nn.Module):
         else:
             is_cold_user = None
 
-        # Item history: pool user_embed over valid raters
-        i_hist = _item_hist_t[mids]                       # (B, IL)
-        i_hist_rat = _item_hist_rat_t[mids]               # (B, IL)
+        # Item history: pool user_embed over valid raters.
+        # apr28af EVAL_DYNAMIC_ITEM_HIST=1 + eval (not training): per-sample
+        # precomputed dynamic item history. Otherwise static per-item.
+        if hist_idx is not None and EVAL_DYNAMIC_ITEM_HIST and not self.training:
+            i_hist = _eval_item_hist_t[hist_idx]
+            i_hist_rat = _eval_item_hist_rat_t[hist_idx]
+        else:
+            i_hist = _item_hist_t[mids]                       # (B, IL)
+            i_hist_rat = _item_hist_rat_t[mids]               # (B, IL)
         i_hist_e = self.user_embed(i_hist)                # (B, IL, D)
         i_valid = (i_hist != USER_PAD_IDX).float()        # (B, IL)
         i_count = i_valid.sum(dim=1).clamp(min=1.0)
@@ -1143,8 +1284,12 @@ for epoch in range(MAX_EPOCHS):
     perm = torch.randperm(n_train, device=DEVICE)
     for b in range(n_batches_per_epoch):
         idx = perm[b * BATCH_SIZE:(b + 1) * BATCH_SIZE]
+        # When TRAIN_DYNAMIC_HIST=1, idx serves as hist_idx for per-sample
+        # cut lookup. The flag-gated forward block uses `self.training` to
+        # distinguish train-time vs eval-time dynamic history.
         out = model(train_uids[idx], train_mids[idx], train_ts[idx],
-                    ts_raw=train_ts_raw[idx])
+                    ts_raw=train_ts_raw[idx],
+                    hist_idx=idx if TRAIN_DYNAMIC_HIST else None)
         if isinstance(out, tuple):
             logits, aux_pred = out
         else:
