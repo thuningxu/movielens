@@ -164,6 +164,28 @@ USER_GENRE_AFFINITY_CROSS = int(os.environ.get("USER_GENRE_AFFINITY_CROSS", "0")
 # Off-state (default 0): no field appended; byte-equivalent to baseline.
 CROSS_GENRE_GENOME = int(os.environ.get("CROSS_GENRE_GENOME", "0"))
 
+# Recency filter on training data: keep only the most-recent RECENCY_FRAC of
+# REAL ratings (positives + hard negatives). Easy negatives are not affected by
+# this filter directly. RECENCY_FRAC=1.0 (default) = no filter (byte-equiv).
+# Legacy default was 0.7 (drop oldest 30%); ported from legacy/train.py:372-380.
+# Caches are keyed on RECENCY_FRAC so each setting builds its own features.
+RECENCY_FRAC = float(os.environ.get("RECENCY_FRAC", "1.0"))
+
+# Post-recency easy-negative resampling. When 1, drop the easy negatives that
+# came from prepare.py and resample new ones at POST_RECENCY_EASY_NEG_PER_POS
+# per kept positive, anchored to the kept positives' timestamps (covariate-shift
+# fix). Off (default 0): keep prepare.py's easy negatives unchanged. Implementation
+# ported from legacy/train.py:382-428. NEG_RATIO is unaffected (still controls
+# initial easy-neg generation in prepare.py).
+POST_RECENCY_NEG_RESAMPLE = int(os.environ.get("POST_RECENCY_NEG_RESAMPLE", "0"))
+POST_RECENCY_EASY_NEG_PER_POS = float(os.environ.get("POST_RECENCY_EASY_NEG_PER_POS", "0.4"))
+
+# Anonymous-user fallback for cold-start. When 1, samples whose user has empty
+# history (u_valid.sum == 0, i.e., user not in (recency-filtered) train) get
+# u_e replaced by a learnable anon_user_embed Parameter (init zeros). Targets
+# the 70%+ of val users that are OOV. Off-state (default 0): byte-equivalent.
+ANON_FALLBACK = int(os.environ.get("ANON_FALLBACK", "0"))
+
 # ─── Device ────────────────────────────────────────────────────────
 torch.manual_seed(SEED)
 if torch.cuda.is_available():
@@ -189,6 +211,66 @@ log.info(f"Dataset: {DATASET} | Users: {num_users} | Items: {num_items} | "
          f"Train: {stats['num_train']} | Val: {stats['num_val']} | "
          f"Pos rate: {stats['pos_rate']:.2%}")
 
+# ─── Optional recency filter + post-recency easy-neg resampling ──────
+# Ported from legacy/train.py:372-428. Applied BEFORE feature cache build so
+# downstream histories, item_count, user_count are computed from the filtered
+# training set (Critic-flagged: stale item_count would contaminate FREQ_WD).
+if RECENCY_FRAC < 1.0 - 1e-9:
+    full_real_train = train_df[train_df["rating"] > 0].copy()
+    real_mask = train_df["rating"] > 0
+    real_ratings = train_df[real_mask].sort_values("timestamp")
+    cutoff = int(len(real_ratings) * (1 - RECENCY_FRAC))
+    keep_real = real_ratings.iloc[cutoff:].index
+    keep_neg = train_df[~real_mask].index
+    train_df = train_df.loc[keep_real.union(keep_neg)].reset_index(drop=True)
+    n_dropped = int(real_mask.sum()) - len(keep_real)
+    log.info(f"Recency filter: kept {RECENCY_FRAC:.0%} of real ratings, dropped {n_dropped} oldest")
+
+    if POST_RECENCY_NEG_RESAMPLE:
+        kept_real_train = train_df[train_df["rating"] > 0].reset_index(drop=True)
+        kept_pos = kept_real_train[kept_real_train["label"] == 1].reset_index(drop=True)
+        old_easy_neg = int((train_df["rating"] == 0).sum())
+        num_easy_neg = int(round(len(kept_pos) * POST_RECENCY_EASY_NEG_PER_POS))
+        if len(kept_pos) == 0 or num_easy_neg == 0:
+            train_df = kept_real_train.copy()
+            log.info("Post-recency neg resample: no kept positives; dropped existing easy negatives")
+        else:
+            from scipy.sparse import csr_matrix
+            rng = np.random.RandomState(SEED)
+            full_rows = full_real_train["userId"].values.astype(np.int64)
+            full_cols = full_real_train["movieId"].values.astype(np.int64)
+            rated_matrix = csr_matrix(
+                (np.ones(len(full_rows), dtype=bool), (full_rows, full_cols)),
+                shape=(num_users, num_items),
+            )
+            item_first_seen = np.full(num_items, int(full_real_train["timestamp"].max()), dtype=np.int64)
+            first_seen_series = full_real_train.groupby("movieId")["timestamp"].min()
+            item_first_seen[first_seen_series.index.values.astype(np.int64)] = first_seen_series.values.astype(np.int64)
+            anchor_idx = rng.randint(0, len(kept_pos), size=num_easy_neg)
+            anchor_rows = kept_pos.iloc[anchor_idx]
+            neg_users = anchor_rows["userId"].values.astype(np.int64)
+            neg_timestamps = anchor_rows["timestamp"].values.astype(np.int64)
+            neg_items = rng.randint(0, num_items, size=num_easy_neg)
+            for _ in range(10):
+                is_rated = np.array(rated_matrix[neg_users, neg_items]).flatten().astype(bool)
+                is_rated |= item_first_seen[neg_items] > neg_timestamps
+                n_bad = int(is_rated.sum())
+                if n_bad == 0:
+                    break
+                neg_items[is_rated] = rng.randint(0, num_items, size=n_bad)
+            new_easy_neg = pd.DataFrame({
+                "userId": neg_users,
+                "movieId": neg_items,
+                "rating": 0.0,
+                "timestamp": neg_timestamps,
+                "label": 0,
+            })
+            train_df = pd.concat([kept_real_train, new_easy_neg], ignore_index=True)
+            log.info(
+                f"Post-recency neg resample: replaced {old_easy_neg} easy neg with {num_easy_neg} "
+                f"({POST_RECENCY_EASY_NEG_PER_POS:.2f} per kept positive)"
+            )
+
 # ─── Feature engineering (with disk cache) ─────────────────────────
 # Bones-only feature set:
 #   - per movie: genre multi-hot, tag genome (1128), release year
@@ -201,6 +283,7 @@ _cache_key = hashlib.md5(json.dumps({
     "dataset": DATASET, "neg_ratio": NEG_RATIO,
     "history_len": HISTORY_LEN, "item_hist_len": ITEM_HIST_LEN,
     "num_users": num_users, "num_items": num_items,
+    "recency_frac": round(RECENCY_FRAC, 4),  # cache invalidates per recency setting
 }).encode()).hexdigest()[:12]
 _cache_path = Path(__file__).parent / "data" / f"features_{_cache_key}.npz"
 
@@ -643,10 +726,16 @@ class LinearBaseline(nn.Module):
             )
 
         # Optional auxiliary rating-residual regression head.
-        # Constructed LAST so off-state RNG sequence is byte-identical (no nn.Linear
-        # constructor invoked at AUX_RATING_WEIGHT==0 — see learning #11).
+        # Constructed AFTER head/decay/DIN so off-state RNG sequence is byte-identical
+        # (no nn.Linear constructor invoked at AUX_RATING_WEIGHT==0 — see learning #11).
         if AUX_RATING_WEIGHT > 0:
             self.aux_head = nn.Linear(in_dim_total, 1)
+
+        # Anonymous-user fallback parameter (apr28aa). Constructed LAST so off-state
+        # RNG is byte-identical. Init zeros so at step 0 cold-user u_e becomes 0
+        # (cleaner than random init); learns toward a "typical user" embedding.
+        if ANON_FALLBACK:
+            self.anon_user_embed = nn.Parameter(torch.zeros(D))
 
     def forward(self, uids, mids, ts, ts_raw=None):
         u_e = self.user_embed(uids)
@@ -658,6 +747,13 @@ class LinearBaseline(nn.Module):
         u_hist_e = self.item_embed(u_hist)                # (B, L, D)
         u_valid = (u_hist != PAD_IDX).float()             # (B, L)
         u_count = u_valid.sum(dim=1).clamp(min=1.0)       # (B,)
+        # Anonymous-user fallback: replace u_e with anon_user_embed for samples
+        # whose user has empty training history (cold-start). Blend AS EARLY AS
+        # POSSIBLE so all downstream u_e uses (cross fields, crosses, etc.) see
+        # the cleaned embedding.
+        if ANON_FALLBACK:
+            is_cold = (u_valid.sum(dim=1) == 0).float().unsqueeze(-1)  # (B, 1)
+            u_e = u_e * (1.0 - is_cold) + self.anon_user_embed.unsqueeze(0) * is_cold
         if USER_HIST_DECAY:
             u_hist_ts = _user_hist_ts_t[uids]             # (B, L) int32
             u_hist_pool = _pool_history(
@@ -872,6 +968,48 @@ if best_state is not None:
 
 t_train_end = time.time()
 final_metrics = run_eval()
+
+# ─── OOV-decomposed eval (apr28aa diagnostic) ──────────────────────
+# Stratifies val_auc by whether user/item appear in the (post-recency) train set.
+# Diagnostic only; does NOT change keep decisions (which use overall val_auc).
+try:
+    from sklearn.metrics import roc_auc_score
+    _train_real = train_df[train_df["rating"] > 0]
+    _train_user_set = set(_train_real["userId"].unique().tolist())
+    _train_item_set = set(_train_real["movieId"].unique().tolist())
+    _eval_uid_arr = _eval_df["userId"].values.astype(np.int64)
+    _eval_mid_arr = _eval_df["movieId"].values.astype(np.int64)
+    _cold_user_mask = ~np.isin(_eval_uid_arr, list(_train_user_set))
+    _cold_item_mask = ~np.isin(_eval_mid_arr, list(_train_item_set))
+    # Recompute scores once (already done in run_eval but discarded)
+    model.eval()
+    _scores = []
+    with torch.no_grad():
+        eval_batch = BATCH_SIZE * 2
+        for s in range(0, n_eval, eval_batch):
+            e = min(s + eval_batch, n_eval)
+            out = model(eval_uids[s:e], eval_mids[s:e], eval_ts[s:e],
+                        ts_raw=eval_ts_raw[s:e])
+            logits = out[0] if isinstance(out, tuple) else out
+            _scores.append(torch.sigmoid(logits).cpu().numpy())
+    model.train()
+    _scores = np.concatenate(_scores)
+    _labels = eval_labels_t.cpu().numpy()
+    _strata = [
+        ("warm", ~_cold_user_mask & ~_cold_item_mask),
+        ("cold_user", _cold_user_mask & ~_cold_item_mask),
+        ("cold_item", ~_cold_user_mask & _cold_item_mask),
+        ("cold_both", _cold_user_mask & _cold_item_mask),
+    ]
+    log.info("OOV-decomposed val AUC:")
+    for name, mask in _strata:
+        if mask.sum() == 0 or len(np.unique(_labels[mask])) < 2:
+            log.info(f"  val_auc_{name}: n/a (n={int(mask.sum())})")
+            continue
+        auc = roc_auc_score(_labels[mask], _scores[mask])
+        log.info(f"  val_auc_{name}: {auc:.6f}  n={int(mask.sum())}")
+except Exception as _e:
+    log.info(f"OOV-decomp eval skipped: {_e}")
 
 if torch.cuda.is_available():
     peak_mem_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
