@@ -186,6 +186,27 @@ POST_RECENCY_EASY_NEG_PER_POS = float(os.environ.get("POST_RECENCY_EASY_NEG_PER_
 # the 70%+ of val users that are OOV. Off-state (default 0): byte-equivalent.
 ANON_FALLBACK = int(os.environ.get("ANON_FALLBACK", "0"))
 
+# apr28ab cold-conditional cross fields + stochastic warm-row masking.
+# COLD_CROSS_FIELDS: comma-separated list of fields to cross with is_cold_user.
+#   Supported: "i_e" (28d), "genre" (num_genres-d). Each appears as
+#   `is_cold_user × <field>` appended to concat. Cold rows (truly OOV at eval,
+#   or stochastically-masked during training) get these fields = the original
+#   feature; warm rows get zeros.
+# WARM_MASK_P: probability per training row of marking a warm user as
+#   synthetic-cold (only during training; eval is deterministic). When > 0,
+#   forces gradient into cold-conditional cross weights via masked warm rows.
+# WARM_GATED_UHIST: when 1, append `(1 − is_cold) × u_hist_pool ⊙ i_e` as
+#   ADDITIONAL warm-specialized copy of the existing cross. Warm rows get
+#   effectively 2× signal on this cross; head can down-weight either copy.
+# is_cold_user is computed from a precomputed train_user_set (deterministic
+# lookup at eval). Off-state (defaults: COLD_CROSS_FIELDS empty, WARM_MASK_P=0,
+# WARM_GATED_UHIST=0): byte-equivalent — no field appended, no masking.
+COLD_CROSS_FIELDS = [f for f in os.environ.get("COLD_CROSS_FIELDS", "").split(",") if f]
+assert all(f in {"i_e", "genre"} for f in COLD_CROSS_FIELDS), \
+    f"COLD_CROSS_FIELDS supports {{i_e, genre}}; got {COLD_CROSS_FIELDS}"
+WARM_MASK_P = float(os.environ.get("WARM_MASK_P", "0.0"))
+WARM_GATED_UHIST = int(os.environ.get("WARM_GATED_UHIST", "0"))
+
 # ─── Device ────────────────────────────────────────────────────────
 torch.manual_seed(SEED)
 if torch.cuda.is_available():
@@ -518,6 +539,16 @@ _user_freq_weight_t = torch.from_numpy(
     1.0 / np.sqrt(np.asarray(user_count, dtype=np.float32) + 5.0)
 ).to(DEVICE)
 
+# Per-user "in train" boolean for is_cold_user lookup (apr28ab). Built from
+# the (post-recency-filter) training set: a uid is "in train" iff it has at
+# least one real rating in train_df. PAD row at index num_users is False (cold).
+# Used at forward time as `is_truly_cold = ~_user_in_train_t[uids]`.
+_user_in_train_np = np.zeros(num_users + 1, dtype=bool)
+_real_train_uids_for_cold = train_df.loc[train_df["rating"] > 0, "userId"].values.astype(np.int64)
+_user_in_train_np[_real_train_uids_for_cold] = True
+_user_in_train_t = torch.from_numpy(_user_in_train_np).to(DEVICE)
+del _user_in_train_np, _real_train_uids_for_cold
+
 
 # Per-sample dense features (just timestamp; year is per-movie, looked up at forward time)
 def _build_sample_tensors(df):
@@ -693,6 +724,14 @@ class LinearBaseline(nn.Module):
         # Optional per-movie genre × genome alignment scalar (1-d field).
         if CROSS_GENRE_GENOME:
             in_dim_total += 1
+        # apr28ab cold-conditional cross fields. Each appends D or num_genres dims.
+        if "i_e" in COLD_CROSS_FIELDS:
+            in_dim_total += D
+        if "genre" in COLD_CROSS_FIELDS:
+            in_dim_total += num_genres
+        # apr28ab warm-gated extra copy of u_hist_pool ⊙ i_e (D-d).
+        if WARM_GATED_UHIST:
+            in_dim_total += D
         self.in_dim = in_dim_total
         # Head: either the default Linear(in, 1) or a 1-hidden-layer MLP. The replacement
         # happens at the SAME __init__ point so any downstream RNG draws are unchanged at
@@ -768,6 +807,26 @@ class LinearBaseline(nn.Module):
             u_hist_pool = _pool_history(u_hist_e, u_hist_rat, u_valid, USER_HIST_POOL)
         u_hist_rat_mean = (u_hist_rat * u_valid).sum(dim=1) / u_count
         u_hist_rat_mean = u_hist_rat_mean.unsqueeze(-1)                        # (B, 1)
+
+        # apr28ab cold-conditional masking + indicator. Active only when any
+        # apr28ab flag is on; otherwise byte-equivalent (no mask, no indicator).
+        # Mask zeros out u_e + u_hist_pool + u_hist_rat_mean for cold rows so
+        # both existing fields/crosses AND new conditional crosses see a clean
+        # zero on the user side. Cold rows = truly OOV (eval) OR stochastic mask
+        # of warm rows (training only, with prob WARM_MASK_P).
+        if COLD_CROSS_FIELDS or WARM_GATED_UHIST or WARM_MASK_P > 0:
+            is_truly_cold = (~_user_in_train_t[uids]).float().unsqueeze(-1)    # (B, 1)
+            if self.training and WARM_MASK_P > 0:
+                is_synthetic = (torch.rand(uids.size(0), 1, device=uids.device) < WARM_MASK_P).float()
+                is_cold_user = ((is_truly_cold + is_synthetic) > 0.5).float()
+            else:
+                is_cold_user = is_truly_cold
+            keep_warm = 1.0 - is_cold_user                                     # (B, 1)
+            u_e = u_e * keep_warm
+            u_hist_pool = u_hist_pool * keep_warm
+            u_hist_rat_mean = u_hist_rat_mean * keep_warm
+        else:
+            is_cold_user = None
 
         # Item history: pool user_embed over valid raters
         i_hist = _item_hist_t[mids]                       # (B, IL)
@@ -850,6 +909,20 @@ class LinearBaseline(nn.Module):
         # Optional per-movie genre × genome alignment scalar (per-movie, no user).
         if CROSS_GENRE_GENOME:
             parts.append(_gg_align_t[mids].unsqueeze(-1))             # (B, 1)
+        # apr28ab cold-conditional cross fields. Each is `is_cold_user × <field>`.
+        # Cold rows get the field's value; warm rows get zero. The head learns
+        # cold-mode-specific weights for these fields without sharing with
+        # the unconditional warm-mode features.
+        if is_cold_user is not None:
+            if "i_e" in COLD_CROSS_FIELDS:
+                parts.append(is_cold_user * i_e)                       # (B, D)
+            if "genre" in COLD_CROSS_FIELDS:
+                parts.append(is_cold_user * genre_raw)                 # (B, num_genres)
+            # apr28ab warm-gated extra copy of u_hist_pool ⊙ i_e. NOTE: u_hist_pool
+            # was zeroed for cold rows above, so this is effectively gated by
+            # (1 - is_cold_user). Adding the explicit gate as belt-and-suspenders.
+            if WARM_GATED_UHIST:
+                parts.append((1.0 - is_cold_user) * (u_hist_pool * i_e))   # (B, D)
 
         x = torch.cat(parts, dim=-1)
         main_logit = self.head(x).squeeze(-1)
