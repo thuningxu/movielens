@@ -1,0 +1,6 @@
+[
+  {"name": "aeaf_c2_item_dyn_s43", "env": {"EVAL_DYNAMIC_HIST": "1", "EVAL_DYNAMIC_ITEM_HIST": "1", "SEED": "43"}},
+  {"name": "aeaf_c2_item_dyn_s44", "env": {"EVAL_DYNAMIC_HIST": "1", "EVAL_DYNAMIC_ITEM_HIST": "1", "SEED": "44"}},
+  {"name": "aeaf_c2_item_dyn_s45", "env": {"EVAL_DYNAMIC_HIST": "1", "EVAL_DYNAMIC_ITEM_HIST": "1", "SEED": "45"}},
+  {"name": "aeaf_c2_item_dyn_s46", "env": {"EVAL_DYNAMIC_HIST": "1", "EVAL_DYNAMIC_ITEM_HIST": "1", "SEED": "46"}}
+]

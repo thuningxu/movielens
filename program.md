@@ -47,6 +47,43 @@ Brief notes on cycles run on the restart. Detailed per-trial data lives in `resu
 
 Legacy DLRM ceiling: 0.8284. Restart linear-head model now within 0.0002 of legacy with much simpler architecture.
 
+### `autoresearch/apr28ae+af` — train-time dynamic + item-side eval-dynamic — null (sub-noise)
+
+**Null** (`a25cb2c` + fix at `bffcef5`). Two follow-ups to apr28ad's WIN. User asked to "explore both."
+
+**apr28ae** = TRAIN_DYNAMIC_HIST=1: per-batch on-the-fly GPU dynamic user history during training. Per-user sorted flat arrays + per-train-sample cut positions. Per-batch GPU gather. Eliminates the existing train-time time leak AND matches the eval distribution. Critic blocked the original 24 GB host precompute design (host has only 29 GB RAM); MLE redesigned for per-batch GPU lookup.
+
+**apr28af** = EVAL_DYNAMIC_ITEM_HIST=1: mirror of apr28ad on item axis. Per-eval-sample item history from train+val raters with timestamp < sample's ts.
+
+Pre-screen at SEED=42 vs apr28ad baseline (C0=0.846279):
+
+| Cell | val_auc | Δ |
+|---|---|---|
+| C0 (apr28ad alone) | 0.846279 | 0 |
+| C1 (TRAIN_DYNAMIC_HIST) | 0.850336 | +0.0041 |
+| **C2 (EVAL_DYNAMIC_ITEM_HIST)** | **0.852238** | **+0.0060** |
+| C3 (both) | 0.849249 | +0.0030 |
+
+C3 (both) UNDER both alone — apr28z-style stacking interference reappears.
+
+5-seed verify of C2 (best single-seed):
+
+| SEED | apr28ad | apr28af C2 | lift |
+|---|---|---|---|
+| 42 | 0.846279 | 0.852238 | +0.005959 |
+| 43 | 0.851598 | 0.852082 | +0.000484 |
+| 44 | 0.852609 | 0.852256 | -0.000353 |
+| 45 | 0.846751 | 0.845115 | **-0.001636** |
+| 46 | 0.851923 | 0.852589 | +0.000666 |
+
+**Mean +0.001024, 3/5 positive, min -0.001636, lift-σ 0.0029, t=0.79. Strictly null** (fails 5/5 positive AND min ≥ -0.0003 bars).
+
+**Validator caught a critical bug** during the pre-sweep review: the `_hist_idx` was gated only on EVAL_DYNAMIC_HIST, so EVAL_DYNAMIC_ITEM_HIST=1 alone silently fell back to static (the C2 path was DEAD until the fix). Fixed at bffcef5 — re-smoke confirmed item-side dynamic now exercises code path. Validator's catch saved the cycle from a misleading "null" finding.
+
+**Lesson**: cold_item (3.4% of val) + cold_both (13.7%, but already at 0.91 with apr28ad) have too little leverage to move overall val_auc beyond the apr28ad-regime noise floor (lift-σ ≈ 0.003). apr28ad's win came from cold_user (70% of val with 0.787 → 0.815 lift). Item-side analog has 1/20 the leverage. Train-time dynamic (C1 +0.0041 single-seed, untested at multi-seed but likely also sub-noise) similarly has too little marginal headroom over the eval-only mechanism.
+
+**Final apr28-restart baseline holds at apr28ad's 0.849833 5-seed mean / 0.846279 SEED=42** (with `EVAL_DYNAMIC_HIST=1`).
+
 ### `autoresearch/apr28ad` — eval-time dynamic user history — **MAJOR WIN +0.022 5-seed mean**
 
 **Win** (`5364583`). After 14 nulls confirmed cold_user 0.787 ceiling is structural (not item-content quality — see apr28aa/ab/ac), user committed to "incremental training during evaluation" / inductive user bootstrapping. Researcher proposed eval-only first cut: at evaluation time, rebuild each sample's u_hist from combined train+val ratings strictly before the sample's timestamp. Critic vetted with mods (vectorize per-uid, stratify cold_user_first/later, tighter decision rule).

@@ -1,0 +1,6 @@
+[
+  {"name": "aeaf_c0_baseline_s42",      "env": {"EVAL_DYNAMIC_HIST": "1"}},
+  {"name": "aeaf_c1_train_dyn_s42",     "env": {"EVAL_DYNAMIC_HIST": "1", "TRAIN_DYNAMIC_HIST": "1"}},
+  {"name": "aeaf_c2_item_dyn_s42",      "env": {"EVAL_DYNAMIC_HIST": "1", "EVAL_DYNAMIC_ITEM_HIST": "1"}},
+  {"name": "aeaf_c3_both_s42",          "env": {"EVAL_DYNAMIC_HIST": "1", "TRAIN_DYNAMIC_HIST": "1", "EVAL_DYNAMIC_ITEM_HIST": "1"}}
+]
