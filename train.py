@@ -1258,7 +1258,7 @@ def run_eval():
     with torch.no_grad():
         for s in range(0, n_eval, eval_batch):
             e = min(s + eval_batch, n_eval)
-            _hist_idx = torch.arange(s, e, device=DEVICE) if EVAL_DYNAMIC_HIST else None
+            _hist_idx = torch.arange(s, e, device=DEVICE) if (EVAL_DYNAMIC_HIST or EVAL_DYNAMIC_ITEM_HIST) else None
             out = model(eval_uids[s:e], eval_mids[s:e], eval_ts[s:e],
                         ts_raw=eval_ts_raw[s:e], hist_idx=_hist_idx)
             logits = out[0] if isinstance(out, tuple) else out
@@ -1370,7 +1370,7 @@ try:
         eval_batch = BATCH_SIZE * 2
         for s in range(0, n_eval, eval_batch):
             e = min(s + eval_batch, n_eval)
-            _hist_idx = torch.arange(s, e, device=DEVICE) if EVAL_DYNAMIC_HIST else None
+            _hist_idx = torch.arange(s, e, device=DEVICE) if (EVAL_DYNAMIC_HIST or EVAL_DYNAMIC_ITEM_HIST) else None
             out = model(eval_uids[s:e], eval_mids[s:e], eval_ts[s:e],
                         ts_raw=eval_ts_raw[s:e], hist_idx=_hist_idx)
             logits = out[0] if isinstance(out, tuple) else out
