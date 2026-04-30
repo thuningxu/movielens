@@ -1,0 +1,6 @@
+[
+  {"name": "ag_c2_no_freq_s43", "env": {"EVAL_DYNAMIC_HIST": "1", "FREQ_WD_LAMBDA": "0", "SEED": "43"}},
+  {"name": "ag_c2_no_freq_s44", "env": {"EVAL_DYNAMIC_HIST": "1", "FREQ_WD_LAMBDA": "0", "SEED": "44"}},
+  {"name": "ag_c2_no_freq_s45", "env": {"EVAL_DYNAMIC_HIST": "1", "FREQ_WD_LAMBDA": "0", "SEED": "45"}},
+  {"name": "ag_c2_no_freq_s46", "env": {"EVAL_DYNAMIC_HIST": "1", "FREQ_WD_LAMBDA": "0", "SEED": "46"}}
+]

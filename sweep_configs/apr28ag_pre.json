@@ -1,0 +1,7 @@
+[
+  {"name": "ag_c0_baseline_s42",   "env": {"EVAL_DYNAMIC_HIST": "1"}},
+  {"name": "ag_c1_no_aux_s42",     "env": {"EVAL_DYNAMIC_HIST": "1", "AUX_RATING_WEIGHT": "0"}},
+  {"name": "ag_c2_no_freq_s42",    "env": {"EVAL_DYNAMIC_HIST": "1", "FREQ_WD_LAMBDA": "0"}},
+  {"name": "ag_c3_no_ts_cross_s42","env": {"EVAL_DYNAMIC_HIST": "1", "CROSS_TS_ITEM": "0"}},
+  {"name": "ag_c4_all_off_s42",    "env": {"EVAL_DYNAMIC_HIST": "1", "AUX_RATING_WEIGHT": "0", "FREQ_WD_LAMBDA": "0", "CROSS_TS_ITEM": "0"}}
+]

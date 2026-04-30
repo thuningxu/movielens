@@ -44,9 +44,42 @@ Brief notes on cycles run on the restart. Detailed per-trial data lives in `resu
 | Cross fields (apr28b) | 0.8251 | +0.040 |
 | LR=3e-4, WD=5e-5 (apr28g) | 0.8263 | +0.042 |
 | Sub-noise stack of 3 (apr28o) | 0.8282 | +0.043 |
-| **EVAL_DYNAMIC_HIST=1 (apr28ad)** | **0.8463** (5-seed mean 0.8498) | **+0.062** |
+| EVAL_DYNAMIC_HIST=1 (apr28ad) | 0.8463 (5-seed mean 0.8498) | +0.062 |
+| **+ FREQ_WD_LAMBDA=0 (apr28ag)** | **0.8521** (5-seed mean 0.8513) | **+0.067** |
 
-Legacy DLRM ceiling: 0.8284. Restart linear-head + `EVAL_DYNAMIC_HIST=1` (apr28ad) **exceeds the legacy ceiling by +0.022**. Without `EVAL_DYNAMIC_HIST=1` the static-history linear baseline still matches legacy within 0.0002 (apr28o stack at 0.8282).
+Legacy DLRM ceiling: 0.8284. Restart linear-head + `EVAL_DYNAMIC_HIST=1` + `FREQ_WD_LAMBDA=0` (apr28ag) **exceeds the legacy ceiling by +0.024**. Without `EVAL_DYNAMIC_HIST=1` the static-history linear baseline still matches legacy within 0.0002 (apr28o stack at 0.8282).
+
+### `autoresearch/apr28ag` — apr28o stack ablation at dynamic regime — **WIN: drop FREQ_WD_LAMBDA**
+
+**Win** (no code change; pure env-flag drop). Phase A1 of the post-apr28ad plan. After apr28ad shipped at +0.022 5-seed mean with EVAL_DYNAMIC_HIST=1, verify whether the apr28o stack components (AUX_RATING_WEIGHT=25, FREQ_WD_LAMBDA=1e-4, CROSS_TS_ITEM=1) still help at the new regime.
+
+5-cell single-seed pre-screen at SEED=42 (vs apr28ad baseline 0.846279):
+
+| Cell | val_auc | Δ |
+|---|---|---|
+| C0 baseline (all on) | 0.846279 | 0 |
+| C1 AUX off | 0.840942 | -0.0053 (essential, keep) |
+| **C2 FREQ off** | **0.852139** | **+0.0059 (drop candidate)** |
+| C3 CROSS_TS off | 0.844587 | -0.0017 (noise band, defer) |
+| C4 all three off | 0.840233 | -0.0060 (~AUX-off; AUX dominates) |
+
+5-seed verify of C2 (FREQ off):
+
+| SEED | C0 (FREQ=1e-4) | C2 (FREQ=0) | lift |
+|---|---|---|---|
+| 42 | 0.846279 | 0.852139 | +0.005860 |
+| 43 | 0.851598 | 0.852213 | +0.000615 |
+| 44 | 0.852609 | 0.852789 | +0.000180 |
+| 45 | 0.846751 | 0.847344 | +0.000593 |
+| 46 | 0.851923 | 0.852146 | +0.000223 |
+
+**Mean +0.001494, 5/5 positive, min +0.000180.** Clears all multi-seed bars.
+
+**Mechanism**: at the static regime (apr28o), FREQ_WD_LAMBDA=1e-4 helped by shrinking tail-item embeddings toward zero (regularizing per `1/sqrt(item_count + 5)`). At the dynamic regime (apr28ad), the model receives richer u_hist signal at eval — including val items, which are tail-frequent. The previously-useful tail-item regularization becomes an over-regularization at the new regime; tail items need larger embeddings to provide useful dynamic-history signal. **Apr28o sub-noise stacking lessons don't auto-transfer when the eval distribution shifts.**
+
+**New baseline**: 5-seed mean **0.851326** (SEED=42: 0.852139). Apr28ad's win + this drop = +0.0232 over the static apr28o baseline.
+
+**AUX_RATING_WEIGHT=25 and CROSS_TS_ITEM=1 still essential** (dropping either regresses by ~-0.002 to -0.005 single-seed). The aux head's multi-task regularization and the temporal-drift cross are still load-bearing at the dynamic regime.
 
 ### `autoresearch/apr28ae+af` — train-time dynamic + item-side eval-dynamic — null (sub-noise)
 
