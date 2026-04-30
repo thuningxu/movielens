@@ -8,6 +8,7 @@ dependencies = [
     "numpy",
     "scikit-learn",
     "scipy",
+    "sentence-transformers",
 ]
 
 [[tool.uv.index]]

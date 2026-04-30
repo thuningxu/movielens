@@ -207,6 +207,14 @@ assert all(f in {"i_e", "genre"} for f in COLD_CROSS_FIELDS), \
 WARM_MASK_P = float(os.environ.get("WARM_MASK_P", "0.0"))
 WARM_GATED_UHIST = int(os.environ.get("WARM_GATED_UHIST", "0"))
 
+# apr28ac per-movie tag-text embedding. Loads tags.csv, groups by movieId,
+# encodes each movie's tag bag via sentence-transformers/all-MiniLM-L6-v2
+# (384-d). Cached as movie_tag_embed (num_items+1, 384) in the feature cache.
+# Tests whether per-movie text content beats the cold_user 0.787 ceiling.
+# Off-state (default 0): no field appended; byte-equivalent.
+MOVIE_TAG_TEXT = int(os.environ.get("MOVIE_TAG_TEXT", "0"))
+MOVIE_TAG_TEXT_DIM = 384  # all-MiniLM-L6-v2 output dim, fixed
+
 # ─── Device ────────────────────────────────────────────────────────
 torch.manual_seed(SEED)
 if torch.cuda.is_available():
@@ -300,7 +308,7 @@ if RECENCY_FRAC < 1.0 - 1e-9:
 #   - per sample: timestamp normalized
 
 _cache_key = hashlib.md5(json.dumps({
-    "feature_version": "restart-5",       # restart-5 adds per-user count + per-user genre affinity
+    "feature_version": "restart-6",       # restart-6 adds per-movie tag-text embedding (384-d)
     "dataset": DATASET, "neg_ratio": NEG_RATIO,
     "history_len": HISTORY_LEN, "item_hist_len": ITEM_HIST_LEN,
     "num_users": num_users, "num_items": num_items,
@@ -328,6 +336,7 @@ if _cache_path.exists():
     user_genome_agg = _c["user_genome_agg"]
     user_count = _c["user_count"]
     user_genre_affinity = _c["user_genre_affinity"]
+    movie_tag_embed = _c["movie_tag_embed"]
     del _c
 else:
     log.info("Computing features (will cache for next run)...")
@@ -485,6 +494,63 @@ else:
         _denom = np.abs(_w).sum(axis=1, keepdims=True).clip(1e-6)
         user_genre_affinity[_s:_e] = (_h * _w[:, :, None]).sum(axis=1) / _denom
 
+    # Per-movie tag-text embedding (apr28ac restart-6). Loads tags.csv, groups
+    # by movieId, encodes each movie's tag bag (space-joined) via
+    # sentence-transformers/all-MiniLM-L6-v2 → 384-d L2-normalized embedding.
+    # Movies with no tags get zero vector (~28% of rated movies on ml-25m).
+    # Shape (num_items + 1, 384) including PAD slot. Allocated even when
+    # MOVIE_TAG_TEXT=0 since it's part of the cache; downstream lookup is gated.
+    log.info("Encoding per-movie tag text via all-MiniLM-L6-v2 (restart-6)...")
+    movie_tag_embed = np.zeros((num_items + 1, MOVIE_TAG_TEXT_DIM), dtype=np.float32)
+    _tags_path = Path(__file__).parent / "data" / DATASET / "tags.csv"
+    if _tags_path.exists():
+        _tags_df = pd.read_csv(_tags_path)
+        # Map RAW movieId → remapped movieId via load_data_hybrid's mapping
+        # The remap was applied to train/val/test inside load_data_hybrid; we
+        # need the same map. Recover it from movies_df, which has remapped IDs.
+        # movies_df rows have remapped IDs; we don't have the original→remapped
+        # map directly. But raw tags.csv uses the SAME ORIGINAL movieIds as
+        # ratings.csv. Rebuild the remap from the union of all ratings.
+        _ratings_df = pd.concat([
+            train_df[["movieId"]], val_df[["movieId"]],
+        ], ignore_index=True)
+        # The remap was: original→0..num_items-1 by order of unique appearance
+        # in the time-sorted full dataset. That info isn't available post-remap.
+        # WORKAROUND: re-run the same remap by reading raw ratings.csv to recover
+        # original→remapped map.
+        _raw_ratings_path = Path(__file__).parent / "data" / DATASET / "ratings.csv"
+        _raw_ratings = pd.read_csv(_raw_ratings_path)
+        _raw_ratings = _raw_ratings.sort_values("timestamp").reset_index(drop=True)
+        _orig_movie_ids = _raw_ratings["movieId"].unique()  # order of first appearance
+        _movie_remap = {orig: i for i, orig in enumerate(_orig_movie_ids)}
+        del _raw_ratings, _orig_movie_ids
+        # Map raw tags.csv movieIds to remapped IDs; drop unmapped
+        _tags_df["mapped_mid"] = _tags_df["movieId"].map(_movie_remap)
+        _tags_df = _tags_df.dropna(subset=["mapped_mid", "tag"])
+        _tags_df["mapped_mid"] = _tags_df["mapped_mid"].astype(int)
+        _tags_df["tag"] = _tags_df["tag"].astype(str)
+        # Group tags per movie, join with spaces (preserves multi-tag context)
+        _movie_tag_text = (
+            _tags_df.groupby("mapped_mid")["tag"]
+            .apply(lambda s: " ".join(s.tolist()))
+            .to_dict()
+        )
+        log.info(f"Tag text built for {len(_movie_tag_text)}/{num_items} movies "
+                 f"({100*len(_movie_tag_text)/num_items:.1f}%)")
+        # Encode through MiniLM in batches
+        from sentence_transformers import SentenceTransformer
+        _st_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2",
+                                        device=str(DEVICE))
+        _mids_with_tags = sorted(_movie_tag_text.keys())
+        _texts = [_movie_tag_text[m] for m in _mids_with_tags]
+        _embs = _st_model.encode(_texts, batch_size=256, show_progress_bar=False,
+                                  convert_to_numpy=True, normalize_embeddings=True)
+        movie_tag_embed[_mids_with_tags] = _embs.astype(np.float32)
+        del _st_model, _tags_df, _movie_tag_text, _texts, _embs, _mids_with_tags, _movie_remap
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    else:
+        log.info(f"No tags.csv for {DATASET}; movie_tag_embed left as zeros")
+
     np.savez_compressed(_cache_path,
         movie_genres=movie_genres,
         user_histories=user_histories, user_hist_ratings=user_hist_ratings,
@@ -498,6 +564,7 @@ else:
         user_genome_agg=user_genome_agg,
         user_count=user_count,
         user_genre_affinity=user_genre_affinity,
+        movie_tag_embed=movie_tag_embed,
     )
     log.info(f"Features cached to {_cache_path.name}")
 
@@ -515,6 +582,7 @@ _movie_genres_t = torch.from_numpy(movie_genres).to(DEVICE)
 _genome_t = torch.from_numpy(genome_matrix).to(DEVICE)
 _user_genome_agg_t = torch.from_numpy(user_genome_agg).to(DEVICE)
 _user_genre_affinity_t = torch.from_numpy(user_genre_affinity).to(DEVICE)
+_movie_tag_embed_t = torch.from_numpy(movie_tag_embed).to(DEVICE)
 _movie_year_t = torch.from_numpy(movie_year).to(DEVICE)
 
 # Per-movie genre × genome content coherence scalar, computed once on GPU.
@@ -732,6 +800,9 @@ class LinearBaseline(nn.Module):
         # apr28ab warm-gated extra copy of u_hist_pool ⊙ i_e (D-d).
         if WARM_GATED_UHIST:
             in_dim_total += D
+        # apr28ac per-movie tag-text embedding (384-d).
+        if MOVIE_TAG_TEXT:
+            in_dim_total += MOVIE_TAG_TEXT_DIM
         self.in_dim = in_dim_total
         # Head: either the default Linear(in, 1) or a 1-hidden-layer MLP. The replacement
         # happens at the SAME __init__ point so any downstream RNG draws are unchanged at
@@ -909,6 +980,9 @@ class LinearBaseline(nn.Module):
         # Optional per-movie genre × genome alignment scalar (per-movie, no user).
         if CROSS_GENRE_GENOME:
             parts.append(_gg_align_t[mids].unsqueeze(-1))             # (B, 1)
+        # apr28ac per-movie tag-text embedding (384-d, all-MiniLM-L6-v2).
+        if MOVIE_TAG_TEXT:
+            parts.append(_movie_tag_embed_t[mids])                    # (B, 384)
         # apr28ab cold-conditional cross fields. Each is `is_cold_user × <field>`.
         # Cold rows get the field's value; warm rows get zero. The head learns
         # cold-mode-specific weights for these fields without sharing with
