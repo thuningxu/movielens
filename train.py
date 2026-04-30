@@ -215,6 +215,15 @@ WARM_GATED_UHIST = int(os.environ.get("WARM_GATED_UHIST", "0"))
 MOVIE_TAG_TEXT = int(os.environ.get("MOVIE_TAG_TEXT", "0"))
 MOVIE_TAG_TEXT_DIM = 384  # all-MiniLM-L6-v2 output dim, fixed
 
+# apr28ad eval-time dynamic user history. When 1, at eval time each sample uses
+# a per-sample u_hist built from combined train+val ratings with timestamp
+# strictly before the sample's own timestamp. For cold val users (70% of val
+# users), this turns an empty history into a non-empty one (their prior val
+# ratings). Tests whether the linear head extracts cold_user signal when given
+# user-side info via dynamic history rebuild. Eval-only — training is unchanged.
+# Off-state (default 0): forward path unchanged; byte-equivalent.
+EVAL_DYNAMIC_HIST = int(os.environ.get("EVAL_DYNAMIC_HIST", "0"))
+
 # ─── Device ────────────────────────────────────────────────────────
 torch.manual_seed(SEED)
 if torch.cuda.is_available():
@@ -674,6 +683,76 @@ eval_uids, eval_mids, eval_ts, eval_ts_raw, eval_labels_t, _eval_ratings_norm = 
 n_eval = len(eval_uids)
 log.info(f"Eval set: {_n_val_pos} pos + {len(_val_hard_neg)} hard neg + {_n_val_pos} easy neg = {n_eval}")
 
+# ─── apr28ad: per-eval-sample dynamic user history ──────────────────
+# For each eval row (uid, ts), build a history from combined train+val
+# ratings of that uid with timestamp strictly before ts. Allows cold val
+# users (70% of val users) to have non-empty u_hist_pool at eval time.
+# Implementation: vectorized per-uid binary search.
+if EVAL_DYNAMIC_HIST:
+    log.info("Building eval-time dynamic user histories (apr28ad)...")
+    # Combine train+val real ratings (rating > 0). Easy negs (rating==0) excluded.
+    _comb_real = pd.concat([
+        train_df[train_df["rating"] > 0][["userId", "movieId", "rating", "timestamp"]],
+        val_df[val_df["rating"] > 0][["userId", "movieId", "rating", "timestamp"]],
+    ], ignore_index=True)
+    # Sort by (userId, timestamp) to enable per-user contiguous slices.
+    _comb_real = _comb_real.sort_values(["userId", "timestamp"]).reset_index(drop=True)
+    _all_uid = _comb_real["userId"].values.astype(np.int64)
+    _all_mid = _comb_real["movieId"].values.astype(np.int64)
+    _all_rat = (_comb_real["rating"].values.astype(np.float32) / 5.0)
+    _all_ts = _comb_real["timestamp"].values.astype(np.int64)
+    # Per-uid offsets in the sorted array (uid → [start, end)).
+    _uid_starts = np.searchsorted(_all_uid, np.arange(num_users), side="left")
+    _uid_ends = np.searchsorted(_all_uid, np.arange(num_users), side="right")
+    # Materialize (n_eval, HISTORY_LEN) tensors.
+    _eval_user_hist_np = np.full((n_eval, HISTORY_LEN), PAD_IDX, dtype=np.int64)
+    _eval_user_hist_rat_np = np.zeros((n_eval, HISTORY_LEN), dtype=np.float32)
+    _eval_user_hist_ts_np = np.zeros((n_eval, HISTORY_LEN), dtype=np.int32)
+    _eval_uids_np = eval_uids.cpu().numpy()
+    _eval_ts_raw_np = eval_ts_raw.cpu().numpy()
+    # Group eval rows by uid for vectorized per-uid searchsorted.
+    _eval_order = np.argsort(_eval_uids_np, kind="stable")
+    _eval_uids_sorted = _eval_uids_np[_eval_order]
+    _eval_uid_starts = np.searchsorted(_eval_uids_sorted, np.arange(num_users), side="left")
+    _eval_uid_ends = np.searchsorted(_eval_uids_sorted, np.arange(num_users), side="right")
+    _n_cold_first_row = 0
+    _n_cold_later_row = 0
+    for _uid in range(num_users):
+        _es, _ee = int(_eval_uid_starts[_uid]), int(_eval_uid_ends[_uid])
+        if _es == _ee:
+            continue  # no eval rows for this uid
+        _us, _ue = int(_uid_starts[_uid]), int(_uid_ends[_uid])
+        if _us == _ue:
+            continue  # no train+val ratings → leave eval rows as PAD (empty history)
+        _user_ts = _all_ts[_us:_ue]                       # sorted asc
+        _user_mid = _all_mid[_us:_ue]
+        _user_rat = _all_rat[_us:_ue]
+        # Eval rows for this uid (their timestamps)
+        _eval_rows = _eval_order[_es:_ee]
+        _row_ts = _eval_ts_raw_np[_eval_rows]
+        # For each eval row, find cut = #items with ts < row_ts
+        _cuts = np.searchsorted(_user_ts, _row_ts, side="left")
+        for _row_idx, _cut in zip(_eval_rows, _cuts):
+            if _cut == 0:
+                continue  # no prior history → leave as PAD
+            _take = min(int(_cut), HISTORY_LEN)
+            _eval_user_hist_np[_row_idx, -_take:] = _user_mid[_cut - _take:_cut]
+            _eval_user_hist_rat_np[_row_idx, -_take:] = _user_rat[_cut - _take:_cut]
+            _eval_user_hist_ts_np[_row_idx, -_take:] = _user_ts[_cut - _take:_cut].astype(np.int32)
+    # Stratify cold_user into first-row vs later-row (Critic ask)
+    _cold_user_mask = ~_user_in_train_t.cpu().numpy()[_eval_uids_np]
+    _has_prior_hist = (_eval_user_hist_np != PAD_IDX).any(axis=1)
+    _n_cold_first_row = int((_cold_user_mask & ~_has_prior_hist).sum())
+    _n_cold_later_row = int((_cold_user_mask & _has_prior_hist).sum())
+    log.info(f"Dynamic eval history built: cold_user_first={_n_cold_first_row}, cold_user_later={_n_cold_later_row}")
+    _eval_user_hist_t = torch.from_numpy(_eval_user_hist_np).to(DEVICE)
+    _eval_user_hist_rat_t = torch.from_numpy(_eval_user_hist_rat_np).to(DEVICE)
+    _eval_user_hist_ts_t = torch.from_numpy(_eval_user_hist_ts_np).to(DEVICE)
+    del _comb_real, _all_uid, _all_mid, _all_rat, _all_ts, _uid_starts, _uid_ends
+    del _eval_user_hist_np, _eval_user_hist_rat_np, _eval_user_hist_ts_np
+    del _eval_uids_np, _eval_ts_raw_np, _eval_order, _eval_uids_sorted
+    del _eval_uid_starts, _eval_uid_ends, _cold_user_mask, _has_prior_hist
+
 
 # ═══════════════════════════════════════════════════════════════════
 # MODEL — single Linear head on concatenated features
@@ -847,13 +926,20 @@ class LinearBaseline(nn.Module):
         if ANON_FALLBACK:
             self.anon_user_embed = nn.Parameter(torch.zeros(D))
 
-    def forward(self, uids, mids, ts, ts_raw=None):
+    def forward(self, uids, mids, ts, ts_raw=None, hist_idx=None):
         u_e = self.user_embed(uids)
         i_e = self.item_embed(mids)
 
-        # User history: pool item_embed over valid (non-PAD) positions
-        u_hist = _user_hist_t[uids]                       # (B, L)
-        u_hist_rat = _user_hist_rat_t[uids]               # (B, L)
+        # User history: pool item_embed over valid (non-PAD) positions.
+        # When hist_idx is provided AND EVAL_DYNAMIC_HIST is on (eval-time only,
+        # apr28ad), use per-sample dynamic history built from train+val ratings
+        # with timestamp < sample's ts. Otherwise use the static per-user history.
+        if hist_idx is not None and EVAL_DYNAMIC_HIST:
+            u_hist = _eval_user_hist_t[hist_idx]
+            u_hist_rat = _eval_user_hist_rat_t[hist_idx]
+        else:
+            u_hist = _user_hist_t[uids]                       # (B, L)
+            u_hist_rat = _user_hist_rat_t[uids]               # (B, L)
         u_hist_e = self.item_embed(u_hist)                # (B, L, D)
         u_valid = (u_hist != PAD_IDX).float()             # (B, L)
         u_count = u_valid.sum(dim=1).clamp(min=1.0)       # (B,)
@@ -865,7 +951,10 @@ class LinearBaseline(nn.Module):
             is_cold = (u_valid.sum(dim=1) == 0).float().unsqueeze(-1)  # (B, 1)
             u_e = u_e * (1.0 - is_cold) + self.anon_user_embed.unsqueeze(0) * is_cold
         if USER_HIST_DECAY:
-            u_hist_ts = _user_hist_ts_t[uids]             # (B, L) int32
+            if hist_idx is not None and EVAL_DYNAMIC_HIST:
+                u_hist_ts = _eval_user_hist_ts_t[hist_idx]
+            else:
+                u_hist_ts = _user_hist_ts_t[uids]             # (B, L) int32
             u_hist_pool = _pool_history(
                 u_hist_e, u_hist_rat, u_valid, USER_HIST_POOL,
                 decay_theta=self.user_decay_theta,
@@ -1028,8 +1117,9 @@ def run_eval():
     with torch.no_grad():
         for s in range(0, n_eval, eval_batch):
             e = min(s + eval_batch, n_eval)
+            _hist_idx = torch.arange(s, e, device=DEVICE) if EVAL_DYNAMIC_HIST else None
             out = model(eval_uids[s:e], eval_mids[s:e], eval_ts[s:e],
-                        ts_raw=eval_ts_raw[s:e])
+                        ts_raw=eval_ts_raw[s:e], hist_idx=_hist_idx)
             logits = out[0] if isinstance(out, tuple) else out
             scores.append(torch.sigmoid(logits).cpu().numpy())
     model.train()
@@ -1135,8 +1225,9 @@ try:
         eval_batch = BATCH_SIZE * 2
         for s in range(0, n_eval, eval_batch):
             e = min(s + eval_batch, n_eval)
+            _hist_idx = torch.arange(s, e, device=DEVICE) if EVAL_DYNAMIC_HIST else None
             out = model(eval_uids[s:e], eval_mids[s:e], eval_ts[s:e],
-                        ts_raw=eval_ts_raw[s:e])
+                        ts_raw=eval_ts_raw[s:e], hist_idx=_hist_idx)
             logits = out[0] if isinstance(out, tuple) else out
             _scores.append(torch.sigmoid(logits).cpu().numpy())
     model.train()
@@ -1148,6 +1239,15 @@ try:
         ("cold_item", ~_cold_user_mask & _cold_item_mask),
         ("cold_both", _cold_user_mask & _cold_item_mask),
     ]
+    # apr28ad: split cold_user into first-row (no prior val items) and
+    # later-row (has prior val items). Only meaningful when EVAL_DYNAMIC_HIST=1
+    # (else dynamic histories aren't built and we can't tell prior history).
+    if EVAL_DYNAMIC_HIST:
+        _has_prior = (_eval_user_hist_t != PAD_IDX).any(dim=1).cpu().numpy()
+        _cold_user_first = _cold_user_mask & ~_cold_item_mask & ~_has_prior
+        _cold_user_later = _cold_user_mask & ~_cold_item_mask & _has_prior
+        _strata.append(("cold_user_first", _cold_user_first))
+        _strata.append(("cold_user_later", _cold_user_later))
     log.info("OOV-decomposed val AUC:")
     for name, mask in _strata:
         if mask.sum() == 0 or len(np.unique(_labels[mask])) < 2:
