@@ -8,7 +8,8 @@ Restart (apr28) of the MovieLens hybrid engagement prediction project. Same task
 
 The legacy project at `legacy/` reached **val_auc = 0.8284** but two separate ceiling tests (apr27, apr27c) confirmed the architecture family is saturated. This restart begins from the **simplest possible model — a single Linear head on concatenated features — with the same input features**, so future architectural decisions can be motivated by clean ablations rather than 540 experiments of inherited assumptions.
 
-Current baseline: **0.8594 on ml-25m at SEED=42** (5-seed mean **0.859289**) with `EVAL_DYNAMIC_HIST=1 FREQ_WD_LAMBDA=0 LR=1e-3`. Reached by stacking three post-apr28o mechanisms:
+Current baseline (val): **0.8594 on ml-25m at SEED=42** (5-seed mean **0.859289**) with `EVAL_DYNAMIC_HIST=1 FREQ_WD_LAMBDA=0 LR=1e-3`.
+**Held-out test (single-shot, apr28aj)**: **0.8455** at SEED=42 with the same stack (vs static apr28o 0.8221 on test = **+0.023** transfer; legacy DLRM ceiling exceeded by +0.023 on test). Reached by stacking three post-apr28o mechanisms:
 1. **Eval-time dynamic user history** (`EVAL_DYNAMIC_HIST=1`, apr28ad): at evaluation each sample's u_hist_pool is rebuilt from train+val ratings strictly prior to sample's ts. Cold_user stratum 0.787 → 0.815 (+0.028), drives overall +0.022 5-seed mean.
 2. **Drop tail-item regularizer** (`FREQ_WD_LAMBDA=0`, apr28ag): at the dynamic regime tail items need larger embeddings to feed useful dynamic-history signal; +0.0015 5-seed mean on top of apr28ad.
 3. **HP retune** (`LR=1e-3`, apr28ah): the static-regime LR=3e-4 was over-conservative at the new regime; with FREQ_WD off + dynamic eval signal the model wants more aggressive updates. +0.008 5-seed mean on top of apr28ag.
