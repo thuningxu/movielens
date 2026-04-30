@@ -47,6 +47,45 @@ Brief notes on cycles run on the restart. Detailed per-trial data lives in `resu
 
 Legacy DLRM ceiling: 0.8284. Restart linear-head model now within 0.0002 of legacy with much simpler architecture.
 
+### `autoresearch/apr28aa` — legacy recency port + anon-user fallback + OOV decomp — null
+
+**Null** (`cba61f2`). User-prompted exploration sequence after noticing two underexplored ideas: legacy's "fewer + more recent" trick (program.md learning #15: +0.00108 5-seed mean), and the cold-start problem (70.59% of ml-25m val users are OOV; 82.89% of val ratings touch an OOV user). Researcher/Critic 3-round debate converged on a 5-cell concurrent batch testing both mechanisms.
+
+Pre-screen at SEED=42 (vs 0.828188):
+
+| Cell | val_auc | Δ |
+|---|---|---|
+| P0 baseline | 0.828188 | 0 (sanity ✓) |
+| P1 RECENCY=0.7 only | 0.812769 | -0.0154 |
+| P2 RECENCY=0.7 + RESAMPLE | 0.814493 | -0.0137 |
+| P3 ANON_FALLBACK=1 only | **0.828188** | **0 (bit-equal!)** |
+| P4 full stack | 0.826251 | -0.0019 |
+
+OOV-stratified eval (P3 vs P4 — 4 strata: warm / cold_user / cold_item / cold_both):
+
+| Stratum | n | P3 (ANON) | P4 (recency+resample+ANON) |
+|---|---|---|---|
+| warm | 471K (12.6%) | 0.8029 | 0.8156 (+0.013) |
+| cold_user | 2.6M (70.3%) | 0.7870 | 0.7888 (+0.002) |
+| cold_item | 125K (3.4%) | 0.8702 | 0.8701 (~0) |
+| cold_both | 511K (13.7%) | 0.9056 | 0.9078 (+0.002) |
+
+**Two diagnostic findings:**
+
+1. **ANON_FALLBACK is broken by design.** anon_user_embed never receives gradient during training because no training row is cold — every training userId has ≥1 real rating in train (easy-negs are anchored to positive samples' users → easy-neg users are warm). anon stays at init zeros forever. P3 vs P0: bit-equal val_auc to 6 decimals (random u_e for OOV val users contributes label-uncorrelated noise below AUC resolution). Fix would require **stochastic warm-row dropout**: with probability p, replace a warm user's u_e with anon during training to force gradient into anon.
+
+2. **Recency port doesn't transfer to apr28o stack.** Legacy got +0.00108 5-seed mean on the field-attention DLRM; apr28aa gets -0.015 on the linear head. Per-stratum P4 is better than P3 on EVERY stratum (warm +0.013, cold_user +0.002, cold_both +0.002), but the OVERALL val_auc regresses by -0.002 — Simpson's paradox. The recency filter rebalances score magnitudes across strata; cold_user dominates (70% of rows) and its sub-noise lift can't compensate for the cross-stratum ranking redistribution. The apr28o stack's AUX_RATING head likely needs the full real-rating distribution to train its MSE head; dropping 30% breaks that.
+
+3. **Cold-start IS the bottleneck.** Cold_user AUC 0.787 vs warm 0.815 (+0.028 headroom). Cold_user is 70% of val rows. But neither mechanism in apr28aa moves it.
+
+**Lessons**:
+- The OOV-decomposed eval is now a permanent diagnostic (15 LOC, eval-only, ~3s overhead).
+- ANON_FALLBACK as designed is dead. Future cold-start fixes need training-time gradient into the anonymous embedding (e.g., stochastic warm-row dropout, or inductive embedding via item-history aggregation).
+- Recency mechanism is structurally incompatible with the apr28o stack via the AUX head dependency on full rating distribution. Could try without AUX_RATING but that's giving up an established win.
+- Sub-noise stack candidates from apr28o-style stacking are exhausted.
+
+**12 nulls now** (apr28p-aa). Final apr28-restart baseline: 0.828188. The cold-start headroom is real but requires structurally different mechanisms (val-time history rebuild, IMDB plot text, or an inductive user representation that can be trained without cold training rows).
+
 ### `autoresearch/apr28z` — all DIN/attention variants — sub-noise null
 
 **Null** (`36896ae`). Per user's "try all DINs" directive, ran 8 cells covering every untested attention/DIN variant: user-side dot-product attention (mirror of apr28y), user-side DIN-MLP-parallel at hidden ∈ {16, 32}, item-side DIN-MLP-parallel, user-side DIN-replace at hidden ∈ {8, 16}, plus rating-modulation and cross variants on user-side dot-product attention.

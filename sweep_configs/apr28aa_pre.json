@@ -1,0 +1,7 @@
+[
+  {"name": "aa_p0_baseline_s42",       "env": {}},
+  {"name": "aa_p1_recency_only_s42",   "env": {"RECENCY_FRAC": "0.7"}},
+  {"name": "aa_p2_recency_resample_s42","env": {"RECENCY_FRAC": "0.7", "POST_RECENCY_NEG_RESAMPLE": "1"}},
+  {"name": "aa_p3_anon_only_s42",      "env": {"ANON_FALLBACK": "1"}},
+  {"name": "aa_p4_full_stack_s42",     "env": {"RECENCY_FRAC": "0.7", "POST_RECENCY_NEG_RESAMPLE": "1", "ANON_FALLBACK": "1"}}
+]
