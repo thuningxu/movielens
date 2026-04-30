@@ -46,9 +46,9 @@ grep "^val_auc:\|^peak_memory_mb:" run.log
 - **Device**: Single CUDA GPU. Auto-detects CUDA / MPS / CPU.
 - **Environment**: Use the repo-local `uv` env (`uv sync`, then `uv run ...`).
 - **Datasets**: `ml-100k` (smoke test only, no genome data), `ml-1m` (fast iteration), `ml-10m` (medium), `ml-25m` (default, has genome data).
-- **Reproducibility**: Deterministic at SEED=42. Run-to-run variance at the same seed is <1e-5 AUC; seed-to-seed variance for the current linear baseline is σ ≈ 0.00008 across SEED ∈ {42,43,44,45,46} — about 10× tighter than the legacy DLRM's σ ≈ 0.00078. Estimate empirically again whenever the model architecture changes meaningfully.
+- **Reproducibility**: Deterministic at SEED=42. Run-to-run variance at the same seed is <1e-5 AUC. Seed-to-seed variance is regime-dependent: at the **static-history regime** (EVAL_DYNAMIC_HIST=0, apr28o stack at 0.8282) σ ≈ 0.00008 across SEED ∈ {42,43,44,45,46} — about 10× tighter than the legacy DLRM's σ ≈ 0.00078. At the **dynamic-history regime** (EVAL_DYNAMIC_HIST=1, apr28ad at 0.8498 5-seed mean) lift-σ widens to ~0.003 because dynamic histories amplify per-seed variance through the cold_user stratum. **The multi-seed bar (mean ≥ +0.0007, 5/5 positive, min ≥ -0.0003) was set at the static regime; at the dynamic regime use lift-σ ~0.003 to set new bars** (e.g., apr28af verified at +0.001 mean was correctly judged sub-noise). Re-estimate empirically whenever the baseline regime changes.
 - **Data**: auto-downloaded to `data/` on first use; not checked into git.
-- **Feature cache**: `data/features_<hash>.npz` is built on first run per (dataset, history-len) and reused afterward.
+- **Feature cache**: `data/features_<hash>.npz` is built on first run per (dataset, history-len, recency-frac) and reused afterward. Current `feature_version=restart-6` (per-movie tag-text embedding from MiniLM, apr28ac); a checkout pre-restart-6 will trigger one-time rebuild on first run.
 
 ## Current checked-in baseline (train.py)
 
@@ -84,9 +84,19 @@ Optimizer: Adam, lr=3e-4, weight_decay=5e-5
 Item-embed regularization: Adam WD + FREQ_WD_LAMBDA (=1e-4) × per-item L2 weighted 1/sqrt(count+5)
 Cross fields: 4 Hadamard products (u_e⊙i_e, u_hist⊙i_e, i_hist⊙u_e, ts⊙i_e)
 Training: batch=16384, sub-epoch eval 3×, patience=3 evals, max 20 epochs
+
+Eval-time mechanism (apr28ad — opt-in, default OFF):
+- EVAL_DYNAMIC_HIST=1: at evaluation each sample's u_hist is rebuilt
+  per-sample from train+val ratings strictly prior to the sample's
+  timestamp (vs the static per-user history built once from train).
+  Off-state byte-equivalent. Lifts cold_user stratum AUC 0.787 → 0.815
+  and overall val_auc 0.828 → 0.846 SEED=42 (5-seed mean +0.022). The
+  headline 0.8463 / 0.8498 baseline numbers REQUIRE this flag set.
 ```
 
 The "linear" naming refers to the prediction head — embeddings are still trainable (~6M params for ml-25m). Genre multi-hot, timestamp, year, and tag genome go straight into the concat with no intermediate projection (a `Linear(20, 28) → Linear(in, 1)` chain is expressively equivalent to a direct slice in the head).
+
+**To reproduce the headline baseline**: `EVAL_DYNAMIC_HIST=1 DATASET=ml-25m uv run python train.py`. Without `EVAL_DYNAMIC_HIST=1`, the model trains identically and reproduces the static-history baseline of 0.8282 (apr28o stack), which still matches the legacy DLRM ceiling within 0.0002.
 
 ## Discipline
 

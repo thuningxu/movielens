@@ -12,7 +12,7 @@ The prior project (see `legacy/`) reached val_auc = 0.8284 on ml-25m via several
 - **`prepare.py`**: do not modify (`evaluate()` is the ground-truth metric).
 - **`train.py`**: the experimentation file. Currently the linear baseline; will grow.
 - **Multi-seed discipline**: estimate the seed-noise floor empirically before declaring any win. A few baseline seeds give you σ; require multi-seed verification with mean lift comfortably above that floor and a positive sign at every seed.
-- **Feature cache**: `data/features_<hash>.npz` is built on first ml-25m run and reused. Cache key is `restart-5` (`restart-3` added per-item training-positive count; `restart-4` added per-user genome aggregate; `restart-5` added per-user count + per-user genre affinity).
+- **Feature cache**: `data/features_<hash>.npz` is built on first ml-25m run and reused. Cache key is `restart-6` (`restart-3` added per-item training-positive count; `restart-4` added per-user genome aggregate; `restart-5` added per-user count + per-user genre affinity; `restart-6` added per-movie tag-text embedding from MiniLM, apr28ac).
 
 ## Current operating mode (autonomous loop)
 
@@ -43,9 +43,10 @@ Brief notes on cycles run on the restart. Detailed per-trial data lives in `resu
 | Centered pool stack (apr28b) | 0.8246 | +0.040 |
 | Cross fields (apr28b) | 0.8251 | +0.040 |
 | LR=3e-4, WD=5e-5 (apr28g) | 0.8263 | +0.042 |
-| **Sub-noise stack of 3 (apr28o)** | **0.8282** | **+0.043** |
+| Sub-noise stack of 3 (apr28o) | 0.8282 | +0.043 |
+| **EVAL_DYNAMIC_HIST=1 (apr28ad)** | **0.8463** (5-seed mean 0.8498) | **+0.062** |
 
-Legacy DLRM ceiling: 0.8284. Restart linear-head model now within 0.0002 of legacy with much simpler architecture.
+Legacy DLRM ceiling: 0.8284. Restart linear-head + `EVAL_DYNAMIC_HIST=1` (apr28ad) **exceeds the legacy ceiling by +0.022**. Without `EVAL_DYNAMIC_HIST=1` the static-history linear baseline still matches legacy within 0.0002 (apr28o stack at 0.8282).
 
 ### `autoresearch/apr28ae+af` — train-time dynamic + item-side eval-dynamic — null (sub-noise)
 

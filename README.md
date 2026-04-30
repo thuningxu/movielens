@@ -93,7 +93,7 @@ Stripped to the bones: only raw IDs, raw history sequences, and pure content met
 
 - **`prepare.py`** — Shared with legacy. Data download + time-based train/val/test splits + AUC evaluation. Do not modify (the evaluation harness is the ground truth metric).
 - **`train.py`** — The current model. Linear head over a 1376-dim concat of embeddings + 4 multiplicative crosses + raw content features; auxiliary rating-residual regression head sharing the same concat. No hidden layers in the heads.
-- **`program.md`** — Experiment log of the restart cycles (apr28b through apr28x so far).
+- **`program.md`** — Experiment log of the restart cycles (apr28b through apr28ae+af so far).
 - **`legacy/`** — Frozen archive of the prior project. Available for reference; not authoritative for the restart.
 
 ## Quickstart
@@ -121,7 +121,7 @@ DATASET=ml-25m uv run python train.py
 
 Current baseline AUC: **0.8463 on ml-25m at SEED=42** (5-seed mean 0.8498) with `EVAL_DYNAMIC_HIST=1` (apr28ad). Static-history baseline: 0.8282 (deterministic, SEED=42; 5-seed mean +0.00175 over the prior 0.8263 LR/WD-retuned baseline). Reached by stacking three individually sub-threshold mechanisms — each +0.0005 to +0.0007 single-seed alone, but +0.0017 multi-seed when combined (super-additive).
 
-Four wins so far on the restart, all pure aggregator/feature/HP changes (no big architectural shifts):
+Five wins so far on the restart:
 - **Centered pool** (0.8246 from 0.8219): switched user-history and item-history pools from plain mean to a rating-centered weighted pool. Items rated above 3 stars push *toward* their embedding; items below 3 stars push *away*. Sign matters.
 - **Cross fields** (0.8251 from 0.8246): appended three Hadamard products to the concat — `u_e ⊙ i_e`, `u_hist_pool ⊙ i_e`, `i_hist_pool ⊙ u_e`. The linear head literally cannot synthesize multiplicative interactions on its own.
 - **LR + WD retune** (0.8263 from 0.8251): `LR=3e-4`, `WD=5e-5`. The new richer-feature baseline benefits from a softer, more regularized optimizer.
@@ -129,5 +129,6 @@ Four wins so far on the restart, all pure aggregator/feature/HP changes (no big 
   - `CROSS_TS_ITEM=1`: 4th cross field `ts_norm ⊙ i_e` for temporal drift in item preference
   - `FREQ_WD_LAMBDA=1e-4`: per-item L2 weighted by `1/sqrt(count + 5)` — tail items get more regularization
   - `AUX_RATING_WEIGHT=25.0`: parallel Linear head predicting normalized rating, MSE multi-task loss
+- **Eval-time dynamic user history** (0.8463 SEED=42 / 0.8498 5-seed mean from 0.8282; apr28ad): at evaluation each sample's `u_hist` is rebuilt from combined train+val ratings strictly prior to the sample's timestamp. Cold val users (70% of val) gain a real `u_hist_pool`; cold_user stratum AUC lifts +0.028 (0.787 → 0.815), driving +0.022 overall. Off-state byte-equivalent — flag-gated by `EVAL_DYNAMIC_HIST=1`. **First cycle to break above the legacy DLRM ceiling (0.8284), by +0.022.**
 
-This brings the linear-head baseline to within 0.0002 of the legacy DLRM ceiling (0.8284) — same task, much simpler architecture (no DIN, no field attention, no genome bottleneck, no two-stream MLPs).
+The first four wins bring the static-history linear baseline within 0.0002 of the legacy DLRM ceiling (0.8284) — same task, much simpler architecture (no DIN, no field attention, no genome bottleneck, no two-stream MLPs). The fifth (`EVAL_DYNAMIC_HIST=1`) **exceeds** the legacy DLRM by +0.022 via a feature-engineering / inference-time change rather than an architectural one.
