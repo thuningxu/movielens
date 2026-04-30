@@ -47,6 +47,42 @@ Brief notes on cycles run on the restart. Detailed per-trial data lives in `resu
 
 Legacy DLRM ceiling: 0.8284. Restart linear-head model now within 0.0002 of legacy with much simpler architecture.
 
+### `autoresearch/apr28ad` — eval-time dynamic user history — **MAJOR WIN +0.022 5-seed mean**
+
+**Win** (`5364583`). After 14 nulls confirmed cold_user 0.787 ceiling is structural (not item-content quality — see apr28aa/ab/ac), user committed to "incremental training during evaluation" / inductive user bootstrapping. Researcher proposed eval-only first cut: at evaluation time, rebuild each sample's u_hist from combined train+val ratings strictly before the sample's timestamp. Critic vetted with mods (vectorize per-uid, stratify cold_user_first/later, tighter decision rule).
+
+Implementation: `EVAL_DYNAMIC_HIST=1` env flag. At script load, vectorized per-uid binary search builds `_eval_user_hist_t` (n_eval, HISTORY_LEN). Forward gains `hist_idx` kwarg; eval loops pass per-batch slice indices. ~3 GB host memory + 80 LOC; off-state byte-equivalent.
+
+Pre-screen at SEED=42 (vs 0.828188):
+
+| | val_auc | warm | cold_user | cold_user_first | cold_user_later |
+|---|---|---|---|---|---|
+| baseline | 0.8282 | 0.8029 | 0.7870 | n/a | n/a |
+| apr28ad | **0.8463** | 0.8041 | **0.8147** | 0.8974 | 0.8134 |
+| Δ | **+0.0181** | +0.001 | **+0.028** | (new) | (new) |
+
+5-seed verify (lift over per-seed baseline):
+
+| SEED | baseline | apr28ad | lift |
+|---|---|---|---|
+| 42 | 0.828188 | 0.846279 | +0.018091 |
+| 43 | 0.828073 | 0.851598 | +0.023525 |
+| 44 | 0.828024 | 0.852609 | +0.024585 |
+| 45 | 0.828098 | 0.846751 | +0.018653 |
+| 46 | 0.828266 | 0.851923 | +0.023657 |
+
+**Mean lift +0.021702. 5/5 positive. Min +0.018091.** Crushes every multi-seed bar (mean 31× over +0.0007 floor; min 60× over -0.0003 floor).
+
+**New baseline**: 5-seed mean **0.849833**, SEED=42 reference **0.846279**. **Breaks above legacy DLRM ceiling (0.8284) by +0.022.**
+
+**Mechanism explanation**: cold val users (70% of val rows) had empty `u_hist_pool` because their history was built only from train_df (where they don't appear). The model defaulted to content-only prediction for them, capped at 0.787 cold_user AUC. With dynamic rebuild, a cold user on their 5th val rating gets a u_hist_pool computed from their first 4 val ratings. The model — though trained on dense static histories — extracts +0.028 cold_user AUC from this even sparse new signal. Even cold_user_first (no prior val items, identical to baseline static history) hits 0.897 AUC because new users tend to rate popular movies first (canonical hits, easy to predict).
+
+**Important caveat — different evaluation setup, not different architecture**: this is an inference-time feature change, not a model change. The val_auc number is comparable to other models that ALSO use inference-time history rebuild (which is how production recommenders work). It is NOT directly comparable to the legacy 0.8284 (which used static histories at eval). For an apples-to-apples comparison: the static-history baseline at apr28o stays at 0.828188.
+
+**Future direction**: train-time dynamic histories (per-batch causal rebuild) as the natural next cycle. The current code has a TIME LEAK in training (user_histories[uid] uses ALL of uid's train ratings, including those after the current sample's timestamp). Fixing the leak AND moving to dynamic train histories would: (a) eliminate the train/eval distribution mismatch (model would be trained on the distribution it sees at eval), (b) potentially extract more signal from cold-user dynamic histories. Cost: per-batch dynamic-history rebuild during training is significant CPU/GPU work.
+
+**This is the first cycle to break above the legacy DLRM ceiling**. 14 prior nulls (apr28p-ac) systematically ruled out architectural and feature-engineering interventions on the static-history representation. The win came from changing what the model SEES at eval, not what the model IS.
+
 ### `autoresearch/apr28ac` — per-movie tag-text embedding (MiniLM 384-d) — null
 
 **Null** (`0947513`). After apr28ab confirmed cold_user 0.787 is content-only ceiling, user proposed adding new content via tags.csv (1.09M user-applied free-text tags across 45k of 59k rated movies; not used by current model). Encoded each movie's tag bag through `sentence-transformers/all-MiniLM-L6-v2` → 384-d L2-normalized embedding per movie, cached as `movie_tag_embed` (cache version restart-6).

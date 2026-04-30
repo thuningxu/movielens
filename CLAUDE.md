@@ -8,7 +8,9 @@ Restart (apr28) of the MovieLens hybrid engagement prediction project. Same task
 
 The legacy project at `legacy/` reached **val_auc = 0.8284** but two separate ceiling tests (apr27, apr27c) confirmed the architecture family is saturated. This restart begins from the **simplest possible model — a single Linear head on concatenated features — with the same input features**, so future architectural decisions can be motivated by clean ablations rather than 540 experiments of inherited assumptions.
 
-Current baseline: **0.8282 on ml-25m at SEED=42** (5-seed mean +0.00175 over the prior 0.8263 LR/WD-retuned baseline; σ ≈ 0.00008 across SEEDs 42-46). Reached by stacking three individually sub-threshold mechanisms — rating-centered pool, multiplicative cross fields including `ts ⊙ i_e`, and an auxiliary rating-residual regression head — that compound super-additively. The progression is documented in `program.md`'s cumulative table.
+Current baseline: **0.8463 on ml-25m at SEED=42** (5-seed mean **0.849833**, lift +0.021702 over the prior 0.828130 baseline; 5/5 positive, min lift +0.018; σ ≈ 0.00008 across SEEDs 42-46 at the prior baseline). Reached by **eval-time dynamic user history** (`EVAL_DYNAMIC_HIST=1`, apr28ad): at evaluation time, each sample's u_hist_pool is rebuilt from train+val ratings strictly prior to the sample's own timestamp. This breaks the static cold-start ceiling (val cold_user AUC was capped at 0.787 because OOV val users had empty u_hist; with dynamic rebuild, cold users with even 1-2 prior val ratings get a real u_hist_pool). Cold_user stratum lifts +0.028 (0.787 → 0.815), driving the +0.022 overall.
+
+This is **not the same evaluation setup** as the legacy 0.8284 ceiling — it requires inference-time access to the user's prior ratings (how production recommender systems actually work). The static-history baseline (apr28o stack) was 0.828188, which the legacy DLRM matched within 0.0002. Apr28ad's mechanism is structurally orthogonal: a feature-engineering / inference-time change rather than an architecture change.
 
 ## Commands
 

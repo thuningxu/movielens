@@ -1,0 +1,6 @@
+[
+  {"name": "ad_dynamic_eval_s43", "env": {"EVAL_DYNAMIC_HIST": "1", "SEED": "43"}},
+  {"name": "ad_dynamic_eval_s44", "env": {"EVAL_DYNAMIC_HIST": "1", "SEED": "44"}},
+  {"name": "ad_dynamic_eval_s45", "env": {"EVAL_DYNAMIC_HIST": "1", "SEED": "45"}},
+  {"name": "ad_dynamic_eval_s46", "env": {"EVAL_DYNAMIC_HIST": "1", "SEED": "46"}}
+]

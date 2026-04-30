@@ -119,7 +119,7 @@ DATASET=ml-25m uv run python train.py
 - The 16 architectural-cycle's worth of dropouts, gates, residuals, and conditional flags
 - Anything in `legacy/train.py` past the feature-engineering section
 
-Current baseline AUC: **0.8282 on ml-25m** (deterministic, SEED=42; 5-seed mean +0.00175 over the prior 0.8263 LR/WD-retuned baseline). Reached by stacking three individually sub-threshold mechanisms — each +0.0005 to +0.0007 single-seed alone, but +0.0017 multi-seed when combined (super-additive).
+Current baseline AUC: **0.8463 on ml-25m at SEED=42** (5-seed mean 0.8498) with `EVAL_DYNAMIC_HIST=1` (apr28ad). Static-history baseline: 0.8282 (deterministic, SEED=42; 5-seed mean +0.00175 over the prior 0.8263 LR/WD-retuned baseline). Reached by stacking three individually sub-threshold mechanisms — each +0.0005 to +0.0007 single-seed alone, but +0.0017 multi-seed when combined (super-additive).
 
 Four wins so far on the restart, all pure aggregator/feature/HP changes (no big architectural shifts):
 - **Centered pool** (0.8246 from 0.8219): switched user-history and item-history pools from plain mean to a rating-centered weighted pool. Items rated above 3 stars push *toward* their embedding; items below 3 stars push *away*. Sign matters.
