@@ -45,9 +45,43 @@ Brief notes on cycles run on the restart. Detailed per-trial data lives in `resu
 | LR=3e-4, WD=5e-5 (apr28g) | 0.8263 | +0.042 |
 | Sub-noise stack of 3 (apr28o) | 0.8282 | +0.043 |
 | EVAL_DYNAMIC_HIST=1 (apr28ad) | 0.8463 (5-seed mean 0.8498) | +0.062 |
-| **+ FREQ_WD_LAMBDA=0 (apr28ag)** | **0.8521** (5-seed mean 0.8513) | **+0.067** |
+| + FREQ_WD_LAMBDA=0 (apr28ag) | 0.8521 (5-seed mean 0.8513) | +0.067 |
+| **+ LR=1e-3 (apr28ah)** | **0.8594** (5-seed mean 0.8593) | **+0.075** |
 
-Legacy DLRM ceiling: 0.8284. Restart linear-head + `EVAL_DYNAMIC_HIST=1` + `FREQ_WD_LAMBDA=0` (apr28ag) **exceeds the legacy ceiling by +0.024**. Without `EVAL_DYNAMIC_HIST=1` the static-history linear baseline still matches legacy within 0.0002 (apr28o stack at 0.8282).
+Legacy DLRM ceiling: 0.8284. Restart linear-head + `EVAL_DYNAMIC_HIST=1 FREQ_WD_LAMBDA=0 LR=1e-3` (apr28ah stack) **exceeds the legacy ceiling by +0.031**. Without `EVAL_DYNAMIC_HIST=1` the static-history linear baseline still matches legacy within 0.0002 (apr28o stack at 0.8282).
+
+### `autoresearch/apr28ah` — HP retune at apr28ag regime — **WIN: LR 3e-4 → 1e-3** (+0.008 5-seed mean)
+
+**Win** (no code change). Phase A2 of the post-apr28ad plan. Re-tune LR × WD now that EVAL_DYNAMIC_HIST=1 and FREQ_WD_LAMBDA=0 changed the gradient/regularization landscape. apr28g's static-regime tune (LR=3e-4 WD=5e-5) was the input.
+
+6-cell single-seed grid at SEED=42 (vs apr28ag baseline 0.852139):
+
+| Cell | LR | WD | val_auc | Δ |
+|---|---|---|---|---|
+| C0 | 3e-4 | 5e-5 | 0.852139 | 0 (control) |
+| C1 | 3e-4 | 1e-4 | 0.850472 | -0.0017 |
+| C2 | 3e-4 | 1e-5 | 0.856847 | +0.0047 |
+| **C3** | **1e-3** | **5e-5** | **0.859384** | **+0.0072** |
+| C4 | 1e-3 | 1e-4 | 0.855529 | +0.0034 |
+| C5 | 1e-4 | 1e-4 | 0.843201 | -0.0089 |
+
+Three cells clear single-seed +0.003 threshold (C2, C3, C4); C3 is the clear winner. Pattern: **LR=1e-3 strongly beats LR=3e-4** at all WDs. LR=1e-4 (C5) hurts.
+
+5-seed verify of C3 (LR=1e-3, WD=5e-5):
+
+| SEED | apr28ag (LR=3e-4) | apr28ah (LR=1e-3) | lift |
+|---|---|---|---|
+| 42 | 0.852139 | 0.859384 | +0.007245 |
+| 43 | 0.852213 | 0.858993 | +0.006780 |
+| 44 | 0.852789 | 0.859990 | +0.007201 |
+| 45 | 0.847344 | 0.858905 | +0.011561 |
+| 46 | 0.852146 | 0.859175 | +0.007029 |
+
+**Mean +0.007963, 5/5 positive, min +0.006780.** Mean 11× over +0.0007 bar.
+
+**Mechanism**: at static regime with FREQ_WD_LAMBDA=1e-4 active, apr28g found LR=3e-4 optimal because the freq-weighted L2 was already shrinking item embeddings; LR=1e-3 would over-shoot. At the dynamic regime with FREQ_WD_LAMBDA=0, the freq-weighted shrinkage is gone — and dynamic-eval supplies richer per-sample u_hist signal during eval (though training is unchanged). The training optimum needs MORE aggressive updates because the bare model has less regularization AND has more useful signal to fit. **HP optima are regime-conditional; locking apr28g's LR was a premature optimization.**
+
+**New baseline**: 5-seed mean **0.859289** (SEED=42: 0.859384). Cumulative +0.031 over apr28o (0.828188) and +0.031 above the legacy DLRM ceiling (0.8284).
 
 ### `autoresearch/apr28ag` — apr28o stack ablation at dynamic regime — **WIN: drop FREQ_WD_LAMBDA**
 

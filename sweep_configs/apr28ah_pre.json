@@ -1,0 +1,8 @@
+[
+  {"name": "ah_c0_lr3e4_wd5e5_s42",  "env": {"EVAL_DYNAMIC_HIST": "1", "FREQ_WD_LAMBDA": "0", "LR": "3e-4",  "WEIGHT_DECAY": "5e-5"}},
+  {"name": "ah_c1_lr3e4_wd1e4_s42",  "env": {"EVAL_DYNAMIC_HIST": "1", "FREQ_WD_LAMBDA": "0", "LR": "3e-4",  "WEIGHT_DECAY": "1e-4"}},
+  {"name": "ah_c2_lr3e4_wd1e5_s42",  "env": {"EVAL_DYNAMIC_HIST": "1", "FREQ_WD_LAMBDA": "0", "LR": "3e-4",  "WEIGHT_DECAY": "1e-5"}},
+  {"name": "ah_c3_lr1e3_wd5e5_s42",  "env": {"EVAL_DYNAMIC_HIST": "1", "FREQ_WD_LAMBDA": "0", "LR": "1e-3",  "WEIGHT_DECAY": "5e-5"}},
+  {"name": "ah_c4_lr1e3_wd1e4_s42",  "env": {"EVAL_DYNAMIC_HIST": "1", "FREQ_WD_LAMBDA": "0", "LR": "1e-3",  "WEIGHT_DECAY": "1e-4"}},
+  {"name": "ah_c5_lr1e4_wd1e4_s42",  "env": {"EVAL_DYNAMIC_HIST": "1", "FREQ_WD_LAMBDA": "0", "LR": "1e-4",  "WEIGHT_DECAY": "1e-4"}}
+]
