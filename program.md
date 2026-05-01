@@ -51,6 +51,26 @@ Brief notes on cycles run on the restart. Detailed per-trial data lives in `resu
 
 Legacy DLRM ceiling: 0.8284 (val). Restart linear-head + `EVAL_DYNAMIC_HIST=1 FREQ_WD_LAMBDA=0 LR=1e-3` **exceeds the legacy ceiling by +0.031 on val and +0.023 on test**. Static-history linear baseline still matches legacy within 0.0002 (apr28o at 0.8282 val). Project headline: **test AUC 0.8455** with single linear-head model.
 
+### `autoresearch/apr28an` — AUX_RATING_WEIGHT retune at dynamic regime — null (already optimal)
+
+**Null** (`09ef667`). Critic's fallback after rejecting both MLP head + multi-pool. `AUX_RATING_WEIGHT=25` was set at apr28o under static regime; three subsequent regime shifts (`EVAL_DYNAMIC_HIST=1`, `FREQ_WD_LAMBDA=0`, `LR=1e-3`) made it plausible the optimum had moved. 5-cell SEED=42 sweep:
+
+| AUX | val_auc | Δ vs locked (0.859384) |
+|---|---|---|
+| 0 | 0.854907 | **-0.0045** (aux load-bearing) |
+| 10 | 0.859013 | -0.00037 |
+| 25 | **0.859384** | 0 (locked baseline reproduced byte-exact) |
+| 50 | 0.859361 | -0.00002 |
+| 100 | 0.859026 | -0.00036 |
+
+Symmetric drop on either side of 25, surface flat between 25–50, hard fall at 0. The static-regime choice **remained optimal** through all three apr28a-arc regime shifts.
+
+**Lesson**: AUX_RATING_WEIGHT=25 is a wide, regime-stable optimum — not a coincidence of the static-regime HP. The aux MSE multi-task signal contributes a fixed-magnitude representation pull regardless of where the BCE loss surface lives. Falsifies the "all knobs may have shifted" hypothesis — at least one knob (AUX) is regime-invariant.
+
+**Hypothesis ruled out, baseline unchanged.** This is the **5th consecutive null** (ai, ak, al, am, an). Pattern is unambiguous: the apr28ah representation is at a local optimum that single-cycle architecture or HP polish cannot escape. **Critic's primary recommendation stands**: pivot to new signal sources (Tier 5 — IMDB plot summaries, posters, etc.) rather than continued polishing.
+
+**Final locked state**: val 0.859384 (5-seed mean 0.859289), test 0.845497. Awaiting user decision on next strategic direction.
+
 ### `autoresearch/apr28am` — DIN target-aware attention pool at dynamic regime — regresses
 
 **Null/regress** (`5a13034`). Critic's leverage argument: dynamic regime made u_hist dense for 70% of val users (apr28ad cold_user +0.028); the *pool aggregator* is the un-revisited surface, since prior DIN nulls (apr28y/z) were measured when 70% of pool inputs were empty. No code change — `USER_HIST_POOL=din` path already in train.py. 4-cell SEED=42 sweep:
