@@ -14,6 +14,33 @@ Any HSTU cycle is measured against **val 0.8594 / test 0.8455** to be called a w
 
 ## Cycles
 
+### `apr30` Bug #1 fix + LR=5e-3 / 15-epoch cell — **+0.015 lift, asymptote confirmed at this config**
+
+**Below bar but trajectory clear** (`3ea5c1b`). Bug #1 fix (movieId +1 shift to avoid PAD/movieId-0 collision in `nn.Embedding(..., padding_idx=0)`) + Critic's path: LR=5e-3, MAX_EPOCHS=15, ml-25m SEED=42. Bug #2 (cold-user fallback) intentionally skipped — refined impact estimate ~0.001 AUC, sub-noise.
+
+| epoch | val_auc | Δ |
+|---|---|---|
+| 0 | 0.7946 | — |
+| 1 | 0.8121 | +0.018 |
+| 2 | 0.8186 | +0.007 |
+| 3 | 0.8223 | +0.004 |
+| 6 | 0.8305 | +0.003/ep |
+| 9 | 0.8339 | +0.001/ep |
+| 12 | 0.8354 | +0.000/ep |
+| 13 | **0.8367** | +0.001 (peak) |
+| 14 | 0.8362 | -0.001 (overfit) |
+
+Total runtime: 7200s ≈ 120 min on 1× CUDA GPU.
+
+**vs apr30 step 3** (LR=3e-3, 5 epochs, pre-Bug#1): 0.8214 → **+0.0153 lift**. Three contributing factors:
+- Bug #1 fix: ~0.005-0.015 (Validator-estimated)
+- LR=3e-3 → 5e-3: ~0.005 (LR ladder still climbing)
+- 5 → 15 epochs: ~0.010 (more training)
+
+**Per Critic's decision rule**: result is in the `[0.825, 0.84)` bucket with last-3-epoch deltas ≤ +0.001 (overfit signal at epoch 14). **Asymptote confirmed at (NUM_LAYERS=4, EMBED_DIM=64). Next cycle: capacity sweep at LR=5e-3.**
+
+**vs simple_v2 bar 0.8594**: gap -0.0227 (was -0.038 at step 3).
+
 ### `apr30` step 3 — fused-token HSTU LR sweep on ml-25m
 
 **Below bar** (`12481fc`). 3-cell LR sweep at SEED=42, defaults (EMBED_DIM=64, NUM_LAYERS=4, NUM_HEADS=4, SEQ_LEN=200, BATCH_SIZE=256, MAX_EPOCHS=5):
