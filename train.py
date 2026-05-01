@@ -232,9 +232,11 @@ def main():
     log.info(f"  num_users={stats['num_users']}  num_items={stats['num_items']}  "
              f"num_train={stats['num_train']}  num_val={stats['num_val']}  num_test={stats['num_test']}")
 
-    # Build per-user sequences from train + val (for val we use train-only history;
-    # for test we use train+val history — same semantics as simple_v2's
-    # EVAL_DYNAMIC_HIST=1 mechanism, which is the bar to clear).
+    # Eval history uses train+val with per-sample strict-prior cutoff (mirrors
+    # simple_v2's EVAL_DYNAMIC_HIST=1 — the +0.022 win at apr28ad came from val
+    # rows seeing their OWN earlier val rows in history, while side="left"
+    # excludes the sample itself and any tied events). This is sequential-eval
+    # framing, not i.i.d. leakage. See simple_v2/CLAUDE.md apr28ad description.
     log.info("Building per-user event sequences")
     train_history = build_user_sequences(train_df)
     eval_history = build_user_sequences(pd.concat([train_df, val_df], ignore_index=True))
