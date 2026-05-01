@@ -8,7 +8,7 @@ Restart (apr28) of the MovieLens hybrid engagement prediction project. Same task
 
 The legacy project at `legacy/` reached **val_auc = 0.8284** but two separate ceiling tests (apr27, apr27c) confirmed the architecture family is saturated. This restart begins from the **simplest possible model — a single Linear head on concatenated features — with the same input features**, so future architectural decisions can be motivated by clean ablations rather than 540 experiments of inherited assumptions.
 
-Current baseline (val): **0.8594 on ml-25m at SEED=42** (5-seed mean **0.859289**) with `EVAL_DYNAMIC_HIST=1 FREQ_WD_LAMBDA=0 LR=1e-3`.
+Current baseline (val): **0.8594 on ml-25m at SEED=42** (5-seed mean **0.859289**) with `EVAL_DYNAMIC_HIST=1 FREQ_WD_LAMBDA=0 LR=1e-3 WEIGHT_DECAY=5e-5`.
 **Held-out test (single-shot, apr28aj)**: **0.8455** at SEED=42 with the same stack (vs static apr28o 0.8221 on test = **+0.023** transfer; legacy DLRM ceiling exceeded by +0.023 on test). Reached by stacking three post-apr28o mechanisms:
 1. **Eval-time dynamic user history** (`EVAL_DYNAMIC_HIST=1`, apr28ad): at evaluation each sample's u_hist_pool is rebuilt from train+val ratings strictly prior to sample's ts. Cold_user stratum 0.787 → 0.815 (+0.028), drives overall +0.022 5-seed mean.
 2. **Drop tail-item regularizer** (`FREQ_WD_LAMBDA=0`, apr28ag): at the dynamic regime tail items need larger embeddings to feed useful dynamic-history signal; +0.0015 5-seed mean on top of apr28ad.
@@ -84,8 +84,9 @@ grep "^val_auc:\|^peak_memory_mb:" run.log
 concat → Linear(in_dim, 1) → sigmoid    # in_dim = 4*28 + 2 + 20 + 2 + 1128 + 4*28 = 1376 (ml-25m, with default cross fields and ts-item cross)
 
 Loss: BCEWithLogitsLoss + AUX_RATING_WEIGHT (=25) × masked_mse on rating regression head
-Optimizer: Adam, lr=3e-4, weight_decay=5e-5
+Optimizer: Adam, lr=3e-4, weight_decay=5e-5      # code defaults; locked baseline overrides LR=1e-3
 Item-embed regularization: Adam WD + FREQ_WD_LAMBDA (=1e-4) × per-item L2 weighted 1/sqrt(count+5)
+                                                 # code default; locked baseline overrides FREQ_WD_LAMBDA=0
 Cross fields: 4 Hadamard products (u_e⊙i_e, u_hist⊙i_e, i_hist⊙u_e, ts⊙i_e)
 Training: batch=16384, sub-epoch eval 3×, patience=3 evals, max 20 epochs
 
@@ -94,13 +95,16 @@ Eval-time mechanism (apr28ad — opt-in, default OFF):
   per-sample from train+val ratings strictly prior to the sample's
   timestamp (vs the static per-user history built once from train).
   Off-state byte-equivalent. Lifts cold_user stratum AUC 0.787 → 0.815
-  and overall val_auc 0.828 → 0.846 SEED=42 (5-seed mean +0.022). The
-  headline 0.8463 / 0.8498 baseline numbers REQUIRE this flag set.
+  and overall val_auc 0.828 → 0.846 SEED=42 (5-seed mean +0.022 at the
+  apr28ad stage). The current locked baseline at apr28ah is val 0.859384
+  SEED=42 / 0.859289 5-seed mean / test 0.845497 — all REQUIRE this flag set.
 ```
 
 The "linear" naming refers to the prediction head — embeddings are still trainable (~6M params for ml-25m). Genre multi-hot, timestamp, year, and tag genome go straight into the concat with no intermediate projection (a `Linear(20, 28) → Linear(in, 1)` chain is expressively equivalent to a direct slice in the head).
 
-**To reproduce the headline baseline**: `EVAL_DYNAMIC_HIST=1 DATASET=ml-25m uv run python train.py`. Without `EVAL_DYNAMIC_HIST=1`, the model trains identically and reproduces the static-history baseline of 0.8282 (apr28o stack), which still matches the legacy DLRM ceiling within 0.0002.
+**To reproduce the headline baseline**: `EVAL_DYNAMIC_HIST=1 FREQ_WD_LAMBDA=0 LR=1e-3 WEIGHT_DECAY=5e-5 DATASET=ml-25m uv run python train.py`. The three explicit overrides (`EVAL_DYNAMIC_HIST=1`, `FREQ_WD_LAMBDA=0`, `LR=1e-3`) are required — `WEIGHT_DECAY=5e-5` matches the code default and is included for documentation. Without `EVAL_DYNAMIC_HIST=1` (and reverting the other two to defaults), the model reproduces the static-history baseline of 0.8282 (apr28o stack), which still matches the legacy DLRM ceiling within 0.0002.
+
+**Current state**: 5 consecutive null cycles after apr28ah locked (apr28ai per-user fine-tune, apr28ak recency decay + popularity prior, apr28al train-time time-leak fix, apr28am DIN target-aware attention, apr28an AUX retune). The apr28ah representation is at a local optimum that single-cycle architecture or HP polish cannot escape. Next direction (new signal source vs. accept-locked) pending strategic decision — see `program.md` recent entries for full diagnoses.
 
 ## Discipline
 

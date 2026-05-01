@@ -93,7 +93,7 @@ Stripped to the bones: only raw IDs, raw history sequences, and pure content met
 
 - **`prepare.py`** — Shared with legacy. Data download + time-based train/val/test splits + AUC evaluation. Do not modify (the evaluation harness is the ground truth metric).
 - **`train.py`** — The current model. Linear head over a 1376-dim concat of embeddings + 4 multiplicative crosses + raw content features; auxiliary rating-residual regression head sharing the same concat. No hidden layers in the heads.
-- **`program.md`** — Experiment log of the restart cycles (apr28b through apr28ae+af so far).
+- **`program.md`** — Experiment log of the restart cycles (apr28b through apr28an, including the held-out test eval at apr28aj and the 5 consecutive nulls ai/ak/al/am/an after the apr28ah baseline locked).
 - **`legacy/`** — Frozen archive of the prior project. Available for reference; not authoritative for the restart.
 
 ## Quickstart
@@ -109,7 +109,7 @@ DATASET=ml-25m uv run python train.py
 ## What gets carried over from legacy
 
 - The data pipeline (`prepare.py:load_data_hybrid`)
-- The feature engineering (genre multi-hot, rating histograms, user/item histories, tag genome, user genome profile, dense features)
+- The raw inputs the data pipeline emits: genre multi-hot, user/item history sequences, tag genome, dense scalars (timestamp, year)
 - The HP defaults that were multi-seed-verified to help (`NEG_RATIO=1`, `train_neg_mode=anchor_pos_catalog`)
 - The 16 critical learnings in `legacy/CLAUDE.md` — especially #14 (seed variance ≈ 0.00078) and #15 (sub-noise single-knob lifts can stack)
 
@@ -118,8 +118,9 @@ DATASET=ml-25m uv run python train.py
 - The model architecture (causal SA, DIN, field attention, two-stream MLPs, top MLP)
 - The 16 architectural-cycle's worth of dropouts, gates, residuals, and conditional flags
 - Anything in `legacy/train.py` past the feature-engineering section
+- Pre-computed user/item statistics (rating histograms, counts, user-genre affinity, user genome profile) — stripped on the principle that aggregations are relationships the model should learn from raw data
 
-Current baseline AUC (val): **0.8594 on ml-25m at SEED=42** (5-seed mean 0.8593) with `EVAL_DYNAMIC_HIST=1 FREQ_WD_LAMBDA=0 LR=1e-3` (apr28ah stack, post-apr28ad arc). **Held-out test AUC (single-shot, apr28aj)**: **0.8455** at SEED=42 (vs static apr28o on test 0.8221 → +0.023 transfer; legacy DLRM val ceiling 0.8284 exceeded by +0.023 on test). Static-history val baseline: 0.8282 (deterministic, SEED=42; 5-seed mean +0.00175 over the prior 0.8263 LR/WD-retuned baseline). Reached by stacking three individually sub-threshold mechanisms — each +0.0005 to +0.0007 single-seed alone, but +0.0017 multi-seed when combined (super-additive).
+Current baseline AUC (val): **0.8594 on ml-25m at SEED=42** (5-seed mean **0.859289**) with `EVAL_DYNAMIC_HIST=1 FREQ_WD_LAMBDA=0 LR=1e-3 WEIGHT_DECAY=5e-5` (apr28ah stack, post-apr28ad arc). **Held-out test AUC (single-shot, apr28aj)**: **0.8455** at SEED=42 (vs static apr28o on test 0.8221 → +0.023 transfer; legacy DLRM val ceiling 0.8284 exceeded by +0.023 on test). Static-history val baseline: 0.8282 (deterministic, SEED=42; 5-seed mean +0.00175 over the prior 0.8263 LR/WD-retuned baseline). Reached by stacking three individually sub-threshold mechanisms — each +0.0005 to +0.0007 single-seed alone, but +0.0017 multi-seed when combined (super-additive).
 
 Five wins so far on the restart:
 - **Centered pool** (0.8246 from 0.8219): switched user-history and item-history pools from plain mean to a rating-centered weighted pool. Items rated above 3 stars push *toward* their embedding; items below 3 stars push *away*. Sign matters.
@@ -130,5 +131,9 @@ Five wins so far on the restart:
   - `FREQ_WD_LAMBDA=1e-4`: per-item L2 weighted by `1/sqrt(count + 5)` — tail items get more regularization
   - `AUX_RATING_WEIGHT=25.0`: parallel Linear head predicting normalized rating, MSE multi-task loss
 - **Eval-time dynamic user history** (0.8463 SEED=42 / 0.8498 5-seed mean from 0.8282; apr28ad): at evaluation each sample's `u_hist` is rebuilt from combined train+val ratings strictly prior to the sample's timestamp. Cold val users (70% of val) gain a real `u_hist_pool`; cold_user stratum AUC lifts +0.028 (0.787 → 0.815), driving +0.022 overall. Off-state byte-equivalent — flag-gated by `EVAL_DYNAMIC_HIST=1`. **First cycle to break above the legacy DLRM ceiling (0.8284), by +0.022.**
+- **Drop tail-item regularizer at dynamic regime** (0.8513 5-seed mean from 0.8498; apr28ag): `FREQ_WD_LAMBDA=0`. At the dynamic regime tail items need larger embeddings to feed useful dynamic-history signal; the static-regime regularizer over-penalized them.
+- **HP retune at the new regime** (0.859289 5-seed mean from 0.8513; apr28ah): `LR=3e-4 → 1e-3`. With FREQ_WD off plus dynamic-eval signal the model wants more aggressive updates; the static-regime LR was over-conservative.
 
-The first four wins bring the static-history linear baseline within 0.0002 of the legacy DLRM ceiling (0.8284) — same task, much simpler architecture (no DIN, no field attention, no genome bottleneck, no two-stream MLPs). The fifth (`EVAL_DYNAMIC_HIST=1`) **exceeds** the legacy DLRM by +0.022 via a feature-engineering / inference-time change rather than an architectural one.
+The first four wins bring the static-history linear baseline within 0.0002 of the legacy DLRM ceiling (0.8284) — same task, much simpler architecture (no DIN, no field attention, no genome bottleneck, no two-stream MLPs). The fifth (`EVAL_DYNAMIC_HIST=1`) **exceeds** the legacy DLRM by +0.022 via a feature-engineering / inference-time change rather than an architectural one. The sixth and seventh (apr28ag + apr28ah HP retunes) bring the cumulative lift to **+0.031 on val and +0.023 on test** — current locked baseline.
+
+After apr28ah, **5 consecutive null cycles** (apr28ai per-user fine-tune, apr28ak recency decay + popularity prior, apr28al train-time time-leak fix, apr28am DIN target-aware attention, apr28an AUX retune) confirm the apr28ah representation is at a local optimum that single-cycle architecture or HP polish cannot escape. The next direction will require new signal sources (e.g., IMDB plot summaries) or a fundamentally different architecture, pending strategic decision.
