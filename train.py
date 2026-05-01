@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-HSTU stub for generative recommendation on MovieLens.
+HSTU for generative recommendation on MovieLens.
 
-Status: scaffolding only. End-to-end pipeline runs on ml-100k but the
-model is a placeholder (vanilla pre-norm transformer + dot-product head).
-Replace the HSTUBlock body with the actual HSTU stack to make this
-attempt meaningful.
+Step 2 (this file): replace the placeholder vanilla pre-norm transformer
+block with the real HSTU block per Meta 2024 ("Actions Speak Louder than
+Words"). HSTU = pointwise attention (SiLU, not softmax) + GLU-style gating
++ relative-position bias from log-bucketed time deltas.
 
-Step 1 (this file): sequence-level training with per-position causal loss
+Step 1 (5bf86c6): sequence-level training with per-position causal loss
 (SASRec/HSTU framing). Each train example = one user's full event sequence;
 loss applied at every valid position predicting engagement of the next event.
 Eval still emits per-(user, candidate, ts) rows for AUC continuity vs simple_v2.
@@ -59,6 +59,7 @@ NUM_LAYERS = int(os.environ.get("NUM_LAYERS", "4"))
 NUM_HEADS = int(os.environ.get("NUM_HEADS", "4"))
 SEQ_LEN = int(os.environ.get("SEQ_LEN", "200"))         # per-user context length
 DROPOUT = float(os.environ.get("DROPOUT", "0.1"))
+NUM_TIME_BUCKETS = int(os.environ.get("NUM_TIME_BUCKETS", "32"))  # log-spaced time-delta buckets
 NUM_RATING_BUCKETS = 10                                 # 0.5★ → bucket 0, 5★ → bucket 9
 ENGAGED_BUCKET_THRESHOLD = 7                            # bucket >= 7 ⇔ rating >= 4 (label=1)
 
@@ -94,22 +95,33 @@ def build_user_sequences(df: pd.DataFrame) -> dict[int, np.ndarray]:
     return sequences
 
 
-def _pad_left(items: np.ndarray, ratings: np.ndarray, seq_len: int):
-    """Left-pad item/rating arrays to seq_len with zeros (most recent at end)."""
+def _pad_left(items: np.ndarray, ratings: np.ndarray, timestamps: np.ndarray, seq_len: int):
+    """Left-pad item/rating/timestamp arrays to seq_len with zeros (most recent at end).
+
+    Pad ts=0 means "epoch 1970" — well before any real ML rating (1995+),
+    so any pad-vs-real time delta lands in the largest log bucket. That
+    bucket's bias is irrelevant because the pad position is masked out
+    of attention regardless; we just need the bucket index to be valid
+    and not produce NaN/overflow.
+    """
     n = items.shape[0]
     if n >= seq_len:
         items = items[-seq_len:]
         ratings = ratings[-seq_len:]
+        timestamps = timestamps[-seq_len:]
         mask = np.ones(seq_len, dtype=np.float32)
-        return items.astype(np.int64), ratings.astype(np.int64), mask
+        return (items.astype(np.int64), ratings.astype(np.int64),
+                timestamps.astype(np.int64), mask)
     out_items = np.zeros(seq_len, dtype=np.int64)
     out_ratings = np.zeros(seq_len, dtype=np.int64)
+    out_timestamps = np.zeros(seq_len, dtype=np.int64)
     out_mask = np.zeros(seq_len, dtype=np.float32)
     if n > 0:
         out_items[-n:] = items
         out_ratings[-n:] = ratings
+        out_timestamps[-n:] = timestamps
         out_mask[-n:] = 1.0
-    return out_items, out_ratings, out_mask
+    return out_items, out_ratings, out_timestamps, out_mask
 
 
 class SequenceTrainDataset(Dataset):
@@ -133,11 +145,13 @@ class SequenceTrainDataset(Dataset):
         events = self.history[uid]
         items = events[:, 0]
         ratings = events[:, 1]
-        items, ratings, mask = _pad_left(items, ratings, self.seq_len)
+        timestamps = events[:, 2]
+        items, ratings, timestamps, mask = _pad_left(items, ratings, timestamps, self.seq_len)
         return {
             "uid": uid,
             "hist_items": items,
             "hist_ratings": ratings,
+            "hist_ts": timestamps,
             "hist_mask": mask,
         }
 
@@ -167,17 +181,21 @@ class EvalDataset(Dataset):
         if events is None or events.shape[0] == 0:
             items = np.zeros(self.seq_len, dtype=np.int64)
             ratings = np.zeros(self.seq_len, dtype=np.int64)
+            timestamps = np.zeros(self.seq_len, dtype=np.int64)
             mask = np.zeros(self.seq_len, dtype=np.float32)
         else:
             cut = np.searchsorted(events[:, 2], ts, side="left")
             window = events[max(0, cut - self.seq_len):cut]
-            items, ratings, mask = _pad_left(window[:, 0], window[:, 1], self.seq_len)
+            items, ratings, timestamps, mask = _pad_left(
+                window[:, 0], window[:, 1], window[:, 2], self.seq_len,
+            )
         return {
             "uid": uid,
             "mid": int(self.mid[idx]),
             "label": float(self.lbl[idx]),
             "hist_items": items,
             "hist_ratings": ratings,
+            "hist_ts": timestamps,
             "hist_mask": mask,
         }
 
@@ -187,6 +205,7 @@ def collate_train(batch):
         "uid": [b["uid"] for b in batch],
         "hist_items": torch.tensor(np.stack([b["hist_items"] for b in batch])),
         "hist_ratings": torch.tensor(np.stack([b["hist_ratings"] for b in batch])),
+        "hist_ts": torch.tensor(np.stack([b["hist_ts"] for b in batch])),
         "hist_mask": torch.tensor(np.stack([b["hist_mask"] for b in batch])),
     }
 
@@ -198,57 +217,157 @@ def collate_eval(batch):
         "label": torch.tensor([b["label"] for b in batch], dtype=torch.float32),
         "hist_items": torch.tensor(np.stack([b["hist_items"] for b in batch])),
         "hist_ratings": torch.tensor(np.stack([b["hist_ratings"] for b in batch])),
+        "hist_ts": torch.tensor(np.stack([b["hist_ts"] for b in batch])),
         "hist_mask": torch.tensor(np.stack([b["hist_mask"] for b in batch])),
     }
 
 
 # ─── Model ──────────────────────────────────────────────────────────
-class HSTUBlock(nn.Module):
-    """One HSTU block: pre-norm + gated linear unit + relative-position-bias
-    attention + residual. Causal.
+def time_delta_buckets(timestamps: torch.Tensor, num_buckets: int = NUM_TIME_BUCKETS) -> torch.Tensor:
+    """Convert pairwise time deltas to log-spaced bucket indices.
 
-    TODO: implement per Meta 2024 §3.
-        - PreNorm(x) → SiLU(W_q x) ⊙ (W_k x), with relative position bias
-        - PreNorm(x) → SiLU(W_u x) ⊙ (W_v x) for the GLU FFN
-        - Residual around each
+    Args:
+        timestamps: (B, L) Unix-second timestamps (int64).
+        num_buckets: total buckets. Bucket 0 is "Δt = 0" (tied/same instant).
+            Buckets 1..(num_buckets-2) are log-spaced from 1s to ~1 year.
+            Bucket (num_buckets-1) is the ">1 year" overflow bucket.
+
+    Returns:
+        (B, L, L) int64 bucket indices, where entry [b, i, j] is the bucket
+        for Δt = ts[b, i] - ts[b, j]. We bucket |Δt|; the causal mask
+        guarantees only entries with i >= j contribute to attention, but
+        keeping it symmetric simplifies the bias lookup at minimal cost.
+
+    The scheme is chosen for ml-25m (timestamps in [1995, 2019], so the
+    largest real Δt is ~24 years ≈ 7.6e8 s):
+        bucket 0  → Δt = 0                     (tied/same instant)
+        bucket k  → Δt in [2^(k-1), 2^k) s     for k in 1..num_buckets-2
+        bucket n-1→ Δt >= 2^(num_buckets-2) s  (overflow)
+    For num_buckets=32 the max-but-one bucket covers Δt in [2^29, 2^30)
+    seconds (~17 to ~34 years), which exceeds any real ml-25m delta — so
+    only pad-vs-real entries (pad ts=0, real ts ~1.5e9, log2≈30.5) reach
+    the overflow bucket, and those positions are masked out of attention.
+    Implementation: floor(log2(Δt)) clamped, then +1 to leave bucket 0
+    for Δt == 0.
+    """
+    delta = (timestamps.unsqueeze(-1) - timestamps.unsqueeze(-2)).abs()  # (B, L, L)
+    # Δt == 0 → bucket 0; Δt > 0 → 1 + floor(log2(Δt)) clamped to [1, n-1].
+    log_floor = torch.zeros_like(delta)
+    nonzero = delta > 0
+    if nonzero.any():
+        log_floor[nonzero] = torch.floor(torch.log2(delta[nonzero].float())).long()
+    bucket = torch.where(nonzero, log_floor + 1, torch.zeros_like(log_floor))
+    bucket = bucket.clamp(0, num_buckets - 1)
+    return bucket
+
+
+class HSTUBlock(nn.Module):
+    """One HSTU block per Meta 2024 §3.
+
+    Forward:
+      1. h = LayerNorm(x); split SiLU(h W_uvqk) into U, V, Q, K of shape (B, L, D).
+      2. Pointwise attention (NOT softmax):
+           A = SiLU(Q · K^T / sqrt(D_h) + rel_bias)            # (B, H, L, L)
+         where rel_bias is from log-bucketed pairwise time deltas. The
+         causal+pad mask is applied as a multiplicative zero AFTER SiLU
+         (so pad and future positions contribute exactly 0, no NaN risk
+         from passing -inf through SiLU).
+      3. AV = A @ V; gated = LayerNorm(AV) ⊙ U.
+      4. out = gated W_o; return x + out.
+
+    No separate FFN — the GLU + pointwise attention plays both roles.
+
+    Deviations from the paper noted for the Validator:
+      - Bias table: per-block, learnable, shape (num_buckets, num_heads).
+        Init zeros so the block reduces to no-bias attention at step 0.
+        Paper does per-block; per-head adds expressivity at trivial cost
+        (32 × 4 = 128 scalars per block).
+      - Mask handling: post-SiLU multiplicative zero rather than pre-SiLU
+        -inf addition, to avoid NaN from SiLU(-inf). Mathematically the
+        same outcome (masked positions contribute 0) but numerically safer.
+      - LayerNorm on AV before gating: paper uses a norm here; we use
+        nn.LayerNorm. (Some HSTU codebases use RMSNorm; we stick with LN
+        for parity with the rest of the stack and PyTorch primitives.)
     """
 
-    def __init__(self, dim: int, num_heads: int, dropout: float):
+    def __init__(self, dim: int, num_heads: int, num_time_buckets: int, dropout: float):
         super().__init__()
-        # placeholder
-        self.norm = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
-        self.ffn = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.Linear(dim, 4 * dim),
-            nn.SiLU(),
-            nn.Linear(4 * dim, dim),
-        )
+        assert dim % num_heads == 0, f"dim {dim} must be divisible by num_heads {num_heads}"
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.norm_in = nn.LayerNorm(dim)
+        self.uvqk = nn.Linear(dim, 4 * dim)
+        self.norm_out = nn.LayerNorm(dim)
+        self.proj = nn.Linear(dim, dim)
+        self.dropout = nn.Dropout(dropout)
+        # Per-head learnable bias indexed by log-bucketed pairwise Δt.
+        # Init zeros so the block starts with no positional bias and learns
+        # to differentiate buckets from data.
+        self.rel_bias = nn.Embedding(num_time_buckets, num_heads)
+        nn.init.zeros_(self.rel_bias.weight)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
-        # placeholder: vanilla pre-norm transformer block, no relative bias.
-        # key_padding_mask and attn_mask must share dtype (both float here) to
-        # avoid the PyTorch mismatched-mask deprecation path.
-        h = self.norm(x)
-        kp_mask = torch.zeros_like(mask)
-        kp_mask = kp_mask.masked_fill(mask < 0.5, float("-inf"))
-        attn_out, _ = self.attn(
-            h, h, h,
-            attn_mask=attn_mask,
-            key_padding_mask=kp_mask,
-            need_weights=False,
-        )
-        x = x + attn_out
-        x = x + self.ffn(x)
-        return x
+    def forward(self, x: torch.Tensor, valid_mask: torch.Tensor,
+                causal_bool: torch.Tensor, time_buckets: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+          x:            (B, L, D)
+          valid_mask:   (B, L) float, 1 for real positions, 0 for pad.
+          causal_bool:  (L, L) bool, True at allowed (i >= j) positions.
+          time_buckets: (B, L, L) int64 bucket indices for the relative bias.
+
+        Returns:
+          (B, L, D)
+        """
+        B, L, D = x.shape
+        H, Dh = self.num_heads, self.head_dim
+
+        h = self.norm_in(x)
+        u, v, q, k = torch.chunk(torch.nn.functional.silu(self.uvqk(h)), 4, dim=-1)
+        # Reshape Q, K, V to per-head: (B, L, D) → (B, H, L, Dh)
+        q = q.view(B, L, H, Dh).transpose(1, 2)
+        k = k.view(B, L, H, Dh).transpose(1, 2)
+        v = v.view(B, L, H, Dh).transpose(1, 2)
+
+        # Raw scores: (B, H, L, L)
+        scores = torch.matmul(q, k.transpose(-2, -1)) / (Dh ** 0.5)
+
+        # Add relative-position bias. Embedding lookup gives (B, L, L, H);
+        # permute to (B, H, L, L).
+        bias = self.rel_bias(time_buckets).permute(0, 3, 1, 2)
+        scores = scores + bias
+
+        # Pointwise activation (NOT softmax — HSTU's signature).
+        attn = torch.nn.functional.silu(scores)
+
+        # Apply causal + pad mask as a multiplicative zero. Pad-key positions
+        # zeroed via valid_mask broadcast over query dim; future positions
+        # zeroed via causal_bool. SiLU(0) = 0, so no NaN risk.
+        # combined: (B, 1, L, L) — 1 where (j real) AND (i >= j), else 0.
+        key_valid = valid_mask.view(B, 1, 1, L)               # (B, 1, 1, L)
+        causal = causal_bool.view(1, 1, L, L)                 # (1, 1, L, L)
+        keep = key_valid * causal.to(valid_mask.dtype)        # (B, 1, L, L)
+        attn = attn * keep
+
+        attn = self.dropout(attn)
+
+        # Pointwise output: A @ V → (B, H, L, Dh) → (B, L, D)
+        av = torch.matmul(attn, v).transpose(1, 2).contiguous().view(B, L, D)
+        gated = self.norm_out(av) * u                          # GLU-style gate
+        out = self.proj(gated)
+        return x + out
 
 
-class PlaceholderHSTU(nn.Module):
-    """Stub model: causal transformer over (item + rating) embeddings with
-    SASRec-style dot-product scoring against a candidate item embedding.
+class HSTU(nn.Module):
+    """HSTU model per Meta 2024: causal stack of HSTU blocks over (item +
+    rating) embeddings with SASRec-style dot-product scoring against a
+    candidate item embedding.
 
-    The real HSTU implementation (per Meta 2024) replaces the body with the
-    HSTU block stack and adds relative-position bias from time deltas.
+    Dataset additions (vs. step 1 placeholder): hist_ts feeds the relative
+    position bias via log-bucketed pairwise time deltas. The bucketing is
+    computed once per batch in `encode()` (B, L, L int64) and shared across
+    all blocks — each block has its own per-head bias table indexed by these
+    buckets.
     """
 
     def __init__(self, num_items: int, num_rating_buckets: int):
@@ -256,26 +375,27 @@ class PlaceholderHSTU(nn.Module):
         self.item_embed = nn.Embedding(num_items + 1, EMBED_DIM, padding_idx=0)
         self.rating_embed = nn.Embedding(num_rating_buckets, EMBED_DIM)
         self.blocks = nn.ModuleList([
-            HSTUBlock(EMBED_DIM, NUM_HEADS, DROPOUT) for _ in range(NUM_LAYERS)
+            HSTUBlock(EMBED_DIM, NUM_HEADS, NUM_TIME_BUCKETS, DROPOUT)
+            for _ in range(NUM_LAYERS)
         ])
         # No concat-head here: scoring is dot(h_t, item_embed(candidate)).
         # SASRec-style sharing of item_embed between input and output is
         # standard for sequence recommenders and halves head params.
-        # TODO: relative-position bias from log-bucketed time deltas
         # TODO: action-type embedding (binary engaged vs implicit) once we add easy negs to history
 
     def encode(self, hist_items: torch.Tensor, hist_ratings: torch.Tensor,
-               hist_mask: torch.Tensor) -> torch.Tensor:
+               hist_ts: torch.Tensor, hist_mask: torch.Tensor) -> torch.Tensor:
         """Run the causal stack and return per-position hidden states (B, T, D)."""
         B, T = hist_items.shape
         h = self.item_embed(hist_items) + self.rating_embed(hist_ratings)
-        # Causal mask: position t can only attend to ≤t. nn.MultiheadAttention
-        # expects a float mask added to attention logits (so -inf blocks).
-        causal = torch.triu(
-            torch.full((T, T), float("-inf"), device=h.device), diagonal=1,
-        )
+        # Causal mask as a bool over (T, T): True where i >= j (allowed).
+        causal_bool = torch.tril(torch.ones(T, T, dtype=torch.bool, device=h.device))
+        # Pairwise log-bucketed time deltas, computed once and reused across blocks.
+        # (B, L, L) int64 — ~ B·L·L·8 bytes; for B=256, L=200 that's ~80 MB.
+        # Acceptable for ml-25m at our default batch.
+        time_buckets = time_delta_buckets(hist_ts, NUM_TIME_BUCKETS)
         for block in self.blocks:
-            h = block(h, hist_mask, causal)
+            h = block(h, hist_mask, causal_bool, time_buckets)
         return h
 
     def score_per_position(self, h: torch.Tensor, target_items: torch.Tensor) -> torch.Tensor:
@@ -306,9 +426,10 @@ def train_one_epoch(model, loader, optimizer):
     for batch in loader:
         hist_items = batch["hist_items"].to(DEVICE)         # (B, T)
         hist_ratings = batch["hist_ratings"].to(DEVICE)     # (B, T)
+        hist_ts = batch["hist_ts"].to(DEVICE)               # (B, T)
         hist_mask = batch["hist_mask"].to(DEVICE)           # (B, T)
 
-        h = model.encode(hist_items, hist_ratings, hist_mask)  # (B, T, D)
+        h = model.encode(hist_items, hist_ratings, hist_ts, hist_mask)  # (B, T, D)
 
         # Per-position next-event prediction:
         #   At position t (0..T-2), score h_t against item_embed(events[t+1])
@@ -345,10 +466,11 @@ def evaluate_model(model, loader):
     for batch in loader:
         hist_items = batch["hist_items"].to(DEVICE)
         hist_ratings = batch["hist_ratings"].to(DEVICE)
+        hist_ts = batch["hist_ts"].to(DEVICE)
         hist_mask = batch["hist_mask"].to(DEVICE)
         cand = batch["mid"].to(DEVICE)
         label = batch["label"]
-        h = model.encode(hist_items, hist_ratings, hist_mask)
+        h = model.encode(hist_items, hist_ratings, hist_ts, hist_mask)
         logit = model.score_eval(h, hist_mask, cand)
         all_scores.append(torch.sigmoid(logit).detach().cpu().numpy())
         all_labels.append(label.numpy())
@@ -383,10 +505,11 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
                             collate_fn=collate_eval)
 
-    model = PlaceholderHSTU(stats["num_items"], NUM_RATING_BUCKETS).to(DEVICE)
+    model = HSTU(stats["num_items"], NUM_RATING_BUCKETS).to(DEVICE)
     n_params = sum(p.numel() for p in model.parameters())
-    log.info(f"PlaceholderHSTU: {n_params/1e6:.2f}M params on {DEVICE}")
-    log.info("⚠️  Placeholder model — replace with real HSTU block stack to make this meaningful.")
+    log.info(f"HSTU: {n_params/1e6:.2f}M params on {DEVICE}  "
+             f"(layers={NUM_LAYERS}, heads={NUM_HEADS}, dim={EMBED_DIM}, "
+             f"time_buckets={NUM_TIME_BUCKETS})")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
