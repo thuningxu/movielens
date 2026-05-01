@@ -3,8 +3,14 @@
 HSTU stub for generative recommendation on MovieLens.
 
 Status: scaffolding only. End-to-end pipeline runs on ml-100k but the
-model is a placeholder (embedding sum + linear head). Replace the
-PlaceholderModel with the actual HSTU stack to make this attempt meaningful.
+model is a placeholder (vanilla pre-norm transformer + dot-product head).
+Replace the HSTUBlock body with the actual HSTU stack to make this
+attempt meaningful.
+
+Step 1 (this file): sequence-level training with per-position causal loss
+(SASRec/HSTU framing). Each train example = one user's full event sequence;
+loss applied at every valid position predicting engagement of the next event.
+Eval still emits per-(user, candidate, ts) rows for AUC continuity vs simple_v2.
 
 Reference:
     Zhai et al., "Actions Speak Louder than Words: Trillion-Parameter
@@ -54,6 +60,7 @@ NUM_HEADS = int(os.environ.get("NUM_HEADS", "4"))
 SEQ_LEN = int(os.environ.get("SEQ_LEN", "200"))         # per-user context length
 DROPOUT = float(os.environ.get("DROPOUT", "0.1"))
 NUM_RATING_BUCKETS = 10                                 # 0.5★ → bucket 0, 5★ → bucket 9
+ENGAGED_BUCKET_THRESHOLD = 7                            # bucket >= 7 ⇔ rating >= 4 (label=1)
 
 LR = float(os.environ.get("LR", "1e-3"))
 WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "1e-5"))
@@ -68,6 +75,10 @@ def build_user_sequences(df: pd.DataFrame) -> dict[int, np.ndarray]:
     Each event row is (movieId, rating_bucket, timestamp). Easy negatives
     (rating == 0 sentinel) are excluded from the history; only real ratings
     contribute to the sequence representation.
+
+    Note: load_data() never injects easy negatives, so the rating>0 filter is
+    a defensive no-op here. It matters for any future code path that consumes
+    a hybrid frame.
     """
     real = df[df["rating"] > 0].copy()
     real = real.sort_values(["userId", "timestamp"])
@@ -83,12 +94,59 @@ def build_user_sequences(df: pd.DataFrame) -> dict[int, np.ndarray]:
     return sequences
 
 
-class HSTUDataset(Dataset):
-    """One sample = one (user, target_movie, target_label) triple, paired
-    with the user's prior history strictly before target_ts.
+def _pad_left(items: np.ndarray, ratings: np.ndarray, seq_len: int):
+    """Left-pad item/rating arrays to seq_len with zeros (most recent at end)."""
+    n = items.shape[0]
+    if n >= seq_len:
+        items = items[-seq_len:]
+        ratings = ratings[-seq_len:]
+        mask = np.ones(seq_len, dtype=np.float32)
+        return items.astype(np.int64), ratings.astype(np.int64), mask
+    out_items = np.zeros(seq_len, dtype=np.int64)
+    out_ratings = np.zeros(seq_len, dtype=np.int64)
+    out_mask = np.zeros(seq_len, dtype=np.float32)
+    if n > 0:
+        out_items[-n:] = items
+        out_ratings[-n:] = ratings
+        out_mask[-n:] = 1.0
+    return out_items, out_ratings, out_mask
 
-    TODO: replace the per-sample history slice with sequence-level training
-    once the HSTU model accepts a packed batch of sequences.
+
+class SequenceTrainDataset(Dataset):
+    """One sample = one user's full event sequence (truncated to last SEQ_LEN
+    if longer). Per-position causal training: at every valid position t, the
+    model predicts engagement of event[t+1]. No injected easy negatives —
+    sequence training is dense per-position; that was a sample-level artifact.
+    """
+
+    def __init__(self, history: dict[int, np.ndarray], seq_len: int, min_events: int = 2):
+        # Need ≥2 events per sequence: at least one (t, t+1) prediction pair.
+        self.uids = sorted(uid for uid, ev in history.items() if ev.shape[0] >= min_events)
+        self.history = history
+        self.seq_len = seq_len
+
+    def __len__(self):
+        return len(self.uids)
+
+    def __getitem__(self, idx):
+        uid = self.uids[idx]
+        events = self.history[uid]
+        items = events[:, 0]
+        ratings = events[:, 1]
+        items, ratings, mask = _pad_left(items, ratings, self.seq_len)
+        return {
+            "uid": uid,
+            "hist_items": items,
+            "hist_ratings": ratings,
+            "hist_mask": mask,
+        }
+
+
+class EvalDataset(Dataset):
+    """One sample = one (user, candidate_movie, target_ts) eval row, paired
+    with the user's prefix sequence (events strictly before target_ts) sliced
+    from a precomputed dynamic-history dict. Mirrors simple_v2's
+    EVAL_DYNAMIC_HIST=1 mechanism.
     """
 
     def __init__(self, df: pd.DataFrame, history: dict[int, np.ndarray], seq_len: int):
@@ -106,29 +164,42 @@ class HSTUDataset(Dataset):
         uid = int(self.uid[idx])
         ts = int(self.ts[idx])
         events = self.history.get(uid)
-        if events is None:
-            hist_items = np.zeros(self.seq_len, dtype=np.int64)
-            hist_ratings = np.zeros(self.seq_len, dtype=np.int64)
-            hist_mask = np.zeros(self.seq_len, dtype=np.float32)
+        if events is None or events.shape[0] == 0:
+            items = np.zeros(self.seq_len, dtype=np.int64)
+            ratings = np.zeros(self.seq_len, dtype=np.int64)
+            mask = np.zeros(self.seq_len, dtype=np.float32)
         else:
             cut = np.searchsorted(events[:, 2], ts, side="left")
             window = events[max(0, cut - self.seq_len):cut]
-            n = window.shape[0]
-            hist_items = np.zeros(self.seq_len, dtype=np.int64)
-            hist_ratings = np.zeros(self.seq_len, dtype=np.int64)
-            hist_mask = np.zeros(self.seq_len, dtype=np.float32)
-            if n > 0:
-                hist_items[-n:] = window[:, 0]
-                hist_ratings[-n:] = window[:, 1]
-                hist_mask[-n:] = 1.0
+            items, ratings, mask = _pad_left(window[:, 0], window[:, 1], self.seq_len)
         return {
             "uid": uid,
             "mid": int(self.mid[idx]),
             "label": float(self.lbl[idx]),
-            "hist_items": hist_items,
-            "hist_ratings": hist_ratings,
-            "hist_mask": hist_mask,
+            "hist_items": items,
+            "hist_ratings": ratings,
+            "hist_mask": mask,
         }
+
+
+def collate_train(batch):
+    return {
+        "uid": [b["uid"] for b in batch],
+        "hist_items": torch.tensor(np.stack([b["hist_items"] for b in batch])),
+        "hist_ratings": torch.tensor(np.stack([b["hist_ratings"] for b in batch])),
+        "hist_mask": torch.tensor(np.stack([b["hist_mask"] for b in batch])),
+    }
+
+
+def collate_eval(batch):
+    return {
+        "uid": [b["uid"] for b in batch],
+        "mid": torch.tensor([b["mid"] for b in batch], dtype=torch.long),
+        "label": torch.tensor([b["label"] for b in batch], dtype=torch.float32),
+        "hist_items": torch.tensor(np.stack([b["hist_items"] for b in batch])),
+        "hist_ratings": torch.tensor(np.stack([b["hist_ratings"] for b in batch])),
+        "hist_mask": torch.tensor(np.stack([b["hist_mask"] for b in batch])),
+    }
 
 
 # ─── Model ──────────────────────────────────────────────────────────
@@ -154,17 +225,27 @@ class HSTUBlock(nn.Module):
             nn.Linear(4 * dim, dim),
         )
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        # placeholder: vanilla pre-norm transformer block, no relative bias
+    def forward(self, x: torch.Tensor, mask: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
+        # placeholder: vanilla pre-norm transformer block, no relative bias.
+        # key_padding_mask and attn_mask must share dtype (both float here) to
+        # avoid the PyTorch mismatched-mask deprecation path.
         h = self.norm(x)
-        attn_out, _ = self.attn(h, h, h, key_padding_mask=(mask < 0.5), need_weights=False)
+        kp_mask = torch.zeros_like(mask)
+        kp_mask = kp_mask.masked_fill(mask < 0.5, float("-inf"))
+        attn_out, _ = self.attn(
+            h, h, h,
+            attn_mask=attn_mask,
+            key_padding_mask=kp_mask,
+            need_weights=False,
+        )
         x = x + attn_out
         x = x + self.ffn(x)
         return x
 
 
 class PlaceholderHSTU(nn.Module):
-    """Stub model: embedding sum + tiny transformer + scoring head.
+    """Stub model: causal transformer over (item + rating) embeddings with
+    SASRec-style dot-product scoring against a candidate item embedding.
 
     The real HSTU implementation (per Meta 2024) replaces the body with the
     HSTU block stack and adds relative-position bias from time deltas.
@@ -177,50 +258,103 @@ class PlaceholderHSTU(nn.Module):
         self.blocks = nn.ModuleList([
             HSTUBlock(EMBED_DIM, NUM_HEADS, DROPOUT) for _ in range(NUM_LAYERS)
         ])
-        self.head = nn.Linear(EMBED_DIM * 2, 1)
+        # No concat-head here: scoring is dot(h_t, item_embed(candidate)).
+        # SASRec-style sharing of item_embed between input and output is
+        # standard for sequence recommenders and halves head params.
         # TODO: relative-position bias from log-bucketed time deltas
         # TODO: action-type embedding (binary engaged vs implicit) once we add easy negs to history
 
-    def forward(self, hist_items, hist_ratings, hist_mask, candidate_items):
+    def encode(self, hist_items: torch.Tensor, hist_ratings: torch.Tensor,
+               hist_mask: torch.Tensor) -> torch.Tensor:
+        """Run the causal stack and return per-position hidden states (B, T, D)."""
+        B, T = hist_items.shape
         h = self.item_embed(hist_items) + self.rating_embed(hist_ratings)
+        # Causal mask: position t can only attend to ≤t. nn.MultiheadAttention
+        # expects a float mask added to attention logits (so -inf blocks).
+        causal = torch.triu(
+            torch.full((T, T), float("-inf"), device=h.device), diagonal=1,
+        )
         for block in self.blocks:
-            h = block(h, hist_mask)
-        # take the last valid position as the user representation
-        # TODO: replace with proper next-position decoding
+            h = block(h, hist_mask, causal)
+        return h
+
+    def score_per_position(self, h: torch.Tensor, target_items: torch.Tensor) -> torch.Tensor:
+        """Dot-product scoring at every position. h:(B,T,D), target_items:(B,T)."""
+        target_e = self.item_embed(target_items)              # (B, T, D)
+        return (h * target_e).sum(dim=-1)                     # (B, T)
+
+    def score_eval(self, h: torch.Tensor, hist_mask: torch.Tensor,
+                   candidate: torch.Tensor) -> torch.Tensor:
+        """Score the LAST valid position's hidden state against a candidate."""
+        # mask_sum == 0 means empty history; we still index 0 and let the
+        # learned-bias dot product handle it (loss/AUC harness will treat this
+        # as a generic prior). hist_mask>0 yields ≥1 for any user with ≥1 event.
         last_pos = hist_mask.sum(dim=1).clamp(min=1).long() - 1
         batch_idx = torch.arange(h.size(0), device=h.device)
-        user_rep = h[batch_idx, last_pos]
-        cand_rep = self.item_embed(candidate_items)
-        logit = self.head(torch.cat([user_rep, cand_rep], dim=-1)).squeeze(-1)
-        return logit
+        h_last = h[batch_idx, last_pos]                       # (B, D)
+        cand_e = self.item_embed(candidate)                   # (B, D)
+        return (h_last * cand_e).sum(dim=-1)                  # (B,)
 
 
 # ─── Train + eval ───────────────────────────────────────────────────
-def run_epoch(model, loader, optimizer, *, train: bool):
-    model.train(train)
+def train_one_epoch(model, loader, optimizer):
+    """Sequence-level training: per-position causal BCE on next-event engagement."""
+    model.train()
     total_loss = 0.0
-    total_n = 0
+    total_positions = 0
+    bce = nn.BCEWithLogitsLoss(reduction="none")
+    for batch in loader:
+        hist_items = batch["hist_items"].to(DEVICE)         # (B, T)
+        hist_ratings = batch["hist_ratings"].to(DEVICE)     # (B, T)
+        hist_mask = batch["hist_mask"].to(DEVICE)           # (B, T)
+
+        h = model.encode(hist_items, hist_ratings, hist_mask)  # (B, T, D)
+
+        # Per-position next-event prediction:
+        #   At position t (0..T-2), score h_t against item_embed(events[t+1])
+        #   target = engagement bucket of events[t+1] (rating >= 4 → 1)
+        # h, items, ratings, mask are all aligned over T positions.
+        h_in = h[:, :-1, :]                                 # (B, T-1, D)
+        next_items = hist_items[:, 1:]                      # (B, T-1)
+        next_ratings = hist_ratings[:, 1:]                  # (B, T-1)
+        # valid position = both current AND next event are real (not pad)
+        pair_mask = hist_mask[:, :-1] * hist_mask[:, 1:]    # (B, T-1)
+
+        logits = model.score_per_position(h_in, next_items)  # (B, T-1)
+        targets = (next_ratings >= ENGAGED_BUCKET_THRESHOLD).float()
+        loss_per = bce(logits, targets)                     # (B, T-1)
+        masked = loss_per * pair_mask
+        n_valid = pair_mask.sum().clamp(min=1.0)
+        loss = masked.sum() / n_valid
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        total_loss += masked.sum().item()
+        total_positions += int(pair_mask.sum().item())
+    avg_loss = total_loss / max(1, total_positions)
+    return avg_loss
+
+
+@torch.no_grad()
+def evaluate_model(model, loader):
+    """Per-(user, candidate, ts) eval: dot(h_T, item_embed(candidate)) → sigmoid → AUC."""
+    model.eval()
     all_scores, all_labels = [], []
-    bce = nn.BCEWithLogitsLoss(reduction="sum")
     for batch in loader:
         hist_items = batch["hist_items"].to(DEVICE)
         hist_ratings = batch["hist_ratings"].to(DEVICE)
         hist_mask = batch["hist_mask"].to(DEVICE)
-        cand = torch.tensor(batch["mid"], device=DEVICE)
-        label = torch.tensor(batch["label"], device=DEVICE, dtype=torch.float32)
-        logit = model(hist_items, hist_ratings, hist_mask, cand)
-        loss = bce(logit, label)
-        if train:
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-        total_loss += loss.item()
-        total_n += label.numel()
+        cand = batch["mid"].to(DEVICE)
+        label = batch["label"]
+        h = model.encode(hist_items, hist_ratings, hist_mask)
+        logit = model.score_eval(h, hist_mask, cand)
         all_scores.append(torch.sigmoid(logit).detach().cpu().numpy())
-        all_labels.append(label.detach().cpu().numpy())
+        all_labels.append(label.numpy())
     scores = np.concatenate(all_scores)
     labels = np.concatenate(all_labels)
-    return total_loss / max(1, total_n), evaluate(labels, scores)["auc"]
+    return evaluate(labels, scores)["auc"]
 
 
 def main():
@@ -241,21 +375,13 @@ def main():
     train_history = build_user_sequences(train_df)
     eval_history = build_user_sequences(pd.concat([train_df, val_df], ignore_index=True))
 
-    # TODO: collator that packs sequences for the real HSTU; for now per-sample slice.
-    def collate(batch):
-        return {
-            "uid": [b["uid"] for b in batch],
-            "mid": [b["mid"] for b in batch],
-            "label": [b["label"] for b in batch],
-            "hist_items": torch.tensor(np.stack([b["hist_items"] for b in batch])),
-            "hist_ratings": torch.tensor(np.stack([b["hist_ratings"] for b in batch])),
-            "hist_mask": torch.tensor(np.stack([b["hist_mask"] for b in batch])),
-        }
-
-    train_ds = HSTUDataset(train_df, train_history, SEQ_LEN)
-    val_ds = HSTUDataset(val_df, eval_history, SEQ_LEN)
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate)
+    train_ds = SequenceTrainDataset(train_history, SEQ_LEN)
+    val_ds = EvalDataset(val_df, eval_history, SEQ_LEN)
+    log.info(f"  train_sequences={len(train_ds)}  val_rows={len(val_ds)}")
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+                              collate_fn=collate_train)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
+                            collate_fn=collate_eval)
 
     model = PlaceholderHSTU(stats["num_items"], NUM_RATING_BUCKETS).to(DEVICE)
     n_params = sum(p.numel() for p in model.parameters())
@@ -266,10 +392,9 @@ def main():
 
     best_val_auc = 0.0
     for epoch in range(MAX_EPOCHS):
-        train_loss, train_auc = run_epoch(model, train_loader, optimizer, train=True)
-        val_loss, val_auc = run_epoch(model, val_loader, optimizer=None, train=False)
-        log.info(f"epoch {epoch}: train_loss={train_loss:.4f} train_auc={train_auc:.4f} "
-                 f"val_loss={val_loss:.4f} val_auc={val_auc:.4f}")
+        train_loss = train_one_epoch(model, train_loader, optimizer)
+        val_auc = evaluate_model(model, val_loader)
+        log.info(f"epoch {epoch}: train_loss={train_loss:.4f} val_auc={val_auc:.4f}")
         best_val_auc = max(best_val_auc, val_auc)
 
     total = time.time() - t0
