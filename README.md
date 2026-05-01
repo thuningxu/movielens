@@ -48,8 +48,19 @@ graph TD
         EV["events[t] = (movieId_t, rating_bucket_t, timestamp_t)<br/>t = 0 .. L-1, real events at the right end"]
     end
 
-    subgraph "Embeddings (D=64)"
-        EV --> IE["item_embed[movieId]<br/>+ rating_embed[rating_bucket]<br/>→ x ∈ (B, L, D)"]
+    subgraph "Static metadata tables (apr30, opt-in via USE_*)"
+        GMT["genome_table: (num_items+1, 1128)<br/>nn.Buffer, fixed at load"]
+        GRT["genre_table: (num_items+1, 20)<br/>multi-hot, nn.Buffer"]
+        YRT["year_id_table: (num_items+1,)<br/>year - 1850 clipped to [0, 199]"]
+    end
+
+    subgraph "item_full_embed(m) — symmetric helper"
+        EV -.->|"movieId_t"| IFE["item_embed[m]<br/>+ USE_GENOME · genome_proj(genome_table[m])<br/>+ USE_GENRE · genre_proj(genre_table[m])<br/>+ USE_YEAR · year_embed(year_id_table[m])"]
+        GMT -.-> IFE
+        GRT -.-> IFE
+        YRT -.-> IFE
+        IFE --> IE["x = item_full_embed(m_t) + rating_embed[rating_bucket_t]<br/>→ (B, L, D)"]
+        EV --> IE
     end
 
     subgraph "Time-delta bias (precomputed once per batch)"
@@ -70,15 +81,21 @@ graph TD
         WO --> RES["x + out (residual)"]
     end
 
-    subgraph "Heads"
-        RES --> TRH["Train: per-position dot(h_t, item_embed(events[t+1].movieId))<br/>→ BCE on engaged(events[t+1])"]
-        RES --> EVH["Eval: dot(h_{L-1}, item_embed(candidate))<br/>→ sigmoid → P(engage)"]
+    subgraph "Heads (use the SAME item_full_embed helper)"
+        RES --> TRH["Train: per-position<br/>dot(h_t, item_full_embed(events[t+1].movieId))<br/>→ BCE on engaged(events[t+1])"]
+        RES --> EVH["Eval: dot(h_{L-1}, item_full_embed(candidate))<br/>→ sigmoid → P(engage)"]
+        IFE -.->|"shared"| TRH
+        IFE -.->|"shared"| EVH
     end
 
     style EV fill:#e1f5fe
+    style IFE fill:#fff3e0
     style POINT fill:#fce4ec
     style GLU fill:#fff3e0
     style EVH fill:#c8e6c9
+    style GMT fill:#f3e5f5
+    style GRT fill:#f3e5f5
+    style YRT fill:#f3e5f5
 ```
 
 The signature HSTU departures from a vanilla causal transformer:
@@ -89,14 +106,38 @@ The signature HSTU departures from a vanilla causal transformer:
 
 Per Meta 2024 §3.
 
+### Content metadata injection (apr30, Idea 1)
+
+Three opt-in flags wire MovieLens content into HSTU:
+
+- `USE_GENOME=1` — MovieLens 1128-d tag-genome (relevance scores per tag-id, dense)
+- `USE_GENRE=1` — 20-d genre multi-hot from `movies.csv`
+- `USE_YEAR=1` — year embedding via title regex `(\d{4})`, bucketed `clip(year - 1850, 0, 199)`
+
+Single symmetric helper `item_full_embed(m)` adds projected metadata to `item_embed[m]`. The same helper is used at three call sites:
+
+1. **Sequence input** — every position's input is `item_full_embed(m_t) + rating_embed(r_t)`
+2. **Per-position training target** — `dot(h_t, item_full_embed(events[t+1].movieId))` (no rating, since rating is the label)
+3. **Eval candidate scoring** — `dot(h_{L-1}, item_full_embed(candidate))`
+
+Whatever metadata-fused embedding the sequence sees as observations is exactly what the candidate gets at scoring time — symmetric by design, no separate "head augmentation" branch.
+
+**Off-state byte-equivalence**: when all three flags are 0, the projection modules (`genome_proj`, `genre_proj`, `year_embed`) are not constructed at all (RNG state preserved). At ON state, projection weights are zero-init so step-0 logits match OFF; signal grows monotonically as projections train.
+
+**Tables stored as `nn.Buffer(persistent=False)`**: 254 MB on GPU at ml-25m for the genome table; not in `state_dict` (rebuilt at load).
+
 ## Status
 
 `apr30` branch implements the full pipeline:
 - **Step 1** (`5bf86c6`): sequence-level training with per-position causal loss (SASRec/HSTU framing).
 - **Step 2** (`e057e70`): real HSTU block — pointwise SiLU attention + gated linear unit + log-bucketed time-delta bias.
-- **Bugfix** (after Validator audit): cold/short-history users were getting the wrong hidden state at eval (left-padding makes `seq_len-1` always the last real event, not `mask.sum()-1`). Now corrected.
+- **Bugfix** (`12481fc`): cold/short-history users were getting the wrong hidden state at eval — left-padding makes `seq_len-1` always the last real event.
+- **Bug #1 fix** (`3ea5c1b`): movieId +1 shift to avoid PAD/movieId-0 collision in `nn.Embedding(..., padding_idx=0)`.
+- **LR=5e-3, MAX_EPOCHS=15** (`a046154`): val 0.8367 with 4L/64D, no metadata. **Already beats heavily-tuned simple_v2 static (0.828) and legacy DLRM (0.8284) by +0.008 with no movie content features at all** — pure user-item interaction modeling.
+- **Capacity sweep** (cells A/B): width-doubling at preserved depth gave zero lift; capacity along this axis is not the binding constraint.
+- **Content metadata** (`ab4bdda`): USE_GENOME / USE_GENRE / USE_YEAR opt-in flags added to test the structural-content-gap hypothesis. Default off (byte-equivalent baseline).
 
-Smoke test on ml-100k passes (val_auc ≈ 0.515 after 1 epoch — ml-100k is too small for the HSTU inductive bias to surface; ml-25m sweep is the real test).
+Current ml-25m sweep in flight: 3-cell metadata-1 (M0 control / M2 genome-only / M1 all metadata) at 4L/64D LR=5e-3 MAX_EPOCHS=15.
 
 ## What carries over from the prior attempts
 
