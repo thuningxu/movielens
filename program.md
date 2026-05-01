@@ -51,6 +51,29 @@ Brief notes on cycles run on the restart. Detailed per-trial data lives in `resu
 
 Legacy DLRM ceiling: 0.8284 (val). Restart linear-head + `EVAL_DYNAMIC_HIST=1 FREQ_WD_LAMBDA=0 LR=1e-3` **exceeds the legacy ceiling by +0.031 on val and +0.023 on test**. Static-history linear baseline still matches legacy within 0.0002 (apr28o at 0.8282 val). Project headline: **test AUC 0.8455** with single linear-head model.
 
+### `autoresearch/apr28am` — DIN target-aware attention pool at dynamic regime — regresses
+
+**Null/regress** (`5a13034`). Critic's leverage argument: dynamic regime made u_hist dense for 70% of val users (apr28ad cold_user +0.028); the *pool aggregator* is the un-revisited surface, since prior DIN nulls (apr28y/z) were measured when 70% of pool inputs were empty. No code change — `USER_HIST_POOL=din` path already in train.py. 4-cell SEED=42 sweep:
+
+| Cell | val_auc | Δ vs control |
+|---|---|---|
+| C0 control (rating_centered) | 0.859384 | (locked baseline confirmed) |
+| C1 DIN hidden=32 | 0.847159 | **-0.0122** |
+| C2 DIN hidden=64 | 0.847893 | **-0.0115** |
+| C3 DIN hidden=128 | 0.849001 | **-0.0104** |
+
+Wider DIN is monotonically less bad but all cells regress -0.010 to -0.012 vs control — far below the +0.001 kill threshold.
+
+**Diagnosis**: the rating-centered pool's **negative-weight mechanism** is load-bearing. Centered-pool weights items by `(rating − 0.6)` — positive for ≥4★ (push *toward* embedding), negative for <4★ (push *away*). DIN's softmax attention produces strictly non-negative weights — it can downweight low-rated items but cannot push away from them. The "sign matters" finding from apr28b directly bites here.
+
+This is the structural reason DIN replaces (not augments) the centered-pool. Wider hidden helps marginally because more capacity recovers some negative-rating signal via the rating-aware MLP path, but never matches the explicit negative-weight mechanism of centered-pool.
+
+**Lesson**: any candidate that *replaces* the rating-centered pool must preserve negative-weighting on low-rated items. Augmenting (multi-pool concat: `[rating_centered_pool ⊕ attn_pool]`) is structurally different — preserves the signed pool while adding target-aware capacity.
+
+The Critic's "dynamic regime invalidates prior pool-arch nulls" argument was correct in scope but missed that DIN's positive-only attention is the dominant failure mode regardless of regime.
+
+**Baseline unchanged at apr28ah: 5-seed mean 0.859289 / SEED=42 0.859384 / test 0.845497.**
+
 ### `autoresearch/apr28al` — train-time time-leak fix only — regresses
 
 **Null/regress** (`31e6c71`). Isolated test of "train-time causal u_hist" without the val-data injection that apr28ae bundled. New flag `TRAIN_DYNAMIC_HIST_TRAIN_ONLY=1` rebuilds each train sample's u_hist from `train_df` ratings strictly prior to that sample's ts (vs the static `user_histories[uid]` which was built once from all of train, mixing future items into early samples' history).
