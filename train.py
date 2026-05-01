@@ -405,15 +405,17 @@ class HSTU(nn.Module):
 
     def score_eval(self, h: torch.Tensor, hist_mask: torch.Tensor,
                    candidate: torch.Tensor) -> torch.Tensor:
-        """Score the LAST valid position's hidden state against a candidate."""
-        # mask_sum == 0 means empty history; we still index 0 and let the
-        # learned-bias dot product handle it (loss/AUC harness will treat this
-        # as a generic prior). hist_mask>0 yields ≥1 for any user with ≥1 event.
-        last_pos = hist_mask.sum(dim=1).clamp(min=1).long() - 1
-        batch_idx = torch.arange(h.size(0), device=h.device)
-        h_last = h[batch_idx, last_pos]                       # (B, D)
+        """Score the LAST valid position's hidden state against a candidate.
+
+        With LEFT-padding, real events always occupy the rightmost positions
+        [seq_len-n, seq_len-1], so the last valid position is seq_len-1 for
+        any warm user. Empty-history rows are also indexed at seq_len-1 — the
+        hidden state there is computed from all-PAD inputs and the dot product
+        with the candidate embedding gives the model's cold-user prior.
+        """
+        last_h = h[:, -1, :]                                  # (B, D)
         cand_e = self.item_embed(candidate)                   # (B, D)
-        return (h_last * cand_e).sum(dim=-1)                  # (B,)
+        return (last_h * cand_e).sum(dim=-1)                  # (B,)
 
 
 # ─── Train + eval ───────────────────────────────────────────────────

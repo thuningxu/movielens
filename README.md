@@ -40,9 +40,63 @@ DATASET=ml-100k uv run python train.py
 DATASET=ml-25m uv run python train.py
 ```
 
+## Architecture
+
+```mermaid
+graph TD
+    subgraph "Per-user event sequence (left-padded, length L)"
+        EV["events[t] = (movieId_t, rating_bucket_t, timestamp_t)<br/>t = 0 .. L-1, real events at the right end"]
+    end
+
+    subgraph "Embeddings (D=64)"
+        EV --> IE["item_embed[movieId]<br/>+ rating_embed[rating_bucket]<br/>→ x ∈ (B, L, D)"]
+    end
+
+    subgraph "Time-delta bias (precomputed once per batch)"
+        EV --> TD["pairwise Δt = |ts_i - ts_j|<br/>bucket = 0 if Δt=0, else 1+floor(log2(Δt))<br/>clamp to [0, 31] → (B, L, L) int"]
+    end
+
+    subgraph "HSTU block × NUM_LAYERS (=4)"
+        IE --> LN1["LayerNorm"]
+        LN1 --> UVQK["Linear(D, 4D) → SiLU<br/>split → U, V, Q, K  each (B, L, D)"]
+        UVQK --> MH["reshape Q, K, V → (B, H=4, L, D/H=16)"]
+        TD --> RB["rel_bias = Embedding(32, H)[bucket]<br/>→ (B, H, L, L)"]
+        MH --> SCORE["scores = Q · Kᵀ / √(D/H) + rel_bias<br/>→ (B, H, L, L)"]
+        RB --> SCORE
+        SCORE --> POINT["SiLU(scores) ⊙ keep_mask<br/>(causal × pad-key) — POINTWISE, NO softmax"]
+        POINT --> AV["AV = scores · V → reshape (B, L, D)"]
+        AV --> GLU["LayerNorm(AV) ⊙ U<br/>(gated linear unit — no separate FFN)"]
+        GLU --> WO["Linear(D, D)"]
+        WO --> RES["x + out (residual)"]
+    end
+
+    subgraph "Heads"
+        RES --> TRH["Train: per-position dot(h_t, item_embed(events[t+1].movieId))<br/>→ BCE on engaged(events[t+1])"]
+        RES --> EVH["Eval: dot(h_{L-1}, item_embed(candidate))<br/>→ sigmoid → P(engage)"]
+    end
+
+    style EV fill:#e1f5fe
+    style POINT fill:#fce4ec
+    style GLU fill:#fff3e0
+    style EVH fill:#c8e6c9
+```
+
+The signature HSTU departures from a vanilla causal transformer:
+
+- **Pointwise (SiLU) attention, not softmax.** No row-wise normalization over keys.
+- **Gated linear unit replaces FFN.** `LayerNorm(AV) ⊙ U` does both attention output and channel-mixing in one step.
+- **Relative-position bias from log-bucketed time deltas.** Per-block, per-head learnable bias table over 32 time-gap buckets (0 = same instant, 31 = >2³⁰ s ≈ 34 yr). Init zeros so the model starts as a no-bias HSTU.
+
+Per Meta 2024 §3.
+
 ## Status
 
-**Stub only.** The HSTU model class, data pipeline, and training loop are skeleton TODOs. The first commit just establishes the layout and points the entrypoints at `prepare.py:load_data` for raw rating events.
+`apr30` branch implements the full pipeline:
+- **Step 1** (`5bf86c6`): sequence-level training with per-position causal loss (SASRec/HSTU framing).
+- **Step 2** (`e057e70`): real HSTU block — pointwise SiLU attention + gated linear unit + log-bucketed time-delta bias.
+- **Bugfix** (after Validator audit): cold/short-history users were getting the wrong hidden state at eval (left-padding makes `seq_len-1` always the last real event, not `mask.sum()-1`). Now corrected.
+
+Smoke test on ml-100k passes (val_auc ≈ 0.515 after 1 epoch — ml-100k is too small for the HSTU inductive bias to surface; ml-25m sweep is the real test).
 
 ## What carries over from the prior attempts
 
