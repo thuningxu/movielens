@@ -240,6 +240,15 @@ EVAL_DYNAMIC_ITEM_HIST = int(os.environ.get("EVAL_DYNAMIC_ITEM_HIST", "0"))
 # (which uses dynamic histories). Off-state (default 0): byte-equivalent.
 TRAIN_DYNAMIC_HIST = int(os.environ.get("TRAIN_DYNAMIC_HIST", "0"))
 
+# apr28al: train-time time-leak fix only. Like TRAIN_DYNAMIC_HIST but builds
+# per-user sorted flat arrays from train_df ONLY (no val_df). Each train
+# sample's u_hist becomes strictly causal (only train ratings with ts < sample's
+# ts) — fixes the existing static-history time leak (where user_histories[uid]
+# = "last K train items" includes items rated AFTER the current sample's ts).
+# Off-state (default 0): byte-equivalent. Mutually-exclusive-prefer with
+# TRAIN_DYNAMIC_HIST: if both set, TRAIN_DYNAMIC_HIST wins (uses train+val).
+TRAIN_DYNAMIC_HIST_TRAIN_ONLY = int(os.environ.get("TRAIN_DYNAMIC_HIST_TRAIN_ONLY", "0"))
+
 # apr28ai per-user incremental fine-tune at eval. After model training, for each
 # val user u with prior real ratings, take INCR_TUNE_K SGD step(s) on
 # user_embed.weight[u] using their prior ratings (with ts < min(eval_row_ts) for
@@ -867,12 +876,16 @@ if EVAL_DYNAMIC_ITEM_HIST:
 # Compact per-user sorted arrays + per-train-sample cut positions; per-batch
 # GPU gather. Memory: ~720 MB GPU total (avoids the 24 GB host precompute
 # that wouldn't fit in 29 GB host RAM).
-if TRAIN_DYNAMIC_HIST:
-    log.info("Building train-time dynamic-history infrastructure (apr28ae)...")
-    _comb_real_train = pd.concat([
-        train_df[train_df["rating"] > 0][["userId", "movieId", "rating", "timestamp"]],
-        val_df[val_df["rating"] > 0][["userId", "movieId", "rating", "timestamp"]],
-    ], ignore_index=True)
+if TRAIN_DYNAMIC_HIST or TRAIN_DYNAMIC_HIST_TRAIN_ONLY:
+    if TRAIN_DYNAMIC_HIST:
+        log.info("Building train-time dynamic-history infrastructure (apr28ae: train+val)...")
+        _comb_real_train = pd.concat([
+            train_df[train_df["rating"] > 0][["userId", "movieId", "rating", "timestamp"]],
+            val_df[val_df["rating"] > 0][["userId", "movieId", "rating", "timestamp"]],
+        ], ignore_index=True)
+    else:
+        log.info("Building train-time dynamic-history infrastructure (apr28al: train-only leak-fix)...")
+        _comb_real_train = train_df[train_df["rating"] > 0][["userId", "movieId", "rating", "timestamp"]].copy()
     _comb_real_train = _comb_real_train.sort_values(["userId", "timestamp"]).reset_index(drop=True)
     _flat_uid = _comb_real_train["userId"].values.astype(np.int64)
     _flat_mid = _comb_real_train["movieId"].values.astype(np.int32)
@@ -1100,7 +1113,7 @@ class LinearBaseline(nn.Module):
         # 2. apr28ad EVAL_DYNAMIC_HIST=1 + eval (not training): per-sample
         #    precomputed dynamic history.
         # 3. Static (default): per-user fixed history from train.
-        if self.training and hist_idx is not None and TRAIN_DYNAMIC_HIST:
+        if self.training and hist_idx is not None and (TRAIN_DYNAMIC_HIST or TRAIN_DYNAMIC_HIST_TRAIN_ONLY):
             cuts = _train_sample_cut_t[hist_idx]                              # (B,) abs pos
             user_starts = _user_starts_t[uids]                                # (B,) start of slice
             _pos_off = torch.arange(HISTORY_LEN, device=DEVICE).unsqueeze(0)  # (1, L)
@@ -1346,7 +1359,7 @@ for epoch in range(MAX_EPOCHS):
         # distinguish train-time vs eval-time dynamic history.
         out = model(train_uids[idx], train_mids[idx], train_ts[idx],
                     ts_raw=train_ts_raw[idx],
-                    hist_idx=idx if TRAIN_DYNAMIC_HIST else None)
+                    hist_idx=idx if (TRAIN_DYNAMIC_HIST or TRAIN_DYNAMIC_HIST_TRAIN_ONLY) else None)
         if isinstance(out, tuple):
             logits, aux_pred = out
         else:
