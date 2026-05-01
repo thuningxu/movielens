@@ -1,0 +1,6 @@
+[
+  {"name": "am_control_s42", "env": {"EVAL_DYNAMIC_HIST": "1", "FREQ_WD_LAMBDA": "0", "LR": "1e-3"}},
+  {"name": "am_din_h32_s42", "env": {"EVAL_DYNAMIC_HIST": "1", "FREQ_WD_LAMBDA": "0", "LR": "1e-3", "USER_HIST_POOL": "din", "DIN_ATTN_HIDDEN": "32"}},
+  {"name": "am_din_h64_s42", "env": {"EVAL_DYNAMIC_HIST": "1", "FREQ_WD_LAMBDA": "0", "LR": "1e-3", "USER_HIST_POOL": "din", "DIN_ATTN_HIDDEN": "64"}},
+  {"name": "am_din_h128_s42", "env": {"EVAL_DYNAMIC_HIST": "1", "FREQ_WD_LAMBDA": "0", "LR": "1e-3", "USER_HIST_POOL": "din", "DIN_ATTN_HIDDEN": "128"}}
+]
