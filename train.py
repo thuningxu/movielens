@@ -25,6 +25,7 @@ Task is unchanged from the prior attempts (legacy/, simple_v2/):
 
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -67,6 +68,137 @@ LR = float(os.environ.get("LR", "1e-3"))
 WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "1e-5"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "256"))
 MAX_EPOCHS = int(os.environ.get("MAX_EPOCHS", "5"))
+
+# Cold-start content metadata flags (apr30, Idea 1). All default OFF for
+# byte-equivalence with the prior baseline. When enabled, each adds a
+# projection (or embedding) summed into the per-position item-side input
+# AND used symmetrically when scoring a candidate, so the metadata appears
+# in BOTH the sequence and the dot product. Zero-init keeps the OFF→ON
+# transition smooth (initial logits unchanged at step 0; signal grows as
+# the projections train).
+USE_GENOME = int(os.environ.get("USE_GENOME", "0"))
+USE_GENRE = int(os.environ.get("USE_GENRE", "0"))
+USE_YEAR = int(os.environ.get("USE_YEAR", "0"))
+
+# Year embedding bucket scheme. ml-25m titles span 1874..2019; ml-100k spans
+# 1922..1998. Coverage 1850..2049 = 200 buckets handles all observed datasets
+# with safety margin and costs ~12 KB at D=64. year_id = clip(year - YEAR_MIN,
+# 0, NUM_YEAR_BUCKETS - 1); missing-year sentinel uses bucket 0 (1850, well
+# outside any real movie's release year).
+YEAR_MIN = 1850
+NUM_YEAR_BUCKETS = 200
+
+
+# ─── Movie metadata (cold-start content features) ───────────────────
+def load_movie_metadata(movies_df: pd.DataFrame, dataset: str, num_items: int):
+    """Load per-movie content features aligned to the +1-shifted movieId convention.
+
+    Returns three numpy arrays sized (num_items + 1, ...) where row 0 is the
+    PAD slot (all zeros) and rows 1..num_items are the real movies' metadata.
+    This matches the embedding-table convention used by HSTU.item_embed (PAD=0,
+    real movies = 1..num_items) so a single +1-shifted movieId indexes both
+    item_embed and any metadata table.
+
+    Returns:
+        genome:  (num_items + 1, GENOME_DIM) float32. Per-movie tag-genome
+                 relevance scores from genome-scores.csv. Movies without genome
+                 data (e.g. all of ml-100k, or new movies in ml-25m) get a
+                 zero row. GENOME_DIM = 1128 for ml-25m, 0 for datasets with
+                 no genome file (graceful fallback: ml-100k → empty matrix).
+        genre:   (num_items + 1, num_genres) float32. Multi-hot genre vector
+                 per movie. num_genres is the number of unique genre tokens
+                 observed in movies_df (~20 for MovieLens).
+        year_id: (num_items + 1,) int64. Bucket index = clip(year - YEAR_MIN,
+                 0, NUM_YEAR_BUCKETS - 1). Movies without a parseable year, and
+                 the PAD slot, get bucket 0 (1850). The HSTU.year_embed table
+                 is zero-initialized so year_id=0 contributes the same zero
+                 vector as a missing entry.
+
+    All datasets share the same genre/year code path. Genome falls back to an
+    empty (0-width) matrix when genome-scores.csv is absent, and the model is
+    careful to skip the genome path entirely when GENOME_DIM == 0 — that way
+    USE_GENOME=1 on ml-100k is a benign no-op rather than a crash.
+    """
+    data_root = Path(__file__).resolve().parent / "data"
+
+    # Genre multi-hot from movies_df["genres"] (pipe-separated, e.g. "Action|Comedy").
+    # movies_df is the prepare.load_data() output: movieIds already mapped to
+    # contiguous 0..num_items-1, and genres preserved as the original string.
+    all_genres_set = set()
+    for g in movies_df["genres"].dropna():
+        all_genres_set.update(g.split("|"))
+    all_genres = sorted(all_genres_set - {""})
+    genre_to_idx = {g: i for i, g in enumerate(all_genres)}
+    num_genres = len(all_genres)
+    genre = np.zeros((num_items + 1, max(num_genres, 1)), dtype=np.float32)
+    for _, row in movies_df.iterrows():
+        mid = int(row["movieId"])
+        if 0 <= mid < num_items and isinstance(row["genres"], str):
+            for g in row["genres"].split("|"):
+                if g in genre_to_idx:
+                    genre[mid + 1, genre_to_idx[g]] = 1.0
+
+    # Year bucket from regex on title. Missing-year movies and the PAD row
+    # both use bucket 0 (1850), which is outside any real release year.
+    year_id = np.zeros(num_items + 1, dtype=np.int64)
+    for _, row in movies_df.iterrows():
+        mid = int(row["movieId"])
+        if 0 <= mid < num_items:
+            m = re.search(r"\((\d{4})\)", str(row.get("title", "")))
+            if m:
+                y = int(m.group(1)) - YEAR_MIN
+                year_id[mid + 1] = max(0, min(NUM_YEAR_BUCKETS - 1, y))
+
+    # Tag genome (1128-d per movie, ml-25m only). The genome CSV uses RAW
+    # movieIds, so we re-derive prepare.py's movie_map by reading ratings.csv
+    # and applying the same `unique() in time-sorted order` rule. Datasets
+    # without genome data fall through to a (num_items + 1, 0) array; the
+    # model checks GENOME_DIM > 0 before invoking genome_proj.
+    genome_path = data_root / dataset / "genome-scores.csv"
+    if genome_path.exists():
+        # Recompute the prepare.py movie_map. For ml-25m the raw ratings are
+        # in ratings.csv with the same column scheme as load_data uses.
+        if dataset == "ml-25m":
+            raw_path = data_root / dataset / "ratings.csv"
+            raw = pd.read_csv(raw_path)
+        elif dataset == "ml-1m":
+            raw_path = data_root / dataset / "ratings.dat"
+            raw = pd.read_csv(raw_path, sep="::", engine="python",
+                              names=["userId", "movieId", "rating", "timestamp"])
+        elif dataset == "ml-10m":
+            raw_path = data_root / "ml-10M100K" / "ratings.dat"
+            raw = pd.read_csv(raw_path, sep="::", engine="python",
+                              names=["userId", "movieId", "rating", "timestamp"])
+        else:
+            raw = None
+        if raw is not None:
+            raw = raw.sort_values("timestamp").reset_index(drop=True)
+            movie_map = {int(mid): i for i, mid in enumerate(raw["movieId"].unique())}
+            gdf = pd.read_csv(genome_path)
+            num_tags = int(gdf["tagId"].max())
+            genome = np.zeros((num_items + 1, num_tags), dtype=np.float32)
+            gdf["mapped_mid"] = gdf["movieId"].map(movie_map)
+            gdf = gdf.dropna(subset=["mapped_mid"])
+            gdf["mapped_mid"] = gdf["mapped_mid"].astype(int)
+            have = 0
+            for mid, group in gdf.groupby("mapped_mid"):
+                if 0 <= mid < num_items:
+                    tag_ids = group["tagId"].values.astype(int) - 1
+                    genome[mid + 1, tag_ids] = group["relevance"].values.astype(np.float32)
+                    have += 1
+            log.info(f"  tag genome: {have}/{num_items} movies "
+                     f"({100 * have / num_items:.1f}%), dim={num_tags}")
+        else:
+            genome = np.zeros((num_items + 1, 0), dtype=np.float32)
+    else:
+        # ml-100k and any future dataset without a genome file. USE_GENOME=1
+        # is treated as a no-op in this case (HSTU checks genome_dim > 0).
+        genome = np.zeros((num_items + 1, 0), dtype=np.float32)
+        log.info(f"  no tag genome at {genome_path} — USE_GENOME will no-op")
+
+    log.info(f"  metadata: genome_dim={genome.shape[1]}  "
+             f"num_genres={num_genres}  year_buckets=[{YEAR_MIN}..{YEAR_MIN + NUM_YEAR_BUCKETS - 1}]")
+    return genome, genre, year_id
 
 
 # ─── Data ───────────────────────────────────────────────────────────
@@ -376,9 +508,27 @@ class HSTU(nn.Module):
     computed once per batch in `encode()` (B, L, L int64) and shared across
     all blocks — each block has its own per-head bias table indexed by these
     buckets.
+
+    Cold-start content metadata (apr30, Idea 1, opt-in via USE_GENOME /
+    USE_GENRE / USE_YEAR flags). When enabled, each per-position item-side
+    embedding becomes
+        item_full_embed(m) = item_embed(m)
+                           + (USE_GENOME ? genome_proj(genome[m]) : 0)
+                           + (USE_GENRE  ? genre_proj(genre[m])   : 0)
+                           + (USE_YEAR   ? year_embed(year_id[m]) : 0)
+    and this *same* construction is used both at sequence input AND at
+    candidate scoring (symmetric path). Projection weights are zero-init,
+    so OFF→ON keeps step-0 logits identical to OFF and the metadata signal
+    grows monotonically as the projections train.
+
+    OFF-state byte-equivalence: when all three flags are 0, item_full_embed
+    skips every metadata branch and returns plain item_embed(m), matching
+    the prior baseline exactly. Metadata tensors are allocated regardless
+    (for codepath simplicity) but never accessed in the OFF path.
     """
 
-    def __init__(self, num_items: int, num_rating_buckets: int):
+    def __init__(self, num_items: int, num_rating_buckets: int,
+                 genome: torch.Tensor, genre: torch.Tensor, year_id: torch.Tensor):
         super().__init__()
         # Index 0 is PAD; real movies occupy 1..num_items. Callers
         # (build_user_sequences, EvalDataset) shift movieIds by +1 so the
@@ -394,11 +544,51 @@ class HSTU(nn.Module):
         # standard for sequence recommenders and halves head params.
         # TODO: action-type embedding (binary engaged vs implicit) once we add easy negs to history
 
+        # Cold-start content metadata buffers and projections. Buffers are
+        # registered (not parameters) — only the projections train.
+        self.register_buffer("genome_table", genome, persistent=False)
+        self.register_buffer("genre_table", genre, persistent=False)
+        self.register_buffer("year_id_table", year_id, persistent=False)
+        self.genome_dim = int(genome.shape[1])
+        self.genre_dim = int(genre.shape[1])
+        # USE_GENOME on a dataset without genome data (e.g. ml-100k) is a
+        # silent no-op: genome_dim==0 → genome_proj has no input → skip.
+        self.use_genome = bool(USE_GENOME) and self.genome_dim > 0
+        self.use_genre = bool(USE_GENRE) and self.genre_dim > 0
+        self.use_year = bool(USE_YEAR)
+        if self.use_genome:
+            self.genome_proj = nn.Linear(self.genome_dim, EMBED_DIM, bias=False)
+            nn.init.zeros_(self.genome_proj.weight)  # OFF→ON byte-equivalent at step 0
+        if self.use_genre:
+            self.genre_proj = nn.Linear(self.genre_dim, EMBED_DIM, bias=False)
+            nn.init.zeros_(self.genre_proj.weight)
+        if self.use_year:
+            self.year_embed = nn.Embedding(NUM_YEAR_BUCKETS, EMBED_DIM)
+            nn.init.zeros_(self.year_embed.weight)
+
+    def item_full_embed(self, item_ids: torch.Tensor) -> torch.Tensor:
+        """Symmetric per-position item-side embedding used for both sequence
+        input AND candidate scoring. Same construction in both spots is the
+        whole point: the candidate at score time gets the same metadata-fused
+        embedding that its observations contributed at training time.
+
+        item_ids is the +1-shifted movieId convention (PAD=0, real=1..num_items).
+        Output shape matches item_embed(item_ids), i.e. (..., EMBED_DIM).
+        """
+        e = self.item_embed(item_ids)
+        if self.use_genome:
+            e = e + self.genome_proj(self.genome_table[item_ids])
+        if self.use_genre:
+            e = e + self.genre_proj(self.genre_table[item_ids])
+        if self.use_year:
+            e = e + self.year_embed(self.year_id_table[item_ids])
+        return e
+
     def encode(self, hist_items: torch.Tensor, hist_ratings: torch.Tensor,
                hist_ts: torch.Tensor, hist_mask: torch.Tensor) -> torch.Tensor:
         """Run the causal stack and return per-position hidden states (B, T, D)."""
         B, T = hist_items.shape
-        h = self.item_embed(hist_items) + self.rating_embed(hist_ratings)
+        h = self.item_full_embed(hist_items) + self.rating_embed(hist_ratings)
         # Causal mask as a bool over (T, T): True where i >= j (allowed).
         causal_bool = torch.tril(torch.ones(T, T, dtype=torch.bool, device=h.device))
         # Pairwise log-bucketed time deltas, computed once and reused across blocks.
@@ -411,7 +601,7 @@ class HSTU(nn.Module):
 
     def score_per_position(self, h: torch.Tensor, target_items: torch.Tensor) -> torch.Tensor:
         """Dot-product scoring at every position. h:(B,T,D), target_items:(B,T)."""
-        target_e = self.item_embed(target_items)              # (B, T, D)
+        target_e = self.item_full_embed(target_items)         # (B, T, D)
         return (h * target_e).sum(dim=-1)                     # (B, T)
 
     def score_eval(self, h: torch.Tensor, hist_mask: torch.Tensor,
@@ -425,7 +615,7 @@ class HSTU(nn.Module):
         with the candidate embedding gives the model's cold-user prior.
         """
         last_h = h[:, -1, :]                                  # (B, D)
-        cand_e = self.item_embed(candidate)                   # (B, D)
+        cand_e = self.item_full_embed(candidate)              # (B, D)
         return (last_h * cand_e).sum(dim=-1)                  # (B,)
 
 
@@ -497,9 +687,19 @@ def main():
     log.info(f"Loading {DATASET} (raw rating events; no feature engineering)")
     data = load_data(DATASET)
     train_df, val_df, test_df = data["train"], data["val"], data["test"]
+    movies_df = data["movies"]
     stats = data["stats"]
     log.info(f"  num_users={stats['num_users']}  num_items={stats['num_items']}  "
              f"num_train={stats['num_train']}  num_val={stats['num_val']}  num_test={stats['num_test']}")
+
+    # Cold-start content metadata. Loaded once; allocated regardless of flags
+    # so the model construction is uniform. Tables sized (num_items + 1, ...)
+    # to align with the +1-shifted movieId convention used throughout the model.
+    log.info(f"Loading movie metadata (USE_GENOME={USE_GENOME} USE_GENRE={USE_GENRE} USE_YEAR={USE_YEAR})")
+    genome_np, genre_np, year_id_np = load_movie_metadata(movies_df, DATASET, stats["num_items"])
+    genome_t = torch.from_numpy(genome_np).to(DEVICE)
+    genre_t = torch.from_numpy(genre_np).to(DEVICE)
+    year_id_t = torch.from_numpy(year_id_np).to(DEVICE)
 
     # Eval history uses train+val with per-sample strict-prior cutoff (mirrors
     # simple_v2's EVAL_DYNAMIC_HIST=1 — the +0.022 win at apr28ad came from val
@@ -518,11 +718,13 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
                             collate_fn=collate_eval)
 
-    model = HSTU(stats["num_items"], NUM_RATING_BUCKETS).to(DEVICE)
+    model = HSTU(stats["num_items"], NUM_RATING_BUCKETS,
+                 genome=genome_t, genre=genre_t, year_id=year_id_t).to(DEVICE)
     n_params = sum(p.numel() for p in model.parameters())
     log.info(f"HSTU: {n_params/1e6:.2f}M params on {DEVICE}  "
              f"(layers={NUM_LAYERS}, heads={NUM_HEADS}, dim={EMBED_DIM}, "
-             f"time_buckets={NUM_TIME_BUCKETS})")
+             f"time_buckets={NUM_TIME_BUCKETS}) "
+             f"use_genome={model.use_genome} use_genre={model.use_genre} use_year={model.use_year}")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
