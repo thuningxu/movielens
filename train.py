@@ -73,9 +73,15 @@ MAX_EPOCHS = int(os.environ.get("MAX_EPOCHS", "5"))
 def build_user_sequences(df: pd.DataFrame) -> dict[int, np.ndarray]:
     """Group ratings by user, sort by timestamp, return per-user event arrays.
 
-    Each event row is (movieId, rating_bucket, timestamp). Easy negatives
+    Each event row is (movieId+1, rating_bucket, timestamp). Easy negatives
     (rating == 0 sentinel) are excluded from the history; only real ratings
     contribute to the sequence representation.
+
+    movieId shift: prepare.py remaps movieIds to [0, num_items-1], so movieId
+    0 is a real movie. We shift by +1 here so PAD slot = 0 in the embedding
+    table and real movies occupy 1..num_items. Without this shift,
+    nn.Embedding(..., padding_idx=0) silently zeroes gradients for movieId-0
+    events and conflates left-pad slots with real movieId-0 occurrences.
 
     Note: load_data() never injects easy negatives, so the rating>0 filter is
     a defensive no-op here. It matters for any future code path that consumes
@@ -87,7 +93,7 @@ def build_user_sequences(df: pd.DataFrame) -> dict[int, np.ndarray]:
     sequences = {}
     for uid, group in real.groupby("userId", sort=False):
         sequences[int(uid)] = np.stack(
-            [group["movieId"].to_numpy(np.int64),
+            [group["movieId"].to_numpy(np.int64) + 1,
              group["rating_bucket"].to_numpy(np.int64),
              group["timestamp"].to_numpy(np.int64)],
             axis=1,
@@ -165,7 +171,9 @@ class EvalDataset(Dataset):
 
     def __init__(self, df: pd.DataFrame, history: dict[int, np.ndarray], seq_len: int):
         self.uid = df["userId"].to_numpy(np.int64)
-        self.mid = df["movieId"].to_numpy(np.int64)
+        # +1 shift to match the item-embedding convention: PAD=0,
+        # real movies = 1..num_items. See build_user_sequences() docstring.
+        self.mid = df["movieId"].to_numpy(np.int64) + 1
         self.lbl = df["label"].to_numpy(np.float32)
         self.ts = df["timestamp"].to_numpy(np.int64)
         self.history = history
@@ -372,6 +380,9 @@ class HSTU(nn.Module):
 
     def __init__(self, num_items: int, num_rating_buckets: int):
         super().__init__()
+        # Index 0 is PAD; real movies occupy 1..num_items. Callers
+        # (build_user_sequences, EvalDataset) shift movieIds by +1 so the
+        # left-pad slot (also 0) and real movieId-0 do not collide.
         self.item_embed = nn.Embedding(num_items + 1, EMBED_DIM, padding_idx=0)
         self.rating_embed = nn.Embedding(num_rating_buckets, EMBED_DIM)
         self.blocks = nn.ModuleList([
