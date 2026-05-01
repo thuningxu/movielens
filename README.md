@@ -1,139 +1,59 @@
-# MovieLens Recommendation — Restart (apr28)
+# MovieLens — HSTU generative recommendation
 
-Predict whether a user will rate a movie >= 4 stars (positive engagement). Hybrid task with hard negatives (rated < 4) and easy negatives (random unrated). Same data + same metric as the legacy project.
+Predict whether a user will rate a movie ≥ 4 stars (positive engagement). Same task and metric as the prior attempts — different model: **HSTU** (Hierarchical Sequential Transduction Units, Meta 2024 — *Actions Speak Louder than Words*).
 
-## Why a restart?
+## Why HSTU, why a fresh start?
 
-The legacy project (`legacy/`) reached **val_auc = 0.8284** on ml-25m after ~540 experiments converging on a DLRM-style architecture: per-field embeddings, causal self-attention + DIN over user history, item-side DIN, tag-genome bottleneck, squeeze-and-excitation field reweighting, and a 4-layer top MLP.
+Two prior attempts on this task are archived in `legacy/` and `simple_v2/`:
 
-Two separate ceiling tests confirmed the architecture family is saturated:
+- `legacy/` — DLRM-style architecture (causal SA + DIN + tag-genome bottleneck + 4-layer MLP). Reached **val 0.8284** on ml-25m after ~540 experiments. Architecture family confirmed saturated by two ceiling tests (apr27, apr27c).
+- `simple_v2/` — apr28 restart from a single Linear head over engineered features (rating-centered history pools, multi-hot genres, raw tag genome, manual cross fields, eval-time dynamic user history). Reached **val 0.8594 / test 0.8455** with ~6M params. Confirmed locked at apr28ah after 5 consecutive nulls — the engineered-feature representation has no remaining lift.
 
-- **apr27 (10 cycles, ~63 trials)** — every architectural addition (HSTU-style attention, multi-task aux loss, per-position genome similarity, field-pair bilinear) produced sub-noise lift or negative.
-- **apr27c (15 trials with multi-seed verify)** — adding a multi-layer pre-LN transformer encoder over user history regressed across 5 seeds (mean lift -0.000487, 1/5 positive).
+This attempt drops the "engineered features going into a scoring head" framing entirely. **HSTU treats the user as a token stream** of (item, action, time) events and uses pointwise causal attention to predict the next event's engagement target. No hand-specified history pools, no tag-genome concat, no cross fields. The model sees raw events; representations emerge from the sequence.
 
-Apr27b's 100-trial HP sweep extracted +0.0017 from joint HP retuning, but that is the only direction that still moved the baseline. The legacy architecture is a local optimum.
+## Why HSTU specifically (not OneRec / PinRec / TIGER)
 
-This restart starts from the **simplest possible model — a single Linear head on concatenated features — with the same input features and prediction goals**, so future architectural choices can be motivated by clear ablations rather than 540 experiments of accumulated assumptions.
+- **HSTU** is point-estimate scoring (per-event probability) — keeps AUC eval apples-to-apples vs simple_v2 / legacy.
+- **OneRec / PinRec** are encoder-decoder generative *retrieval* (beam-search a ranked slate) — closer to "true generative" but force NDCG@K and are 2-3× the code.
+- **TIGER** sits between the two, with semantic-ID quantization. Higher cold-start ceiling than HSTU but bigger build (RQ-VAE + encoder-decoder + decoding) and a metric change.
 
-## Architecture (current baseline)
-
-```mermaid
-graph TD
-    subgraph Inputs
-        UID["userId"]
-        MID["movieId"]
-        UHIST["User history<br/>(last 100 items + ratings)"]
-        IHIST["Item history<br/>(last 30 raters + ratings)"]
-        GENRE["Genre multi-hot (20)"]
-        TS["timestamp_norm (1)"]
-        YEAR["movie_year (1)"]
-        GENOME["Tag genome (1128)"]
-    end
-
-    subgraph "Embeddings (trainable)"
-        UID --> UE["user_embed<br/>dim=28"]
-        MID --> IE["item_embed<br/>dim=28"]
-    end
-
-    subgraph "Pooling (no params)"
-        UHIST --> UHP["rating-centered pool of item_embed<br/>weight = (rating − 0.6) * valid<br/>→ 28"]
-        UHIST --> UHR["mean rating → 1"]
-        IHIST --> IHP["rating-centered pool of user_embed<br/>weight = (rating − 0.6) * valid<br/>→ 28"]
-        IHIST --> IHR["mean rating → 1"]
-    end
-
-    subgraph "Multiplicative crosses (no params)"
-        UE -.-> CR1["u_e ⊙ i_e → 28"]
-        IE -.-> CR1
-        UHP -.-> CR2["u_hist_pool ⊙ i_e → 28"]
-        IE -.-> CR2
-        IHP -.-> CR3["i_hist_pool ⊙ u_e → 28"]
-        UE -.-> CR3
-        TS -.-> CR4["ts_norm ⊙ i_e → 28"]
-        IE -.-> CR4
-    end
-
-    UE --> CONCAT["concat<br/>(in_dim = 1376 for ml-25m)"]
-    IE --> CONCAT
-    UHP --> CONCAT
-    UHR --> CONCAT
-    IHP --> CONCAT
-    IHR --> CONCAT
-    GENRE --> CONCAT
-    TS --> CONCAT
-    YEAR --> CONCAT
-    GENOME --> CONCAT
-    CR1 --> CONCAT
-    CR2 --> CONCAT
-    CR3 --> CONCAT
-    CR4 --> CONCAT
-
-    CONCAT --> MAINHEAD["Linear(in_dim, 1)<br/>main head"]
-    CONCAT --> AUXHEAD["Linear(in_dim, 1)<br/>aux head"]
-    MAINHEAD --> SIGMOID["sigmoid"]
-    SIGMOID --> PRED["P(engage)"]
-
-    LOSS["BCEWithLogitsLoss<br/>+ AUX_RATING_WEIGHT (=25) × masked_mse(rating)<br/>+ FREQ_WD_LAMBDA (=1e-4) × Σ freq_w[i] · ‖item_embed[i]‖²"]
-    MAINHEAD -.-> LOSS
-    AUXHEAD -.-> LOSS
-
-    style Inputs fill:#e1f5fe
-    style MAINHEAD fill:#fce4ec
-    style AUXHEAD fill:#fff3e0
-    style PRED fill:#c8e6c9
-```
-
-The "linear" naming refers to the prediction head — embeddings are still trainable (~6.1M params for ml-25m); the heads themselves are ~1.3K params each. Genre multi-hot, timestamp, year, and tag genome feed the head as-is, with no intermediate projection (a `Linear(20, 28) → Linear(in, 1)` chain is mathematically equivalent to a direct `Linear(20, 1)` slice in the head — the projection was redundant).
-
-The auxiliary rating-residual head shares the same concat as the main head and predicts the per-sample normalized rating (0.5★→0.1, …, 5★→1.0). Random unrated easy negatives are masked out of the aux MSE. The combined loss `bce + 25·mse` shifts the embeddings toward representations that simultaneously rank engagement and predict rating magnitude — multi-task signal that the linear head turns into +0.0017 multi-seed lift.
-
-Stripped to the bones: only raw IDs, raw history sequences, and pure content metadata (genres, tag genome, year, timestamp). All pre-computed user/item statistics — rating histograms, counts, user-genre affinity, user genome profile — are out, on the principle that aggregations are relationships the model should learn from raw data, not inputs hand-specified before training.
+HSTU is the cleanest first generative baseline that lets us measure against the apr28ah locked number directly. If HSTU lifts meaningfully, we can layer semantic-ID quantization on top later.
 
 ## Layout
 
-- **`prepare.py`** — Shared with legacy. Data download + time-based train/val/test splits + AUC evaluation. Do not modify (the evaluation harness is the ground truth metric).
-- **`train.py`** — The current model. Linear head over a 1376-dim concat of embeddings + 4 multiplicative crosses + raw content features; auxiliary rating-residual regression head sharing the same concat. No hidden layers in the heads.
-- **`program.md`** — Experiment log of the restart cycles (apr28b through apr28an, including the held-out test eval at apr28aj and the 5 consecutive nulls ai/ak/al/am/an after the apr28ah baseline locked).
-- **`legacy/`** — Frozen archive of the prior project. Available for reference; not authoritative for the restart.
+- **`prepare.py`** — Shared with both prior attempts. Data download + time-based train/val/test splits + `evaluate()` AUC harness. **Do not modify.**
+- **`train.py`** — HSTU model + training loop. Currently a stub.
+- **`program.md`** — Experiment log for this attempt (starts empty).
+- **`legacy/`** — Frozen archive of the original DLRM project.
+- **`simple_v2/`** — Frozen archive of the apr28 linear-head restart. The locked baseline (`val 0.859384`, `test 0.845497`) lives there for comparison.
+- **`data/`** — Auto-downloaded MovieLens datasets; not in git.
 
 ## Quickstart
 
 ```bash
-# Smoke test (ml-100k, ~seconds, crash detection only)
+uv sync
+
+# Smoke test (ml-100k, ~seconds)
 DATASET=ml-100k uv run python train.py
 
-# Standard experiment (ml-25m)
+# Standard experiment (ml-25m on the current CUDA GPU)
 DATASET=ml-25m uv run python train.py
 ```
 
-## What gets carried over from legacy
+## Status
 
-- The data pipeline (`prepare.py:load_data_hybrid`)
-- The raw inputs the data pipeline emits: genre multi-hot, user/item history sequences, tag genome, dense scalars (timestamp, year)
-- The HP defaults that were multi-seed-verified to help (`NEG_RATIO=1`, `train_neg_mode=anchor_pos_catalog`)
-- The 16 critical learnings in `legacy/CLAUDE.md` — especially #14 (seed variance ≈ 0.00078) and #15 (sub-noise single-knob lifts can stack)
+**Stub only.** The HSTU model class, data pipeline, and training loop are skeleton TODOs. The first commit just establishes the layout and points the entrypoints at `prepare.py:load_data` for raw rating events.
 
-## What does NOT get carried over
+## What carries over from the prior attempts
 
-- The model architecture (causal SA, DIN, field attention, two-stream MLPs, top MLP)
-- The 16 architectural-cycle's worth of dropouts, gates, residuals, and conditional flags
-- Anything in `legacy/train.py` past the feature-engineering section
-- Pre-computed user/item statistics (rating histograms, counts, user-genre affinity, user genome profile) — stripped on the principle that aggregations are relationships the model should learn from raw data
+- `prepare.py` data pipeline + `evaluate()` AUC harness (the metric is the ground truth)
+- The label scheme: rating ≥ 4 → positive (1); rating < 4 OR random unrated → negative (0)
+- The dataset choice: ml-25m as the default; ml-100k for smoke tests
+- The discipline learnings (multi-seed verification, deterministic SEED=42, etc.) — see `legacy/CLAUDE.md` learnings #14, #15
 
-Current baseline AUC (val): **0.8594 on ml-25m at SEED=42** (5-seed mean **0.859289**) with `EVAL_DYNAMIC_HIST=1 FREQ_WD_LAMBDA=0 LR=1e-3 WEIGHT_DECAY=5e-5` (apr28ah stack, post-apr28ad arc). **Held-out test AUC (single-shot, apr28aj)**: **0.8455** at SEED=42 (vs static apr28o on test 0.8221 → +0.023 transfer; legacy DLRM val ceiling 0.8284 exceeded by +0.023 on test). Static-history val baseline: 0.8282 (deterministic, SEED=42; 5-seed mean +0.00175 over the prior 0.8263 LR/WD-retuned baseline). Reached by stacking three individually sub-threshold mechanisms — each +0.0005 to +0.0007 single-seed alone, but +0.0017 multi-seed when combined (super-additive).
+## What does NOT carry over
 
-Five wins so far on the restart:
-- **Centered pool** (0.8246 from 0.8219): switched user-history and item-history pools from plain mean to a rating-centered weighted pool. Items rated above 3 stars push *toward* their embedding; items below 3 stars push *away*. Sign matters.
-- **Cross fields** (0.8251 from 0.8246): appended three Hadamard products to the concat — `u_e ⊙ i_e`, `u_hist_pool ⊙ i_e`, `i_hist_pool ⊙ u_e`. The linear head literally cannot synthesize multiplicative interactions on its own.
-- **LR + WD retune** (0.8263 from 0.8251): `LR=3e-4`, `WD=5e-5`. The new richer-feature baseline benefits from a softer, more regularized optimizer.
-- **Sub-noise stack** (0.8282 from 0.8263): three orthogonal mechanisms, each individually below the multi-seed bar, compound super-additively:
-  - `CROSS_TS_ITEM=1`: 4th cross field `ts_norm ⊙ i_e` for temporal drift in item preference
-  - `FREQ_WD_LAMBDA=1e-4`: per-item L2 weighted by `1/sqrt(count + 5)` — tail items get more regularization
-  - `AUX_RATING_WEIGHT=25.0`: parallel Linear head predicting normalized rating, MSE multi-task loss
-- **Eval-time dynamic user history** (0.8463 SEED=42 / 0.8498 5-seed mean from 0.8282; apr28ad): at evaluation each sample's `u_hist` is rebuilt from combined train+val ratings strictly prior to the sample's timestamp. Cold val users (70% of val) gain a real `u_hist_pool`; cold_user stratum AUC lifts +0.028 (0.787 → 0.815), driving +0.022 overall. Off-state byte-equivalent — flag-gated by `EVAL_DYNAMIC_HIST=1`. **First cycle to break above the legacy DLRM ceiling (0.8284), by +0.022.**
-- **Drop tail-item regularizer at dynamic regime** (0.8513 5-seed mean from 0.8498; apr28ag): `FREQ_WD_LAMBDA=0`. At the dynamic regime tail items need larger embeddings to feed useful dynamic-history signal; the static-regime regularizer over-penalized them.
-- **HP retune at the new regime** (0.859289 5-seed mean from 0.8513; apr28ah): `LR=3e-4 → 1e-3`. With FREQ_WD off plus dynamic-eval signal the model wants more aggressive updates; the static-regime LR was over-conservative.
-
-The first four wins bring the static-history linear baseline within 0.0002 of the legacy DLRM ceiling (0.8284) — same task, much simpler architecture (no DIN, no field attention, no genome bottleneck, no two-stream MLPs). The fifth (`EVAL_DYNAMIC_HIST=1`) **exceeds** the legacy DLRM by +0.022 via a feature-engineering / inference-time change rather than an architectural one. The sixth and seventh (apr28ag + apr28ah HP retunes) bring the cumulative lift to **+0.031 on val and +0.023 on test** — current locked baseline.
-
-After apr28ah, **5 consecutive null cycles** (apr28ai per-user fine-tune, apr28ak recency decay + popularity prior, apr28al train-time time-leak fix, apr28am DIN target-aware attention, apr28an AUX retune) confirm the apr28ah representation is at a local optimum that single-cycle architecture or HP polish cannot escape. The next direction will require new signal sources (e.g., IMDB plot summaries) or a fundamentally different architecture, pending strategic decision.
+- Any model architecture or layer choices
+- Any feature engineering (history pools, multi-hot fields, tag genome, cross products, eval-time dynamic-history mechanism)
+- Any hyperparameter defaults — HSTU has its own (embed dim, num layers, num heads, sequence length)
+- Any inherited assumption about input structure

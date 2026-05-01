@@ -1,29 +1,24 @@
 #!/usr/bin/env python3
 """
-Linear baseline for hybrid engagement prediction on MovieLens.
+HSTU stub for generative recommendation on MovieLens.
 
-Restart from scratch (apr28). Same prediction goals and metric as the
-prior project at legacy/, but the model itself is a single Linear head:
+Status: scaffolding only. End-to-end pipeline runs on ml-100k but the
+model is a placeholder (embedding sum + linear head). Replace the
+PlaceholderModel with the actual HSTU stack to make this attempt meaningful.
 
-    concat(features) -> Linear(in, 1) -> sigmoid
+Reference:
+    Zhai et al., "Actions Speak Louder than Words: Trillion-Parameter
+    Sequential Transducers for Generative Recommendations." Meta, 2024.
+    https://arxiv.org/abs/2402.17152
 
-No hidden layers, no attention, no MLP. The features are also stripped
-to the bones: only raw IDs, raw history sequences, and pure content
-metadata (genres, tag genome, movie year, timestamp). All pre-computed
-user/item statistics (rating histograms, counts, user genome profiles,
-user-genre affinity) are out — those are aggregations the model can learn
-from raw data if they actually help.
-
-Label scheme (unchanged):
-  - 1: user rated >= 4 (watched and liked)
-  - 0: user rated < 4 (hard negative) OR random unrated movie (easy negative)
+Task is unchanged from the prior attempts (legacy/, simple_v2/):
+    label = 1 if rating >= 4 else 0  (with random unrated as easy negs)
+    metric = val_auc on ml-25m at SEED=42
+    bar    = simple_v2 locked baseline val 0.8594 / test 0.8455
 """
 
-import hashlib
-import json
 import logging
 import os
-import re
 import sys
 import time
 from pathlib import Path
@@ -36,1719 +31,252 @@ np.random.seed(SEED)
 import pandas as pd
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
 
-from prepare import load_data_hybrid, evaluate, print_summary
+from prepare import load_data, evaluate
 
-# ─── Logging ───────────────────────────────────────────────────────
+# ─── Logging ────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s",
                     datefmt="%H:%M:%S", stream=sys.stdout)
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(line_buffering=True)
-log = logging.getLogger("train")
+log = logging.getLogger(__name__)
 
-# ─── Config (env-overridable) ──────────────────────────────────────
+# ─── Config ─────────────────────────────────────────────────────────
 DATASET = os.environ.get("DATASET", "ml-25m")
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "16384"))
-LR = float(os.environ.get("LR", "3e-4"))
-WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "5e-5"))
-EMBED_DIM = int(os.environ.get("EMBED_DIM", "28"))
-HISTORY_LEN = int(os.environ.get("HISTORY_LEN", "100"))
-ITEM_HIST_LEN = int(os.environ.get("ITEM_HIST_LEN", "30"))
-NEG_RATIO = int(os.environ.get("NEG_RATIO", "1"))
-PATIENCE = int(os.environ.get("PATIENCE", "3"))
-EVAL_PER_EPOCH = int(os.environ.get("EVAL_PER_EPOCH", "3"))
-MAX_EPOCHS = int(os.environ.get("MAX_EPOCHS", "20"))
-
-# History pooling modes (mean is the byte-equivalent default).
-USER_HIST_POOL = os.environ.get("USER_HIST_POOL", "rating_centered")
-ITEM_HIST_POOL = os.environ.get("ITEM_HIST_POOL", "rating_centered")
-assert USER_HIST_POOL in {"mean", "rating", "rating_centered", "din"}, USER_HIST_POOL
-assert ITEM_HIST_POOL in {"mean", "rating", "rating_centered"}, ITEM_HIST_POOL
-
-# DIN (Deep Interest Network) target-aware attention hidden size, only used when
-# USER_HIST_POOL='din'. Off-state (default rating_centered): no module constructed.
-DIN_ATTN_HIDDEN = int(os.environ.get("DIN_ATTN_HIDDEN", "64"))
-
-# Optional add-on fields (each appends one D-dim field to the concat).
-USER_HIST_DISLIKE_POOL = int(os.environ.get("USER_HIST_DISLIKE_POOL", "0"))
-USER_HIST_LAST_POSITION = int(os.environ.get("USER_HIST_LAST_POSITION", "0"))
-ITEM_HIST_LAST_POSITION = int(os.environ.get("ITEM_HIST_LAST_POSITION", "0"))
-# Plain unweighted mean-pool over valid history positions, appended *alongside*
-# the existing centered/etc pool. Tests whether mean-pool encodes signal that's
-# orthogonal to the rating-centered pool (e.g., unsigned co-watch frequency).
-USER_HIST_MEAN_POOL = int(os.environ.get("USER_HIST_MEAN_POOL", "0"))
-ITEM_HIST_MEAN_POOL = int(os.environ.get("ITEM_HIST_MEAN_POOL", "0"))
-
-# Pivot used by rating_centered pool mode. Default 0.6 = 3 stars / 5 (current behavior).
-POOL_PIVOT = float(os.environ.get("POOL_PIVOT", "0.6"))
-
-# Optional per-side learnable timestamp decay multiplier on the rating-centered weight.
-# Off-state (default 0): no Parameter constructed, no decay logic in forward — byte-equivalent.
-# When on, theta is initialized to USER_HIST_DECAY_INIT / ITEM_HIST_DECAY_INIT (default -10
-# = near-no-decay; large gradient-starved zone — pick init in [-2, +5] range to actually exercise).
-USER_HIST_DECAY = int(os.environ.get("USER_HIST_DECAY", "0"))
-ITEM_HIST_DECAY = int(os.environ.get("ITEM_HIST_DECAY", "0"))
-USER_HIST_DECAY_INIT = float(os.environ.get("USER_HIST_DECAY_INIT", "-10.0"))
-ITEM_HIST_DECAY_INIT = float(os.environ.get("ITEM_HIST_DECAY_INIT", "-10.0"))
-
-# Optional multiplicative cross-feature fields appended to the concat (each shape (B, D)):
-#   cross_user_item   = u_e * i_e                   (28-d)
-#   cross_uhist_item  = u_hist_pool * i_e           (28-d)
-#   cross_ihist_user  = i_hist_pool * u_e           (28-d)
-# Off-state (default 0): no extra fields, no head widening — byte-equivalent.
-CROSS_FIELDS = int(os.environ.get("CROSS_FIELDS", "1"))
-
-# Optional 4th multiplicative cross field testing temporal drift in item preference:
-#   cross_ts_item = ts * i_e                        (28-d, ts broadcast over D)
-# Only meaningful when CROSS_FIELDS=1 (the head's in_dim arithmetic assumes the 84-d
-# cross block is already present); kept as an independent flag for sweep clarity.
-# Off-state (default 0): no extra field, no head widening — byte-equivalent.
-CROSS_TS_ITEM = int(os.environ.get("CROSS_TS_ITEM", "1"))
-
-# Optional MLP prediction head replacing the default Linear(in, 1):
-#   Linear(in, MLP_HIDDEN) -> ReLU -> Dropout(MLP_HEAD_DROPOUT) -> Linear(MLP_HIDDEN, 1)
-# Off-state (default 0): the existing Linear(in, 1) head is constructed exactly as before.
-MLP_HEAD = int(os.environ.get("MLP_HEAD", "0"))
-MLP_HIDDEN = int(os.environ.get("MLP_HIDDEN", "128"))
-MLP_HEAD_DROPOUT = float(os.environ.get("MLP_HEAD_DROPOUT", "0.2"))
-
-# Frequency-weighted L2 regularization on item embeddings. Tail items (rated
-# by few users) get MORE penalty (pushed toward zero), popular items LESS.
-#   freq_weight[i] = 1 / sqrt(item_count[i] + 5)
-#   penalty = FREQ_WD_LAMBDA * sum_i( freq_weight[i] * ||item_embed.weight[i]||^2 )
-# Note: this penalty is ADDITIVE on top of the standard Adam WD on item_embed.
-# Sweep FREQ_WD_LAMBDA values accordingly. PAD row is included in the penalty
-# (count=0 -> freq_weight ≈ 0.447); not special-cased.
-# Off-state (default 0.0): no penalty added; byte-equivalent to baseline.
-FREQ_WD_LAMBDA = float(os.environ.get("FREQ_WD_LAMBDA", "1e-4"))
-
-# Auxiliary rating-residual regression head. When > 0, a parallel Linear(in_dim, 1)
-# head predicts the normalized rating (0.5..5.0 -> 0.1..1.0) for samples with a
-# real rating. Random unrated easy negatives (rating=0) are masked out of the
-# aux loss. Combined: total_loss = bce_loss + AUX_RATING_WEIGHT * masked_mse.
-# Off-state (default 0.0): no aux head constructed; byte-equivalent to baseline.
-AUX_RATING_WEIGHT = float(os.environ.get("AUX_RATING_WEIGHT", "25.0"))
-
-# Per-user tag-genome aggregate dotted with the candidate movie's genome,
-# appended to the concat as a SINGLE scalar field (1-d). Tests whether the
-# linear head benefits from a "user × candidate genome compatibility" signal
-# that no current cross provides — the existing concat has user-side features
-# in trained 28-d basis, but no path to the fixed 1128-d genome basis.
-# Per legacy learning #10: user-genome content alignment is information-
-# bottlenecked at ONE scalar; vector forms overfit. So we expose ONE scalar.
-# user_genome_agg is precomputed in the feature cache (rating-centered weighted
-# average of historical movies' genomes per user, 1128-d).
-# Off-state (default 0): no field appended; byte-equivalent to baseline.
-USER_GENOME_AGG_DOT = int(os.environ.get("USER_GENOME_AGG_DOT", "0"))
-
-# Frequency-weighted L2 on user_embed (mirror of FREQ_WD_LAMBDA on item_embed).
-# Tail users (few ratings) get more penalty. Penalty = LAMBDA * sum_u w_u * |u_e_u|^2
-# where w_u = 1 / sqrt(user_count_u + 5). Off-state (default 0.0): no penalty.
-USER_FREQ_WD_LAMBDA = float(os.environ.get("USER_FREQ_WD_LAMBDA", "0.0"))
-
-# Per-user genre affinity Hadamard-crossed with the candidate movie's genres.
-# user_genre_affinity is the rating-centered weighted average of historical
-# movies' genre multi-hot vectors (num_genres-d per user, precomputed). The
-# cross `user_genre_affinity ⊙ candidate_genre` (num_genres-d) lets the linear
-# head learn "this user's affinity for genre G times this movie's membership
-# in G", a per-user × per-movie genre-match signal.
-# Off-state (default 0): no field appended; byte-equivalent to baseline.
-USER_GENRE_AFFINITY_CROSS = int(os.environ.get("USER_GENRE_AFFINITY_CROSS", "0"))
-
-# Per-movie genre × genome alignment scalar. For each movie, computes how well
-# its genome aligns with the prototype genome of its claimed genres (averaged
-# genome of all movies in that genre). Single scalar per movie, precomputed at
-# script load time on GPU (no cache change). Tests whether the linear head
-# benefits from an explicit per-movie content-coherence signal that genre and
-# genome can't synthesize separately.
-# Off-state (default 0): no field appended; byte-equivalent to baseline.
-CROSS_GENRE_GENOME = int(os.environ.get("CROSS_GENRE_GENOME", "0"))
-
-# Recency filter on training data: keep only the most-recent RECENCY_FRAC of
-# REAL ratings (positives + hard negatives). Easy negatives are not affected by
-# this filter directly. RECENCY_FRAC=1.0 (default) = no filter (byte-equiv).
-# Legacy default was 0.7 (drop oldest 30%); ported from legacy/train.py:372-380.
-# Caches are keyed on RECENCY_FRAC so each setting builds its own features.
-RECENCY_FRAC = float(os.environ.get("RECENCY_FRAC", "1.0"))
-
-# Post-recency easy-negative resampling. When 1, drop the easy negatives that
-# came from prepare.py and resample new ones at POST_RECENCY_EASY_NEG_PER_POS
-# per kept positive, anchored to the kept positives' timestamps (covariate-shift
-# fix). Off (default 0): keep prepare.py's easy negatives unchanged. Implementation
-# ported from legacy/train.py:382-428. NEG_RATIO is unaffected (still controls
-# initial easy-neg generation in prepare.py).
-POST_RECENCY_NEG_RESAMPLE = int(os.environ.get("POST_RECENCY_NEG_RESAMPLE", "0"))
-POST_RECENCY_EASY_NEG_PER_POS = float(os.environ.get("POST_RECENCY_EASY_NEG_PER_POS", "0.4"))
-
-# Anonymous-user fallback for cold-start. When 1, samples whose user has empty
-# history (u_valid.sum == 0, i.e., user not in (recency-filtered) train) get
-# u_e replaced by a learnable anon_user_embed Parameter (init zeros). Targets
-# the 70%+ of val users that are OOV. Off-state (default 0): byte-equivalent.
-ANON_FALLBACK = int(os.environ.get("ANON_FALLBACK", "0"))
-
-# apr28ab cold-conditional cross fields + stochastic warm-row masking.
-# COLD_CROSS_FIELDS: comma-separated list of fields to cross with is_cold_user.
-#   Supported: "i_e" (28d), "genre" (num_genres-d). Each appears as
-#   `is_cold_user × <field>` appended to concat. Cold rows (truly OOV at eval,
-#   or stochastically-masked during training) get these fields = the original
-#   feature; warm rows get zeros.
-# WARM_MASK_P: probability per training row of marking a warm user as
-#   synthetic-cold (only during training; eval is deterministic). When > 0,
-#   forces gradient into cold-conditional cross weights via masked warm rows.
-# WARM_GATED_UHIST: when 1, append `(1 − is_cold) × u_hist_pool ⊙ i_e` as
-#   ADDITIONAL warm-specialized copy of the existing cross. Warm rows get
-#   effectively 2× signal on this cross; head can down-weight either copy.
-# is_cold_user is computed from a precomputed train_user_set (deterministic
-# lookup at eval). Off-state (defaults: COLD_CROSS_FIELDS empty, WARM_MASK_P=0,
-# WARM_GATED_UHIST=0): byte-equivalent — no field appended, no masking.
-COLD_CROSS_FIELDS = [f for f in os.environ.get("COLD_CROSS_FIELDS", "").split(",") if f]
-assert all(f in {"i_e", "genre"} for f in COLD_CROSS_FIELDS), \
-    f"COLD_CROSS_FIELDS supports {{i_e, genre}}; got {COLD_CROSS_FIELDS}"
-WARM_MASK_P = float(os.environ.get("WARM_MASK_P", "0.0"))
-WARM_GATED_UHIST = int(os.environ.get("WARM_GATED_UHIST", "0"))
-
-# apr28ac per-movie tag-text embedding. Loads tags.csv, groups by movieId,
-# encodes each movie's tag bag via sentence-transformers/all-MiniLM-L6-v2
-# (384-d). Cached as movie_tag_embed (num_items+1, 384) in the feature cache.
-# Tests whether per-movie text content beats the cold_user 0.787 ceiling.
-# Off-state (default 0): no field appended; byte-equivalent.
-MOVIE_TAG_TEXT = int(os.environ.get("MOVIE_TAG_TEXT", "0"))
-MOVIE_TAG_TEXT_DIM = 384  # all-MiniLM-L6-v2 output dim, fixed
-
-# apr28ad eval-time dynamic user history. When 1, at eval time each sample uses
-# a per-sample u_hist built from combined train+val ratings with timestamp
-# strictly before the sample's own timestamp. For cold val users (70% of val
-# users), this turns an empty history into a non-empty one (their prior val
-# ratings). Tests whether the linear head extracts cold_user signal when given
-# user-side info via dynamic history rebuild. Eval-only — training is unchanged.
-# Off-state (default 0): forward path unchanged; byte-equivalent.
-EVAL_DYNAMIC_HIST = int(os.environ.get("EVAL_DYNAMIC_HIST", "0"))
-
-# apr28af eval-time dynamic ITEM history. Mirror of EVAL_DYNAMIC_HIST on the
-# item axis: at eval time each sample uses a per-sample i_hist built from
-# combined train+val raters of the candidate movie with timestamp < sample's
-# own ts. Targets cold_item stratum (3.4% of val) AND warm items getting new
-# raters during val. Off-state (default 0): byte-equivalent.
-EVAL_DYNAMIC_ITEM_HIST = int(os.environ.get("EVAL_DYNAMIC_ITEM_HIST", "0"))
-
-# apr28ae train-time dynamic user history. Per-batch on-the-fly GPU lookup
-# (NOT host precompute — host RAM is only 29 GB). At forward time during
-# training, each sample's u_hist is built from train+val ratings strictly
-# before the sample's own timestamp. Eliminates the train-time time leak
-# (current static user_histories[uid] uses ALL train ratings including
-# future ones relative to the current sample) AND matches the eval distribution
-# (which uses dynamic histories). Off-state (default 0): byte-equivalent.
-TRAIN_DYNAMIC_HIST = int(os.environ.get("TRAIN_DYNAMIC_HIST", "0"))
-
-# apr28al: train-time time-leak fix only. Like TRAIN_DYNAMIC_HIST but builds
-# per-user sorted flat arrays from train_df ONLY (no val_df). Each train
-# sample's u_hist becomes strictly causal (only train ratings with ts < sample's
-# ts) — fixes the existing static-history time leak (where user_histories[uid]
-# = "last K train items" includes items rated AFTER the current sample's ts).
-# Off-state (default 0): byte-equivalent. Mutually-exclusive-prefer with
-# TRAIN_DYNAMIC_HIST: if both set, TRAIN_DYNAMIC_HIST wins (uses train+val).
-TRAIN_DYNAMIC_HIST_TRAIN_ONLY = int(os.environ.get("TRAIN_DYNAMIC_HIST_TRAIN_ONLY", "0"))
-
-# apr28ai per-user incremental fine-tune at eval. After model training, for each
-# val user u with prior real ratings, take INCR_TUNE_K SGD step(s) on
-# user_embed.weight[u] using their prior ratings (with ts < min(eval_row_ts) for
-# u) as supervised signal. Strictly causal per-user (Critic flag). Real hard negs
-# from val (rating < 4) used as label=0; no synthetic easy-neg sampling.
-# Updates ONLY user_embed (all other params frozen during the fine-tune step).
-# Off-state (default 0.0): no fine-tune; byte-equivalent to baseline.
-INCR_TUNE_LR = float(os.environ.get("INCR_TUNE_LR", "0.0"))
-INCR_TUNE_K = int(os.environ.get("INCR_TUNE_K", "1"))
-INCR_TUNE_MAX_PRIOR = int(os.environ.get("INCR_TUNE_MAX_PRIOR", "100"))  # cap per user
-
-# apr28aj: run on the held-out test set (last 10% of ratings, 2018-2019).
-# After val eval, build a parallel test_eval_df + per-test-sample dynamic
-# histories from combined train+val+test-prior data (per-row causal — same
-# methodology as val dynamic-history). Single-shot run; no iteration on test.
-RUN_TEST = int(os.environ.get("RUN_TEST", "0"))
-
-# apr28ak (a): recency decay on the dynamic-eval-history pool weights.
-# When alpha > 0 AND EVAL_DYNAMIC_HIST=1 AND eval-time, multiplies the rating-
-# centered weight by exp(-alpha * (sample_ts - hist_ts) / ts_range) — most-recent
-# val items dominate the pool. Eval-only; training uses static histories
-# unchanged. Off-state (default 0.0): byte-equivalent.
-EVAL_HIST_DECAY_ALPHA = float(os.environ.get("EVAL_HIST_DECAY_ALPHA", "0.0"))
-
-# apr28ak (c): per-movie log-popularity scalar appended to concat. Computed
-# from item_count (training-positive count). New users tend to rate popular
-# movies first; explicit popularity may help cold_user_later.
-# Off-state (default 0): no field appended; byte-equivalent.
-POPULARITY_PRIOR = int(os.environ.get("POPULARITY_PRIOR", "0"))
-
-# ─── Device ────────────────────────────────────────────────────────
+DEVICE = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
 torch.manual_seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
-    DEVICE = torch.device("cuda")
-elif torch.backends.mps.is_available():
-    DEVICE = torch.device("mps")
-else:
-    DEVICE = torch.device("cpu")
-log.info(f"Device: {DEVICE} | dim={EMBED_DIM} | hist={HISTORY_LEN}/{ITEM_HIST_LEN} | "
-         f"neg_ratio={NEG_RATIO} | lr={LR} | wd={WEIGHT_DECAY}")
 
-t_total_start = time.time()
+# HSTU hyperparameters (placeholders — tune once the real model lands)
+EMBED_DIM = int(os.environ.get("EMBED_DIM", "64"))
+NUM_LAYERS = int(os.environ.get("NUM_LAYERS", "4"))
+NUM_HEADS = int(os.environ.get("NUM_HEADS", "4"))
+SEQ_LEN = int(os.environ.get("SEQ_LEN", "200"))         # per-user context length
+DROPOUT = float(os.environ.get("DROPOUT", "0.1"))
+NUM_RATING_BUCKETS = 10                                 # 0.5★ → bucket 0, 5★ → bucket 9
 
-# ─── Data ──────────────────────────────────────────────────────────
-data = load_data_hybrid(DATASET, neg_ratio=NEG_RATIO,
-                        train_neg_mode="anchor_pos_catalog")
-train_df, val_df = data["train"], data["val"]
-test_df = data["test"]  # held-out 10%; only consumed if RUN_TEST=1
-movies_df, stats = data["movies"], data["stats"]
-user_all_items = data["user_all_items"]
-num_users, num_items = stats["num_users"], stats["num_items"]
-log.info(f"Dataset: {DATASET} | Users: {num_users} | Items: {num_items} | "
-         f"Train: {stats['num_train']} | Val: {stats['num_val']} | "
-         f"Pos rate: {stats['pos_rate']:.2%}")
-
-# ─── Optional recency filter + post-recency easy-neg resampling ──────
-# Ported from legacy/train.py:372-428. Applied BEFORE feature cache build so
-# downstream histories, item_count, user_count are computed from the filtered
-# training set (Critic-flagged: stale item_count would contaminate FREQ_WD).
-if RECENCY_FRAC < 1.0 - 1e-9:
-    full_real_train = train_df[train_df["rating"] > 0].copy()
-    real_mask = train_df["rating"] > 0
-    real_ratings = train_df[real_mask].sort_values("timestamp")
-    cutoff = int(len(real_ratings) * (1 - RECENCY_FRAC))
-    keep_real = real_ratings.iloc[cutoff:].index
-    keep_neg = train_df[~real_mask].index
-    train_df = train_df.loc[keep_real.union(keep_neg)].reset_index(drop=True)
-    n_dropped = int(real_mask.sum()) - len(keep_real)
-    log.info(f"Recency filter: kept {RECENCY_FRAC:.0%} of real ratings, dropped {n_dropped} oldest")
-
-    if POST_RECENCY_NEG_RESAMPLE:
-        kept_real_train = train_df[train_df["rating"] > 0].reset_index(drop=True)
-        kept_pos = kept_real_train[kept_real_train["label"] == 1].reset_index(drop=True)
-        old_easy_neg = int((train_df["rating"] == 0).sum())
-        num_easy_neg = int(round(len(kept_pos) * POST_RECENCY_EASY_NEG_PER_POS))
-        if len(kept_pos) == 0 or num_easy_neg == 0:
-            train_df = kept_real_train.copy()
-            log.info("Post-recency neg resample: no kept positives; dropped existing easy negatives")
-        else:
-            from scipy.sparse import csr_matrix
-            rng = np.random.RandomState(SEED)
-            full_rows = full_real_train["userId"].values.astype(np.int64)
-            full_cols = full_real_train["movieId"].values.astype(np.int64)
-            rated_matrix = csr_matrix(
-                (np.ones(len(full_rows), dtype=bool), (full_rows, full_cols)),
-                shape=(num_users, num_items),
-            )
-            item_first_seen = np.full(num_items, int(full_real_train["timestamp"].max()), dtype=np.int64)
-            first_seen_series = full_real_train.groupby("movieId")["timestamp"].min()
-            item_first_seen[first_seen_series.index.values.astype(np.int64)] = first_seen_series.values.astype(np.int64)
-            anchor_idx = rng.randint(0, len(kept_pos), size=num_easy_neg)
-            anchor_rows = kept_pos.iloc[anchor_idx]
-            neg_users = anchor_rows["userId"].values.astype(np.int64)
-            neg_timestamps = anchor_rows["timestamp"].values.astype(np.int64)
-            neg_items = rng.randint(0, num_items, size=num_easy_neg)
-            for _ in range(10):
-                is_rated = np.array(rated_matrix[neg_users, neg_items]).flatten().astype(bool)
-                is_rated |= item_first_seen[neg_items] > neg_timestamps
-                n_bad = int(is_rated.sum())
-                if n_bad == 0:
-                    break
-                neg_items[is_rated] = rng.randint(0, num_items, size=n_bad)
-            new_easy_neg = pd.DataFrame({
-                "userId": neg_users,
-                "movieId": neg_items,
-                "rating": 0.0,
-                "timestamp": neg_timestamps,
-                "label": 0,
-            })
-            train_df = pd.concat([kept_real_train, new_easy_neg], ignore_index=True)
-            log.info(
-                f"Post-recency neg resample: replaced {old_easy_neg} easy neg with {num_easy_neg} "
-                f"({POST_RECENCY_EASY_NEG_PER_POS:.2f} per kept positive)"
-            )
-
-# ─── Feature engineering (with disk cache) ─────────────────────────
-# Bones-only feature set:
-#   - per movie: genre multi-hot, tag genome (1128), release year
-#   - per user: history sequence (last K items + ratings)
-#   - per item: history sequence (last K raters + ratings)
-#   - per sample: timestamp normalized
-
-_cache_key = hashlib.md5(json.dumps({
-    "feature_version": "restart-6",       # restart-6 adds per-movie tag-text embedding (384-d)
-    "dataset": DATASET, "neg_ratio": NEG_RATIO,
-    "history_len": HISTORY_LEN, "item_hist_len": ITEM_HIST_LEN,
-    "num_users": num_users, "num_items": num_items,
-    "recency_frac": round(RECENCY_FRAC, 4),  # cache invalidates per recency setting
-}).encode()).hexdigest()[:12]
-_cache_path = Path(__file__).parent / "data" / f"features_{_cache_key}.npz"
-
-if _cache_path.exists():
-    log.info(f"Loading cached features from {_cache_path.name}...")
-    _c = np.load(_cache_path, allow_pickle=True)
-    movie_genres = _c["movie_genres"]
-    num_genres = movie_genres.shape[1]
-    user_histories = _c["user_histories"]
-    user_hist_ratings = _c["user_hist_ratings"]
-    user_hist_timestamps = _c["user_hist_timestamps"]
-    item_histories = _c["item_histories"]
-    item_hist_ratings = _c["item_hist_ratings"]
-    item_hist_timestamps = _c["item_hist_timestamps"]
-    ts_min = float(_c["ts_min"])
-    ts_range = float(_c["ts_range"])
-    movie_year = _c["movie_year"]
-    genome_matrix = _c["genome_matrix"]
-    GENOME_DIM = genome_matrix.shape[1]
-    item_count = _c["item_count"]
-    user_genome_agg = _c["user_genome_agg"]
-    user_count = _c["user_count"]
-    user_genre_affinity = _c["user_genre_affinity"]
-    movie_tag_embed = _c["movie_tag_embed"]
-    del _c
-else:
-    log.info("Computing features (will cache for next run)...")
-    real_train = train_df[train_df["rating"] > 0]
-
-    # Per-item training-positive count (rating >= 4). Used by frequency-weighted
-    # L2 regularization on item embeddings (FREQ_WD_LAMBDA). PAD index num_items
-    # gets count=0 and is included with the rest in the penalty.
-    item_count = np.zeros(num_items + 1, dtype=np.float32)
-    _pos_mids = real_train.loc[real_train["rating"] >= 4, "movieId"].values.astype(np.int64)
-    if len(_pos_mids) > 0:
-        np.add.at(item_count, _pos_mids, 1.0)
-
-    # Genre multi-hot
-    all_genres_set = set()
-    for g in movies_df["genres"].dropna():
-        all_genres_set.update(g.split("|"))
-    all_genres = sorted(all_genres_set - {""})
-    genre_to_idx = {g: i for i, g in enumerate(all_genres)}
-    num_genres = len(all_genres)
-    movie_genres = np.zeros((num_items, num_genres), dtype=np.float32)
-    for _, row in movies_df.iterrows():
-        mid = int(row["movieId"])
-        if mid < num_items and isinstance(row["genres"], str):
-            for g in row["genres"].split("|"):
-                if g in genre_to_idx:
-                    movie_genres[mid, genre_to_idx[g]] = 1.0
-
-    # User/item history sequences (raw, last K)
-    _uids = real_train["userId"].values
-    _mids = real_train["movieId"].values
-    _ratings = real_train["rating"].values
-    _ts = real_train["timestamp"].values
-    PAD_IDX = num_items
-    USER_PAD_IDX = num_users
-    def _build_history(ids, targets, ratings, timestamps, n_entities, pad_idx, max_len):
-        sort_idx = np.lexsort((timestamps, ids))
-        s_ids, s_targets = ids[sort_idx], targets[sort_idx]
-        s_ratings = ratings[sort_idx].astype(np.float32) / 5.0
-        s_ts = timestamps[sort_idx].astype(np.int64)
-        hist = np.full((n_entities, max_len), pad_idx, dtype=np.int64)
-        hist_rat = np.zeros((n_entities, max_len), dtype=np.float32)
-        hist_ts = np.zeros((n_entities, max_len), dtype=np.int32)
-        boundaries = np.where(np.diff(s_ids) != 0)[0] + 1
-        starts = np.concatenate([[0], boundaries])
-        ends = np.concatenate([boundaries, [len(s_ids)]])
-        for s, e in zip(starts, ends):
-            eid = s_ids[s]
-            length = min(e - s, max_len)
-            hist[eid, -length:] = s_targets[e - length:e]
-            hist_rat[eid, -length:] = s_ratings[e - length:e]
-            hist_ts[eid, -length:] = s_ts[e - length:e].astype(np.int32)
-        return hist, hist_rat, hist_ts
-
-    user_histories, user_hist_ratings, user_hist_timestamps = _build_history(
-        _uids, _mids, _ratings, _ts, num_users, PAD_IDX, HISTORY_LEN)
-    item_histories, item_hist_ratings, item_hist_timestamps = _build_history(
-        _mids, _uids, _ratings, _ts, num_items, USER_PAD_IDX, ITEM_HIST_LEN)
-    del _uids, _mids, _ratings, _ts
-
-    # Timestamp normalization
-    ts_min = float(real_train["timestamp"].min())
-    ts_range = float(real_train["timestamp"].max() - ts_min) + 1.0
-
-    # Movie release year (parsed from title)
-    movie_year = np.zeros(num_items, dtype=np.float32)
-    for _, row in movies_df.iterrows():
-        mid = int(row["movieId"])
-        if mid < num_items:
-            m = re.search(r'\((\d{4})\)', str(row.get("title", "")))
-            if m:
-                movie_year[mid] = float(m.group(1))
-    valid_years = movie_year[movie_year > 0]
-    if len(valid_years) > 0:
-        median_year = np.median(valid_years)
-        movie_year[movie_year == 0] = median_year
-        movie_year = (movie_year - movie_year.mean()) / (movie_year.std() + 1e-8)
-
-    # Tag genome (1128 relevance scores per movie, ml-25m only — zeros otherwise)
-    _genome_path = Path(__file__).parent / "data" / DATASET / "genome-scores.csv"
-    if _genome_path.exists():
-        log.info("Loading tag genome scores...")
-        if DATASET == "ml-25m":
-            _raw = pd.read_csv(Path(__file__).parent / "data" / DATASET / "ratings.csv")
-        elif DATASET == "ml-10m":
-            _raw = pd.read_csv(Path(__file__).parent / "data" / "ml-10M100K" / "ratings.dat",
-                               sep="::", engine="python",
-                               names=["userId", "movieId", "rating", "timestamp"])
-        elif DATASET == "ml-1m":
-            _raw = pd.read_csv(Path(__file__).parent / "data" / DATASET / "ratings.dat",
-                               sep="::", engine="python",
-                               names=["userId", "movieId", "rating", "timestamp"])
-        else:
-            _raw = None
-        if _raw is not None:
-            _raw = _raw.sort_values("timestamp").reset_index(drop=True)
-            _movie_map = {mid: i for i, mid in enumerate(_raw["movieId"].unique())}
-            _gdf = pd.read_csv(_genome_path)
-            _num_tags = int(_gdf["tagId"].max())
-            genome_matrix = np.zeros((num_items, _num_tags), dtype=np.float32)
-            _gdf["mapped_mid"] = _gdf["movieId"].map(_movie_map)
-            _gdf = _gdf.dropna(subset=["mapped_mid"])
-            _gdf["mapped_mid"] = _gdf["mapped_mid"].astype(int)
-            _have = 0
-            for mid, group in _gdf.groupby("mapped_mid"):
-                if mid < num_items:
-                    tag_ids = group["tagId"].values.astype(int) - 1
-                    genome_matrix[mid, tag_ids] = group["relevance"].values.astype(np.float32)
-                    _have += 1
-            log.info(f"Tag genome: {_have}/{num_items} movies ({100*_have/num_items:.1f}%)")
-        else:
-            genome_matrix = np.zeros((num_items, 1128), dtype=np.float32)
-    else:
-        genome_matrix = np.zeros((num_items, 1128), dtype=np.float32)
-    GENOME_DIM = genome_matrix.shape[1]
-
-    # Per-user tag-genome aggregate: rating-centered weighted average of each
-    # user's historical movies' genome vectors. Shape (num_users + 1, GENOME_DIM);
-    # row num_users is the PAD slot (zeros). Used only when USER_GENOME_AGG_DOT=1.
-    # Computed in chunks to avoid materializing (num_users, HISTORY_LEN, GENOME_DIM)
-    # at once (~73 GB on ml-25m would OOM CPU).
-    log.info("Precomputing per-user genome aggregates (restart-4)...")
-    user_genome_agg = np.zeros((num_users + 1, GENOME_DIM), dtype=np.float32)
-    # Pad genome with a zero row at index num_items (=PAD_IDX) so PAD slots
-    # contribute zero to both numerator and denominator.
-    genome_padded = np.zeros((num_items + 1, GENOME_DIM), dtype=np.float32)
-    genome_padded[:num_items] = genome_matrix
-    _chunk = 1024
-    _pivot = 0.6  # POOL_PIVOT default; users who watch with rating > pivot push toward genome
-    for _s in range(0, num_users, _chunk):
-        _e = min(_s + _chunk, num_users)
-        _h = genome_padded[user_histories[_s:_e]]                    # (chunk, L, G)
-        _w = (user_hist_ratings[_s:_e] - _pivot) * (user_histories[_s:_e] != PAD_IDX).astype(np.float32)
-        _denom = np.abs(_w).sum(axis=1, keepdims=True).clip(1e-6)
-        user_genome_agg[_s:_e] = (_h * _w[:, :, None]).sum(axis=1) / _denom
-
-    # Per-user training-positive count (rating >= 4). Mirror of item_count, used
-    # by USER_FREQ_WD_LAMBDA. Shape (num_users + 1,) including PAD row at num_users.
-    user_count = np.zeros(num_users + 1, dtype=np.float32)
-    _pos_uids = real_train.loc[real_train["rating"] >= 4, "userId"].values.astype(np.int64)
-    if len(_pos_uids) > 0:
-        np.add.at(user_count, _pos_uids, 1.0)
-
-    # Per-user genre affinity: rating-centered weighted average of each user's
-    # historical movies' genre multi-hot vectors. Shape (num_users + 1, num_genres).
-    # Row num_users is the PAD slot (zeros). Same weighting as user_genome_agg.
-    log.info("Precomputing per-user genre affinity (restart-5)...")
-    user_genre_affinity = np.zeros((num_users + 1, num_genres), dtype=np.float32)
-    genres_padded = np.zeros((num_items + 1, num_genres), dtype=np.float32)
-    genres_padded[:num_items] = movie_genres
-    for _s in range(0, num_users, _chunk):
-        _e = min(_s + _chunk, num_users)
-        _h = genres_padded[user_histories[_s:_e]]                    # (chunk, L, num_genres)
-        _w = (user_hist_ratings[_s:_e] - _pivot) * (user_histories[_s:_e] != PAD_IDX).astype(np.float32)
-        _denom = np.abs(_w).sum(axis=1, keepdims=True).clip(1e-6)
-        user_genre_affinity[_s:_e] = (_h * _w[:, :, None]).sum(axis=1) / _denom
-
-    # Per-movie tag-text embedding (apr28ac restart-6). Loads tags.csv, groups
-    # by movieId, encodes each movie's tag bag (space-joined) via
-    # sentence-transformers/all-MiniLM-L6-v2 → 384-d L2-normalized embedding.
-    # Movies with no tags get zero vector (~28% of rated movies on ml-25m).
-    # Shape (num_items + 1, 384) including PAD slot. Allocated even when
-    # MOVIE_TAG_TEXT=0 since it's part of the cache; downstream lookup is gated.
-    log.info("Encoding per-movie tag text via all-MiniLM-L6-v2 (restart-6)...")
-    movie_tag_embed = np.zeros((num_items + 1, MOVIE_TAG_TEXT_DIM), dtype=np.float32)
-    _tags_path = Path(__file__).parent / "data" / DATASET / "tags.csv"
-    if _tags_path.exists():
-        _tags_df = pd.read_csv(_tags_path)
-        # Map RAW movieId → remapped movieId via load_data_hybrid's mapping
-        # The remap was applied to train/val/test inside load_data_hybrid; we
-        # need the same map. Recover it from movies_df, which has remapped IDs.
-        # movies_df rows have remapped IDs; we don't have the original→remapped
-        # map directly. But raw tags.csv uses the SAME ORIGINAL movieIds as
-        # ratings.csv. Rebuild the remap from the union of all ratings.
-        _ratings_df = pd.concat([
-            train_df[["movieId"]], val_df[["movieId"]],
-        ], ignore_index=True)
-        # The remap was: original→0..num_items-1 by order of unique appearance
-        # in the time-sorted full dataset. That info isn't available post-remap.
-        # WORKAROUND: re-run the same remap by reading raw ratings.csv to recover
-        # original→remapped map.
-        _raw_ratings_path = Path(__file__).parent / "data" / DATASET / "ratings.csv"
-        _raw_ratings = pd.read_csv(_raw_ratings_path)
-        _raw_ratings = _raw_ratings.sort_values("timestamp").reset_index(drop=True)
-        _orig_movie_ids = _raw_ratings["movieId"].unique()  # order of first appearance
-        _movie_remap = {orig: i for i, orig in enumerate(_orig_movie_ids)}
-        del _raw_ratings, _orig_movie_ids
-        # Map raw tags.csv movieIds to remapped IDs; drop unmapped
-        _tags_df["mapped_mid"] = _tags_df["movieId"].map(_movie_remap)
-        _tags_df = _tags_df.dropna(subset=["mapped_mid", "tag"])
-        _tags_df["mapped_mid"] = _tags_df["mapped_mid"].astype(int)
-        _tags_df["tag"] = _tags_df["tag"].astype(str)
-        # Group tags per movie, join with spaces (preserves multi-tag context)
-        _movie_tag_text = (
-            _tags_df.groupby("mapped_mid")["tag"]
-            .apply(lambda s: " ".join(s.tolist()))
-            .to_dict()
-        )
-        log.info(f"Tag text built for {len(_movie_tag_text)}/{num_items} movies "
-                 f"({100*len(_movie_tag_text)/num_items:.1f}%)")
-        # Encode through MiniLM in batches
-        from sentence_transformers import SentenceTransformer
-        _st_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2",
-                                        device=str(DEVICE))
-        _mids_with_tags = sorted(_movie_tag_text.keys())
-        _texts = [_movie_tag_text[m] for m in _mids_with_tags]
-        _embs = _st_model.encode(_texts, batch_size=256, show_progress_bar=False,
-                                  convert_to_numpy=True, normalize_embeddings=True)
-        movie_tag_embed[_mids_with_tags] = _embs.astype(np.float32)
-        del _st_model, _tags_df, _movie_tag_text, _texts, _embs, _mids_with_tags, _movie_remap
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
-    else:
-        log.info(f"No tags.csv for {DATASET}; movie_tag_embed left as zeros")
-
-    np.savez_compressed(_cache_path,
-        movie_genres=movie_genres,
-        user_histories=user_histories, user_hist_ratings=user_hist_ratings,
-        user_hist_timestamps=user_hist_timestamps,
-        item_histories=item_histories, item_hist_ratings=item_hist_ratings,
-        item_hist_timestamps=item_hist_timestamps,
-        ts_min=np.array(ts_min), ts_range=np.array(ts_range),
-        movie_year=movie_year,
-        genome_matrix=genome_matrix,
-        item_count=item_count,
-        user_genome_agg=user_genome_agg,
-        user_count=user_count,
-        user_genre_affinity=user_genre_affinity,
-        movie_tag_embed=movie_tag_embed,
-    )
-    log.info(f"Features cached to {_cache_path.name}")
-
-PAD_IDX = num_items
-USER_PAD_IDX = num_users
-
-# Move lookup tables to GPU
-_user_hist_t = torch.from_numpy(user_histories).to(DEVICE)
-_user_hist_rat_t = torch.from_numpy(user_hist_ratings).to(DEVICE)
-_user_hist_ts_t = torch.from_numpy(user_hist_timestamps).to(DEVICE)
-_item_hist_t = torch.from_numpy(item_histories).to(DEVICE)
-_item_hist_rat_t = torch.from_numpy(item_hist_ratings).to(DEVICE)
-_item_hist_ts_t = torch.from_numpy(item_hist_timestamps).to(DEVICE)
-_movie_genres_t = torch.from_numpy(movie_genres).to(DEVICE)
-_genome_t = torch.from_numpy(genome_matrix).to(DEVICE)
-_user_genome_agg_t = torch.from_numpy(user_genome_agg).to(DEVICE)
-_user_genre_affinity_t = torch.from_numpy(user_genre_affinity).to(DEVICE)
-_movie_tag_embed_t = torch.from_numpy(movie_tag_embed).to(DEVICE)
-_movie_year_t = torch.from_numpy(movie_year).to(DEVICE)
-
-# Per-movie genre × genome content coherence scalar, computed once on GPU.
-# genre_prototype[g] = mean genome of movies with genre g. Then for each movie:
-#   gg_align[m] = sum_g (movie_genres[m, g] * (genome[m] · genre_prototype[g]))
-#               / movie_genres[m].sum()
-# i.e., average alignment with each of the movie's claimed genres' genome
-# prototypes. Per-movie scalar; no learnable params; cheap.
-_genre_count_t = _movie_genres_t.sum(dim=0).clamp(min=1.0).unsqueeze(-1)        # (num_genres, 1)
-_genre_prototype_t = (_movie_genres_t.t() @ _genome_t) / _genre_count_t          # (num_genres, GENOME_DIM)
-_per_movie_per_genre_align = _genome_t @ _genre_prototype_t.t()                  # (num_items, num_genres)
-_movie_genre_count_t = _movie_genres_t.sum(dim=-1).clamp(min=1.0)                # (num_items,)
-_gg_align_t = (_movie_genres_t * _per_movie_per_genre_align).sum(dim=-1) / _movie_genre_count_t  # (num_items,)
-del _genre_count_t, _genre_prototype_t, _per_movie_per_genre_align, _movie_genre_count_t
-
-# Frequency weights for the optional FREQ_WD_LAMBDA penalty on item_embed.
-# Shape (num_items + 1,) including the PAD row at index num_items (count=0).
-_item_freq_weight_t = torch.from_numpy(
-    1.0 / np.sqrt(np.asarray(item_count, dtype=np.float32) + 5.0)
-).to(DEVICE)
-_user_freq_weight_t = torch.from_numpy(
-    1.0 / np.sqrt(np.asarray(user_count, dtype=np.float32) + 5.0)
-).to(DEVICE)
-
-# apr28ak (c): per-movie log-popularity scalar. Normalized by max count so the
-# field is in [0, 1]. PAD row (index num_items) has count=0 → log(1)/log(...)=0.
-_item_count_arr = np.asarray(item_count, dtype=np.float32)
-_max_count = max(float(_item_count_arr.max()), 1.0)
-_movie_popularity_t = torch.from_numpy(
-    np.log1p(_item_count_arr) / np.log1p(_max_count)
-).to(DEVICE).float()
-
-# Per-user "in train" boolean for is_cold_user lookup (apr28ab). Built from
-# the (post-recency-filter) training set: a uid is "in train" iff it has at
-# least one real rating in train_df. PAD row at index num_users is False (cold).
-# Used at forward time as `is_truly_cold = ~_user_in_train_t[uids]`.
-_user_in_train_np = np.zeros(num_users + 1, dtype=bool)
-_real_train_uids_for_cold = train_df.loc[train_df["rating"] > 0, "userId"].values.astype(np.int64)
-_user_in_train_np[_real_train_uids_for_cold] = True
-_user_in_train_t = torch.from_numpy(_user_in_train_np).to(DEVICE)
-del _user_in_train_np, _real_train_uids_for_cold
+LR = float(os.environ.get("LR", "1e-3"))
+WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "1e-5"))
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "256"))
+MAX_EPOCHS = int(os.environ.get("MAX_EPOCHS", "5"))
 
 
-# Per-sample dense features (just timestamp; year is per-movie, looked up at forward time)
-def _build_sample_tensors(df):
-    uids = df["userId"].values.astype(np.int64)
-    mids = df["movieId"].values.astype(np.int64)
-    labels = df["label"].values.astype(np.float32)
-    ts_raw = df["timestamp"].values.astype(np.int64)
-    ts_norm = ((ts_raw - ts_min) / ts_range).astype(np.float32).reshape(-1, 1)
-    # Normalized rating in [0.1, 1.0] for each sample (rating / 5.0). Random
-    # unrated easy negatives have df["rating"]==0 and stay at 0.0, used as the
-    # mask sentinel for AUX_RATING_WEIGHT.
-    if "rating" in df.columns:
-        ratings_norm = (df["rating"].values.astype(np.float32) / 5.0)
-    else:
-        ratings_norm = np.zeros(len(df), dtype=np.float32)
-    return (torch.from_numpy(uids).to(DEVICE),
-            torch.from_numpy(mids).to(DEVICE),
-            torch.from_numpy(ts_norm).to(DEVICE),
-            torch.from_numpy(ts_raw).to(DEVICE),
-            torch.from_numpy(labels).to(DEVICE),
-            torch.from_numpy(ratings_norm).to(DEVICE))
+# ─── Data ───────────────────────────────────────────────────────────
+def build_user_sequences(df: pd.DataFrame) -> dict[int, np.ndarray]:
+    """Group ratings by user, sort by timestamp, return per-user event arrays.
 
-log.info("Precomputing training tensors...")
-train_uids, train_mids, train_ts, train_ts_raw, train_labels, train_ratings_norm = _build_sample_tensors(train_df)
-n_train = len(train_labels)
-
-# ─── Eval set: val pos + val hard neg + sampled easy neg ──────────
-_val_pos_mask = val_df["label"] == 1
-_val_pos = val_df[_val_pos_mask]
-_val_hard_neg = val_df[~_val_pos_mask]
-_n_val_pos = len(_val_pos)
-
-_val_user_all = {uid: set(items) for uid, items in user_all_items.items()}
-for uid, group in val_df.groupby("userId"):
-    _val_user_all.setdefault(uid, set()).update(group["movieId"].values)
-
-_eval_rng = np.random.RandomState(42)
-_easy_neg_users = _val_pos["userId"].values.astype(np.int64)
-_easy_neg_items = np.empty(_n_val_pos, dtype=np.int64)
-for i in range(_n_val_pos):
-    rated = _val_user_all.get(_easy_neg_users[i], set())
-    mid = _eval_rng.randint(0, num_items)
-    while mid in rated:
-        mid = _eval_rng.randint(0, num_items)
-    _easy_neg_items[i] = mid
-
-_eval_df = pd.DataFrame({
-    "userId": np.concatenate([_val_pos["userId"].values, _val_hard_neg["userId"].values, _easy_neg_users]),
-    "movieId": np.concatenate([_val_pos["movieId"].values, _val_hard_neg["movieId"].values, _easy_neg_items]),
-    "timestamp": np.concatenate([_val_pos["timestamp"].values, _val_hard_neg["timestamp"].values, _val_pos["timestamp"].values]),
-    "label": np.concatenate([np.ones(_n_val_pos), np.zeros(len(_val_hard_neg)), np.zeros(_n_val_pos)]),
-})
-log.info("Precomputing eval tensors...")
-eval_uids, eval_mids, eval_ts, eval_ts_raw, eval_labels_t, _eval_ratings_norm = _build_sample_tensors(_eval_df)
-n_eval = len(eval_uids)
-log.info(f"Eval set: {_n_val_pos} pos + {len(_val_hard_neg)} hard neg + {_n_val_pos} easy neg = {n_eval}")
-
-# ─── apr28ad: per-eval-sample dynamic user history ──────────────────
-# For each eval row (uid, ts), build a history from combined train+val
-# ratings of that uid with timestamp strictly before ts. Allows cold val
-# users (70% of val users) to have non-empty u_hist_pool at eval time.
-# Implementation: vectorized per-uid binary search.
-if EVAL_DYNAMIC_HIST:
-    log.info("Building eval-time dynamic user histories (apr28ad)...")
-    # Combine train+val real ratings (rating > 0). Easy negs (rating==0) excluded.
-    _comb_real = pd.concat([
-        train_df[train_df["rating"] > 0][["userId", "movieId", "rating", "timestamp"]],
-        val_df[val_df["rating"] > 0][["userId", "movieId", "rating", "timestamp"]],
-    ], ignore_index=True)
-    # Sort by (userId, timestamp) to enable per-user contiguous slices.
-    _comb_real = _comb_real.sort_values(["userId", "timestamp"]).reset_index(drop=True)
-    _all_uid = _comb_real["userId"].values.astype(np.int64)
-    _all_mid = _comb_real["movieId"].values.astype(np.int64)
-    _all_rat = (_comb_real["rating"].values.astype(np.float32) / 5.0)
-    _all_ts = _comb_real["timestamp"].values.astype(np.int64)
-    # Per-uid offsets in the sorted array (uid → [start, end)).
-    _uid_starts = np.searchsorted(_all_uid, np.arange(num_users), side="left")
-    _uid_ends = np.searchsorted(_all_uid, np.arange(num_users), side="right")
-    # Materialize (n_eval, HISTORY_LEN) tensors.
-    _eval_user_hist_np = np.full((n_eval, HISTORY_LEN), PAD_IDX, dtype=np.int64)
-    _eval_user_hist_rat_np = np.zeros((n_eval, HISTORY_LEN), dtype=np.float32)
-    _eval_user_hist_ts_np = np.zeros((n_eval, HISTORY_LEN), dtype=np.int32)
-    _eval_uids_np = eval_uids.cpu().numpy()
-    _eval_ts_raw_np = eval_ts_raw.cpu().numpy()
-    # Group eval rows by uid for vectorized per-uid searchsorted.
-    _eval_order = np.argsort(_eval_uids_np, kind="stable")
-    _eval_uids_sorted = _eval_uids_np[_eval_order]
-    _eval_uid_starts = np.searchsorted(_eval_uids_sorted, np.arange(num_users), side="left")
-    _eval_uid_ends = np.searchsorted(_eval_uids_sorted, np.arange(num_users), side="right")
-    _n_cold_first_row = 0
-    _n_cold_later_row = 0
-    for _uid in range(num_users):
-        _es, _ee = int(_eval_uid_starts[_uid]), int(_eval_uid_ends[_uid])
-        if _es == _ee:
-            continue  # no eval rows for this uid
-        _us, _ue = int(_uid_starts[_uid]), int(_uid_ends[_uid])
-        if _us == _ue:
-            continue  # no train+val ratings → leave eval rows as PAD (empty history)
-        _user_ts = _all_ts[_us:_ue]                       # sorted asc
-        _user_mid = _all_mid[_us:_ue]
-        _user_rat = _all_rat[_us:_ue]
-        # Eval rows for this uid (their timestamps)
-        _eval_rows = _eval_order[_es:_ee]
-        _row_ts = _eval_ts_raw_np[_eval_rows]
-        # For each eval row, find cut = #items with ts < row_ts
-        _cuts = np.searchsorted(_user_ts, _row_ts, side="left")
-        for _row_idx, _cut in zip(_eval_rows, _cuts):
-            if _cut == 0:
-                continue  # no prior history → leave as PAD
-            _take = min(int(_cut), HISTORY_LEN)
-            _eval_user_hist_np[_row_idx, -_take:] = _user_mid[_cut - _take:_cut]
-            _eval_user_hist_rat_np[_row_idx, -_take:] = _user_rat[_cut - _take:_cut]
-            _eval_user_hist_ts_np[_row_idx, -_take:] = _user_ts[_cut - _take:_cut].astype(np.int32)
-    # Stratify cold_user into first-row vs later-row (Critic ask)
-    _cold_user_mask = ~_user_in_train_t.cpu().numpy()[_eval_uids_np]
-    _has_prior_hist = (_eval_user_hist_np != PAD_IDX).any(axis=1)
-    _n_cold_first_row = int((_cold_user_mask & ~_has_prior_hist).sum())
-    _n_cold_later_row = int((_cold_user_mask & _has_prior_hist).sum())
-    log.info(f"Dynamic eval history built: cold_user_first={_n_cold_first_row}, cold_user_later={_n_cold_later_row}")
-    _eval_user_hist_t = torch.from_numpy(_eval_user_hist_np).to(DEVICE)
-    _eval_user_hist_rat_t = torch.from_numpy(_eval_user_hist_rat_np).to(DEVICE)
-    _eval_user_hist_ts_t = torch.from_numpy(_eval_user_hist_ts_np).to(DEVICE)
-    del _comb_real, _all_uid, _all_mid, _all_rat, _all_ts, _uid_starts, _uid_ends
-    del _eval_user_hist_np, _eval_user_hist_rat_np, _eval_user_hist_ts_np
-    del _eval_uids_np, _eval_ts_raw_np, _eval_order, _eval_uids_sorted
-    del _eval_uid_starts, _eval_uid_ends, _cold_user_mask, _has_prior_hist
-
-# ─── apr28af: per-eval-sample dynamic ITEM history ──────────────────
-# Mirror of EVAL_DYNAMIC_HIST on item axis. For each eval row (mid, ts),
-# build i_hist from combined train+val raters of mid with timestamp < ts.
-if EVAL_DYNAMIC_ITEM_HIST:
-    log.info("Building eval-time dynamic item histories (apr28af)...")
-    _comb_real = pd.concat([
-        train_df[train_df["rating"] > 0][["userId", "movieId", "rating", "timestamp"]],
-        val_df[val_df["rating"] > 0][["userId", "movieId", "rating", "timestamp"]],
-    ], ignore_index=True)
-    # Sort by (movieId, timestamp) — mirror of user-side but grouped by item.
-    _comb_real = _comb_real.sort_values(["movieId", "timestamp"]).reset_index(drop=True)
-    _all_mid = _comb_real["movieId"].values.astype(np.int64)
-    _all_uid = _comb_real["userId"].values.astype(np.int64)
-    _all_rat = (_comb_real["rating"].values.astype(np.float32) / 5.0)
-    _all_ts = _comb_real["timestamp"].values.astype(np.int64)
-    _mid_starts = np.searchsorted(_all_mid, np.arange(num_items), side="left")
-    _mid_ends = np.searchsorted(_all_mid, np.arange(num_items), side="right")
-    _eval_item_hist_np = np.full((n_eval, ITEM_HIST_LEN), USER_PAD_IDX, dtype=np.int64)
-    _eval_item_hist_rat_np = np.zeros((n_eval, ITEM_HIST_LEN), dtype=np.float32)
-    _eval_item_hist_ts_np = np.zeros((n_eval, ITEM_HIST_LEN), dtype=np.int32)
-    _eval_mids_np = eval_mids.cpu().numpy()
-    _eval_ts_raw_np = eval_ts_raw.cpu().numpy()
-    _eval_order = np.argsort(_eval_mids_np, kind="stable")
-    _eval_mids_sorted = _eval_mids_np[_eval_order]
-    _eval_mid_starts = np.searchsorted(_eval_mids_sorted, np.arange(num_items), side="left")
-    _eval_mid_ends = np.searchsorted(_eval_mids_sorted, np.arange(num_items), side="right")
-    for _mid in range(num_items):
-        _es, _ee = int(_eval_mid_starts[_mid]), int(_eval_mid_ends[_mid])
-        if _es == _ee:
-            continue
-        _us, _ue = int(_mid_starts[_mid]), int(_mid_ends[_mid])
-        if _us == _ue:
-            continue
-        _item_ts = _all_ts[_us:_ue]
-        _item_uid = _all_uid[_us:_ue]
-        _item_rat = _all_rat[_us:_ue]
-        _eval_rows = _eval_order[_es:_ee]
-        _row_ts = _eval_ts_raw_np[_eval_rows]
-        _cuts = np.searchsorted(_item_ts, _row_ts, side="left")
-        for _row_idx, _cut in zip(_eval_rows, _cuts):
-            if _cut == 0:
-                continue
-            _take = min(int(_cut), ITEM_HIST_LEN)
-            _eval_item_hist_np[_row_idx, -_take:] = _item_uid[_cut - _take:_cut]
-            _eval_item_hist_rat_np[_row_idx, -_take:] = _item_rat[_cut - _take:_cut]
-            _eval_item_hist_ts_np[_row_idx, -_take:] = _item_ts[_cut - _take:_cut].astype(np.int32)
-    log.info(f"Dynamic eval item histories built")
-    _eval_item_hist_t = torch.from_numpy(_eval_item_hist_np).to(DEVICE)
-    _eval_item_hist_rat_t = torch.from_numpy(_eval_item_hist_rat_np).to(DEVICE)
-    _eval_item_hist_ts_t = torch.from_numpy(_eval_item_hist_ts_np).to(DEVICE)
-    del _comb_real, _all_mid, _all_uid, _all_rat, _all_ts, _mid_starts, _mid_ends
-    del _eval_item_hist_np, _eval_item_hist_rat_np, _eval_item_hist_ts_np
-    del _eval_mids_np, _eval_ts_raw_np, _eval_order, _eval_mids_sorted
-    del _eval_mid_starts, _eval_mid_ends
-
-# ─── apr28ae: per-batch on-the-fly dynamic TRAIN user history ───────
-# Compact per-user sorted arrays + per-train-sample cut positions; per-batch
-# GPU gather. Memory: ~720 MB GPU total (avoids the 24 GB host precompute
-# that wouldn't fit in 29 GB host RAM).
-if TRAIN_DYNAMIC_HIST or TRAIN_DYNAMIC_HIST_TRAIN_ONLY:
-    if TRAIN_DYNAMIC_HIST:
-        log.info("Building train-time dynamic-history infrastructure (apr28ae: train+val)...")
-        _comb_real_train = pd.concat([
-            train_df[train_df["rating"] > 0][["userId", "movieId", "rating", "timestamp"]],
-            val_df[val_df["rating"] > 0][["userId", "movieId", "rating", "timestamp"]],
-        ], ignore_index=True)
-    else:
-        log.info("Building train-time dynamic-history infrastructure (apr28al: train-only leak-fix)...")
-        _comb_real_train = train_df[train_df["rating"] > 0][["userId", "movieId", "rating", "timestamp"]].copy()
-    _comb_real_train = _comb_real_train.sort_values(["userId", "timestamp"]).reset_index(drop=True)
-    _flat_uid = _comb_real_train["userId"].values.astype(np.int64)
-    _flat_mid = _comb_real_train["movieId"].values.astype(np.int32)
-    _flat_rat = (_comb_real_train["rating"].values.astype(np.float32) / 5.0)
-    _flat_ts = _comb_real_train["timestamp"].values.astype(np.int64)
-    # Per-user start offsets: starts[uid] is where uid's items begin in the flat array.
-    _user_starts_np = np.searchsorted(_flat_uid, np.arange(num_users + 1), side="left")
-    # Per-train-sample cut: number of (user's) items with ts < train sample's ts.
-    _train_uids_np = train_uids.cpu().numpy()
-    _train_ts_raw_np = train_ts_raw.cpu().numpy()
-    _train_order = np.argsort(_train_uids_np, kind="stable")
-    _train_uids_sorted = _train_uids_np[_train_order]
-    _train_uid_starts = np.searchsorted(_train_uids_sorted, np.arange(num_users), side="left")
-    _train_uid_ends = np.searchsorted(_train_uids_sorted, np.arange(num_users), side="right")
-    _train_sample_cut_np = np.zeros(n_train, dtype=np.int64)
-    for _uid in range(num_users):
-        _es, _ee = int(_train_uid_starts[_uid]), int(_train_uid_ends[_uid])
-        if _es == _ee:
-            continue
-        _us, _ue = int(_user_starts_np[_uid]), int(_user_starts_np[_uid + 1])
-        if _us == _ue:
-            continue
-        _user_ts = _flat_ts[_us:_ue]
-        _train_rows = _train_order[_es:_ee]
-        _row_ts = _train_ts_raw_np[_train_rows]
-        _cuts = np.searchsorted(_user_ts, _row_ts, side="left")
-        # Cut is RELATIVE within user's slice; convert to ABSOLUTE flat-array position.
-        _train_sample_cut_np[_train_rows] = _us + _cuts
-    log.info(f"Dynamic train history precompute done (n_train={n_train}, flat_size={len(_flat_uid)})")
-    # Move compact per-user arrays + per-sample cuts to GPU. Total ~720 MB on ml-25m.
-    _flat_user_mid_t = torch.from_numpy(_flat_mid).to(DEVICE)            # int32
-    _flat_user_rat_t = torch.from_numpy(_flat_rat).to(DEVICE)            # float32
-    _flat_user_ts_t = torch.from_numpy(_flat_ts).to(DEVICE)              # int64
-    _user_starts_t = torch.from_numpy(_user_starts_np).to(DEVICE)        # int64, length num_users+1
-    _train_sample_cut_t = torch.from_numpy(_train_sample_cut_np).to(DEVICE)  # int64
-    del _comb_real_train, _flat_uid, _flat_mid, _flat_rat, _flat_ts
-    del _user_starts_np, _train_uids_np, _train_ts_raw_np
-    del _train_order, _train_uids_sorted, _train_uid_starts, _train_uid_ends
-    del _train_sample_cut_np
-
-
-# ═══════════════════════════════════════════════════════════════════
-# MODEL — single Linear head on concatenated features
-# ═══════════════════════════════════════════════════════════════════
-
-def _pool_history(embed, ratings, valid, mode,
-                  decay_theta=None, sample_ts=None, hist_ts=None, ts_range=None,
-                  din_module=None, target_embed=None):
-    """Pool a (B, L, D) embedding sequence over valid positions.
-
-    embed:   (B, L, D)
-    ratings: (B, L)       — already normalized to [0, 1] (rating / 5.0)
-    valid:   (B, L)       — float, 1.0 for non-PAD, 0.0 for PAD
-    mode: 'mean' | 'rating' | 'rating_centered' | 'din'
-
-    Optional decay (only valid with mode='rating_centered'):
-      decay_theta: scalar nn.Parameter; rate = softplus(theta) >= 0.
-      sample_ts:   (B,)   raw per-sample timestamp (int64 or float).
-      hist_ts:     (B, L) raw per-position history timestamp (int32/float).
-      ts_range:    scalar, denominator for normalizing time gaps.
-
-    Required for mode='din':
-      din_module:    nn.Sequential mapping (B, L, 3*D) -> (B, L, 1) attention scores.
-      target_embed:  (B, D) — target item embedding used as the DIN query.
-
-    Returns (B, D).
+    Each event row is (movieId, rating_bucket, timestamp). Easy negatives
+    (rating == 0 sentinel) are excluded from the history; only real ratings
+    contribute to the sequence representation.
     """
-    valid_e = valid.unsqueeze(-1)                                     # (B, L, 1)
-    if mode == "mean":
-        count = valid.sum(dim=1, keepdim=True).clamp(min=1.0)         # (B, 1)
-        return (embed * valid_e).sum(dim=1) / count
-    if mode == "rating":
-        w = ratings * valid                                           # (B, L)
-        w_e = w.unsqueeze(-1)                                         # (B, L, 1)
-        denom = w.sum(dim=1, keepdim=True).clamp(min=1e-6)            # (B, 1)
-        return (embed * w_e).sum(dim=1) / denom
-    if mode == "rating_centered":
-        # Allow negative weights; normalize by sum of absolute weights.
-        w = (ratings - POOL_PIVOT) * valid                            # (B, L)
-        if decay_theta is not None:
-            # softplus-parameterized non-negative rate; init theta=-10 -> rate≈4.5e-5
-            rate = nn.functional.softplus(decay_theta)
-            time_gap = (sample_ts.float().unsqueeze(-1) - hist_ts.float()) / ts_range
-            time_gap = time_gap.clamp(min=0.0)                        # safety
-            recency = torch.exp(-rate * time_gap)                     # (B, L), in (0, 1]
-            w = w * recency
-        w_e = w.unsqueeze(-1)
-        denom = w.abs().sum(dim=1, keepdim=True).clamp(min=1e-6)
-        return (embed * w_e).sum(dim=1) / denom
-    if mode == "din":
-        # Target-aware attention pool. Per-position features are
-        # [hist_l, target, hist_l * target]; an MLP scores each position;
-        # PAD positions get -inf score; softmax over L gives attention weights.
-        assert din_module is not None and target_embed is not None, \
-            "DIN pool requires din_module and target_embed"
-        B, L, D = embed.shape
-        tgt = target_embed.unsqueeze(1).expand(B, L, D)               # (B, L, D)
-        attn_in = torch.cat([embed, tgt, embed * tgt], dim=-1)        # (B, L, 3*D)
-        scores = din_module(attn_in).squeeze(-1)                      # (B, L)
-        # Mask PAD positions to -inf so softmax assigns them zero weight.
-        neg_inf = torch.finfo(scores.dtype).min
-        scores = scores.masked_fill(valid < 0.5, neg_inf)
-        # If a row has zero valid positions (all PAD), softmax of all -inf produces NaN.
-        # Detect and zero those rows after the weighted sum.
-        any_valid = (valid.sum(dim=1) > 0).float().unsqueeze(-1)      # (B, 1)
-        # Replace fully-invalid rows with a uniform 0 score before softmax to avoid NaN.
-        all_pad_mask = any_valid.squeeze(-1) < 0.5                    # (B,)
-        if all_pad_mask.any():
-            scores = torch.where(all_pad_mask.unsqueeze(-1),
-                                 torch.zeros_like(scores), scores)
-        attn = torch.softmax(scores, dim=1)                           # (B, L)
-        pooled = (embed * attn.unsqueeze(-1)).sum(dim=1)              # (B, D)
-        return pooled * any_valid
-    raise ValueError(f"Unknown pool mode: {mode}")
+    real = df[df["rating"] > 0].copy()
+    real = real.sort_values(["userId", "timestamp"])
+    real["rating_bucket"] = ((real["rating"].clip(0.5, 5.0) - 0.5) * 2).astype(np.int64)
+    sequences = {}
+    for uid, group in real.groupby("userId", sort=False):
+        sequences[int(uid)] = np.stack(
+            [group["movieId"].to_numpy(np.int64),
+             group["rating_bucket"].to_numpy(np.int64),
+             group["timestamp"].to_numpy(np.int64)],
+            axis=1,
+        )
+    return sequences
 
 
-class LinearBaseline(nn.Module):
-    """concat(features) -> Linear(in, 1) -> sigmoid."""
-    def __init__(self, num_users, num_items, num_genres, genome_dim, embed_dim):
+class HSTUDataset(Dataset):
+    """One sample = one (user, target_movie, target_label) triple, paired
+    with the user's prior history strictly before target_ts.
+
+    TODO: replace the per-sample history slice with sequence-level training
+    once the HSTU model accepts a packed batch of sequences.
+    """
+
+    def __init__(self, df: pd.DataFrame, history: dict[int, np.ndarray], seq_len: int):
+        self.uid = df["userId"].to_numpy(np.int64)
+        self.mid = df["movieId"].to_numpy(np.int64)
+        self.lbl = df["label"].to_numpy(np.float32)
+        self.ts = df["timestamp"].to_numpy(np.int64)
+        self.history = history
+        self.seq_len = seq_len
+
+    def __len__(self):
+        return len(self.uid)
+
+    def __getitem__(self, idx):
+        uid = int(self.uid[idx])
+        ts = int(self.ts[idx])
+        events = self.history.get(uid)
+        if events is None:
+            hist_items = np.zeros(self.seq_len, dtype=np.int64)
+            hist_ratings = np.zeros(self.seq_len, dtype=np.int64)
+            hist_mask = np.zeros(self.seq_len, dtype=np.float32)
+        else:
+            cut = np.searchsorted(events[:, 2], ts, side="left")
+            window = events[max(0, cut - self.seq_len):cut]
+            n = window.shape[0]
+            hist_items = np.zeros(self.seq_len, dtype=np.int64)
+            hist_ratings = np.zeros(self.seq_len, dtype=np.int64)
+            hist_mask = np.zeros(self.seq_len, dtype=np.float32)
+            if n > 0:
+                hist_items[-n:] = window[:, 0]
+                hist_ratings[-n:] = window[:, 1]
+                hist_mask[-n:] = 1.0
+        return {
+            "uid": uid,
+            "mid": int(self.mid[idx]),
+            "label": float(self.lbl[idx]),
+            "hist_items": hist_items,
+            "hist_ratings": hist_ratings,
+            "hist_mask": hist_mask,
+        }
+
+
+# ─── Model ──────────────────────────────────────────────────────────
+class HSTUBlock(nn.Module):
+    """One HSTU block: pre-norm + gated linear unit + relative-position-bias
+    attention + residual. Causal.
+
+    TODO: implement per Meta 2024 §3.
+        - PreNorm(x) → SiLU(W_q x) ⊙ (W_k x), with relative position bias
+        - PreNorm(x) → SiLU(W_u x) ⊙ (W_v x) for the GLU FFN
+        - Residual around each
+    """
+
+    def __init__(self, dim: int, num_heads: int, dropout: float):
         super().__init__()
-        D = embed_dim
-        # Embeddings (+1 row for PAD)
-        self.user_embed = nn.Embedding(num_users + 1, D, padding_idx=num_users)
-        self.item_embed = nn.Embedding(num_items + 1, D, padding_idx=num_items)
-        # Concat dim:
-        #   user_e (D) + item_e (D)
-        #   user_hist pool (D) + user_hist mean rating (1)
-        #   item_hist pool (D) + item_hist mean rating (1)
-        #   genre multi-hot (num_genres, raw — no projection)
-        #   ts_norm (1) + movie_year (1)
-        #   genome (genome_dim)
-        # Optional add-on fields (each adds D when its flag is on):
-        #   USER_HIST_DISLIKE_POOL: parallel "dislike" pool over user history
-        #   USER_HIST_LAST_POSITION: most recent valid item embedding
-        #   ITEM_HIST_LAST_POSITION: most recent valid rater embedding
-        #   USER_HIST_MEAN_POOL: plain unweighted mean of item_embed over valid positions
-        #   ITEM_HIST_MEAN_POOL: plain unweighted mean of user_embed over valid positions
-        addon_fields = (USER_HIST_DISLIKE_POOL
-                        + USER_HIST_LAST_POSITION
-                        + ITEM_HIST_LAST_POSITION
-                        + USER_HIST_MEAN_POOL
-                        + ITEM_HIST_MEAN_POOL)
-        self.in_dim = 4 * D + 2 + num_genres + 2 + genome_dim + addon_fields * D
-        # Multiplicative cross-feature fields (3 × D) appended when CROSS_FIELDS=1.
-        # Adds in_dim only — the cross computation itself has no learnable params.
-        in_dim_total = self.in_dim + (3 * D if CROSS_FIELDS else 0)
-        # Optional 4th cross field (ts * i_e); only meaningful with CROSS_FIELDS=1.
-        if CROSS_TS_ITEM:
-            in_dim_total += D
-        # Optional user × candidate genome compatibility scalar (1-d field).
-        if USER_GENOME_AGG_DOT:
-            in_dim_total += 1
-        # Optional user × candidate genre Hadamard cross (num_genres-d field).
-        if USER_GENRE_AFFINITY_CROSS:
-            in_dim_total += num_genres
-        # Optional per-movie genre × genome alignment scalar (1-d field).
-        if CROSS_GENRE_GENOME:
-            in_dim_total += 1
-        # apr28ab cold-conditional cross fields. Each appends D or num_genres dims.
-        if "i_e" in COLD_CROSS_FIELDS:
-            in_dim_total += D
-        if "genre" in COLD_CROSS_FIELDS:
-            in_dim_total += num_genres
-        # apr28ab warm-gated extra copy of u_hist_pool ⊙ i_e (D-d).
-        if WARM_GATED_UHIST:
-            in_dim_total += D
-        # apr28ac per-movie tag-text embedding (384-d).
-        if MOVIE_TAG_TEXT:
-            in_dim_total += MOVIE_TAG_TEXT_DIM
-        # apr28ak (c): per-movie log-popularity scalar (1-d field).
-        if POPULARITY_PRIOR:
-            in_dim_total += 1
-        self.in_dim = in_dim_total
-        # Head: either the default Linear(in, 1) or a 1-hidden-layer MLP. The replacement
-        # happens at the SAME __init__ point so any downstream RNG draws are unchanged at
-        # off-state, and at off-state only the Linear is constructed.
-        if MLP_HEAD:
-            self.head = nn.Sequential(
-                nn.Linear(in_dim_total, MLP_HIDDEN),
-                nn.ReLU(),
-                nn.Dropout(MLP_HEAD_DROPOUT),
-                nn.Linear(MLP_HIDDEN, 1),
-            )
-        else:
-            self.head = nn.Linear(in_dim_total, 1)
+        # placeholder
+        self.norm = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.ffn = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, 4 * dim),
+            nn.SiLU(),
+            nn.Linear(4 * dim, dim),
+        )
 
-        # Optional learnable per-side timestamp-decay rate.
-        # Constructed AFTER all default-init layers so the off-state RNG sequence
-        # is byte-identical to before. softplus(-10) ≈ 4.5e-5 → near-no-decay at init.
-        if USER_HIST_DECAY:
-            self.user_decay_theta = nn.Parameter(torch.tensor(USER_HIST_DECAY_INIT))
-        if ITEM_HIST_DECAY:
-            self.item_decay_theta = nn.Parameter(torch.tensor(ITEM_HIST_DECAY_INIT))
-
-        # Optional DIN target-aware attention MLP for user history pooling.
-        # Constructed AFTER head/decay so the off-state RNG sequence is byte-identical.
-        # Only allocated when USER_HIST_POOL == 'din' — at off-state no module exists.
-        if USER_HIST_POOL == "din":
-            self.user_din_attn = nn.Sequential(
-                nn.Linear(3 * D, DIN_ATTN_HIDDEN),
-                nn.ReLU(),
-                nn.Linear(DIN_ATTN_HIDDEN, 1),
-            )
-
-        # Optional auxiliary rating-residual regression head.
-        # Constructed AFTER head/decay/DIN so off-state RNG sequence is byte-identical
-        # (no nn.Linear constructor invoked at AUX_RATING_WEIGHT==0 — see learning #11).
-        if AUX_RATING_WEIGHT > 0:
-            self.aux_head = nn.Linear(in_dim_total, 1)
-
-        # Anonymous-user fallback parameter (apr28aa). Constructed LAST so off-state
-        # RNG is byte-identical. Init zeros so at step 0 cold-user u_e becomes 0
-        # (cleaner than random init); learns toward a "typical user" embedding.
-        if ANON_FALLBACK:
-            self.anon_user_embed = nn.Parameter(torch.zeros(D))
-
-    def forward(self, uids, mids, ts, ts_raw=None, hist_idx=None):
-        u_e = self.user_embed(uids)
-        i_e = self.item_embed(mids)
-
-        # User history: pool item_embed over valid (non-PAD) positions.
-        # Three modes:
-        # 1. apr28ae TRAIN_DYNAMIC_HIST=1 + training: per-batch GPU gather from
-        #    flat per-user arrays at sample's cut position.
-        # 2. apr28ad EVAL_DYNAMIC_HIST=1 + eval (not training): per-sample
-        #    precomputed dynamic history.
-        # 3. Static (default): per-user fixed history from train.
-        if self.training and hist_idx is not None and (TRAIN_DYNAMIC_HIST or TRAIN_DYNAMIC_HIST_TRAIN_ONLY):
-            cuts = _train_sample_cut_t[hist_idx]                              # (B,) abs pos
-            user_starts = _user_starts_t[uids]                                # (B,) start of slice
-            _pos_off = torch.arange(HISTORY_LEN, device=DEVICE).unsqueeze(0)  # (1, L)
-            abs_pos = cuts.unsqueeze(1) - HISTORY_LEN + _pos_off              # (B, L)
-            valid_pos = (abs_pos >= user_starts.unsqueeze(1)) & (abs_pos < cuts.unsqueeze(1))
-            abs_pos_clamped = torch.where(valid_pos, abs_pos, torch.zeros_like(abs_pos))
-            u_hist = _flat_user_mid_t[abs_pos_clamped].long()                 # (B, L)
-            u_hist_rat = _flat_user_rat_t[abs_pos_clamped]                    # (B, L)
-            u_hist = torch.where(valid_pos, u_hist, torch.full_like(u_hist, PAD_IDX))
-            u_hist_rat = torch.where(valid_pos, u_hist_rat, torch.zeros_like(u_hist_rat))
-        elif hist_idx is not None and EVAL_DYNAMIC_HIST and not self.training:
-            u_hist = _eval_user_hist_t[hist_idx]
-            u_hist_rat = _eval_user_hist_rat_t[hist_idx]
-        else:
-            u_hist = _user_hist_t[uids]                       # (B, L)
-            u_hist_rat = _user_hist_rat_t[uids]               # (B, L)
-        u_hist_e = self.item_embed(u_hist)                # (B, L, D)
-        u_valid = (u_hist != PAD_IDX).float()             # (B, L)
-        # apr28ak (a): recency decay on dynamic-eval-history weights. Multiplies
-        # u_valid (the weight-modulator) by exp(-alpha * Δt / ts_range), so most-
-        # recent val items dominate the rating-centered pool. Eval-time only.
-        if (EVAL_HIST_DECAY_ALPHA > 0.0
-                and (not self.training)
-                and hist_idx is not None
-                and EVAL_DYNAMIC_HIST):
-            _u_hist_ts_decay = _eval_user_hist_ts_t[hist_idx]                  # (B, L) int32
-            _sample_ts_b = ts_raw.unsqueeze(-1).float()                        # (B, 1)
-            _delta_t = (_sample_ts_b - _u_hist_ts_decay.float()).clamp(min=0.0) / ts_range
-            _decay = torch.exp(-EVAL_HIST_DECAY_ALPHA * _delta_t)              # (B, L)
-            u_valid = u_valid * _decay
-        u_count = u_valid.sum(dim=1).clamp(min=1.0)       # (B,)
-        # Anonymous-user fallback: replace u_e with anon_user_embed for samples
-        # whose user has empty training history (cold-start). Blend AS EARLY AS
-        # POSSIBLE so all downstream u_e uses (cross fields, crosses, etc.) see
-        # the cleaned embedding.
-        if ANON_FALLBACK:
-            is_cold = (u_valid.sum(dim=1) == 0).float().unsqueeze(-1)  # (B, 1)
-            u_e = u_e * (1.0 - is_cold) + self.anon_user_embed.unsqueeze(0) * is_cold
-        if USER_HIST_DECAY:
-            if hist_idx is not None and EVAL_DYNAMIC_HIST:
-                u_hist_ts = _eval_user_hist_ts_t[hist_idx]
-            else:
-                u_hist_ts = _user_hist_ts_t[uids]             # (B, L) int32
-            u_hist_pool = _pool_history(
-                u_hist_e, u_hist_rat, u_valid, USER_HIST_POOL,
-                decay_theta=self.user_decay_theta,
-                sample_ts=ts_raw, hist_ts=u_hist_ts, ts_range=ts_range)
-        elif USER_HIST_POOL == "din":
-            u_hist_pool = _pool_history(
-                u_hist_e, u_hist_rat, u_valid, USER_HIST_POOL,
-                din_module=self.user_din_attn, target_embed=i_e)
-        else:
-            u_hist_pool = _pool_history(u_hist_e, u_hist_rat, u_valid, USER_HIST_POOL)
-        u_hist_rat_mean = (u_hist_rat * u_valid).sum(dim=1) / u_count
-        u_hist_rat_mean = u_hist_rat_mean.unsqueeze(-1)                        # (B, 1)
-
-        # apr28ab cold-conditional masking + indicator. Active only when any
-        # apr28ab flag is on; otherwise byte-equivalent (no mask, no indicator).
-        # Mask zeros out u_e + u_hist_pool + u_hist_rat_mean for cold rows so
-        # both existing fields/crosses AND new conditional crosses see a clean
-        # zero on the user side. Cold rows = truly OOV (eval) OR stochastic mask
-        # of warm rows (training only, with prob WARM_MASK_P).
-        if COLD_CROSS_FIELDS or WARM_GATED_UHIST or WARM_MASK_P > 0:
-            is_truly_cold = (~_user_in_train_t[uids]).float().unsqueeze(-1)    # (B, 1)
-            if self.training and WARM_MASK_P > 0:
-                is_synthetic = (torch.rand(uids.size(0), 1, device=uids.device) < WARM_MASK_P).float()
-                is_cold_user = ((is_truly_cold + is_synthetic) > 0.5).float()
-            else:
-                is_cold_user = is_truly_cold
-            keep_warm = 1.0 - is_cold_user                                     # (B, 1)
-            u_e = u_e * keep_warm
-            u_hist_pool = u_hist_pool * keep_warm
-            u_hist_rat_mean = u_hist_rat_mean * keep_warm
-        else:
-            is_cold_user = None
-
-        # Item history: pool user_embed over valid raters.
-        # apr28af EVAL_DYNAMIC_ITEM_HIST=1 + eval (not training): per-sample
-        # precomputed dynamic item history. Otherwise static per-item.
-        if hist_idx is not None and EVAL_DYNAMIC_ITEM_HIST and not self.training:
-            i_hist = _eval_item_hist_t[hist_idx]
-            i_hist_rat = _eval_item_hist_rat_t[hist_idx]
-        else:
-            i_hist = _item_hist_t[mids]                       # (B, IL)
-            i_hist_rat = _item_hist_rat_t[mids]               # (B, IL)
-        i_hist_e = self.user_embed(i_hist)                # (B, IL, D)
-        i_valid = (i_hist != USER_PAD_IDX).float()        # (B, IL)
-        i_count = i_valid.sum(dim=1).clamp(min=1.0)
-        if ITEM_HIST_DECAY:
-            i_hist_ts = _item_hist_ts_t[mids]             # (B, IL) int32
-            i_hist_pool = _pool_history(
-                i_hist_e, i_hist_rat, i_valid, ITEM_HIST_POOL,
-                decay_theta=self.item_decay_theta,
-                sample_ts=ts_raw, hist_ts=i_hist_ts, ts_range=ts_range)
-        else:
-            i_hist_pool = _pool_history(i_hist_e, i_hist_rat, i_valid, ITEM_HIST_POOL)
-        i_hist_rat_mean = (i_hist_rat * i_valid).sum(dim=1) / i_count
-        i_hist_rat_mean = i_hist_rat_mean.unsqueeze(-1)
-
-        # Item content: raw genre multi-hot + raw genome + year
-        genre_raw = _movie_genres_t[mids]                 # (B, num_genres)
-        genome_e = _genome_t[mids]                        # (B, GENOME_DIM)
-        year = _movie_year_t[mids].unsqueeze(-1)          # (B, 1)
-
-        parts = [
-            u_e, i_e,
-            u_hist_pool, u_hist_rat_mean,
-            i_hist_pool, i_hist_rat_mean,
-            genre_raw,
-            ts, year,
-            genome_e,
-        ]
-
-        # Optional add-on fields (only appended if flag is on; off-state is byte-equivalent)
-        if USER_HIST_DISLIKE_POOL:
-            # Dislike pool: weight by (1 - rating) over valid positions.
-            w = (1.0 - u_hist_rat) * u_valid                          # (B, L)
-            denom = w.sum(dim=1, keepdim=True).clamp(min=1e-6)        # (B, 1)
-            dislike_pool = (u_hist_e * w.unsqueeze(-1)).sum(dim=1) / denom
-            parts.append(dislike_pool)
-        if USER_HIST_LAST_POSITION:
-            # Most recent valid user-history slot (PAD on the left, recent on the right).
-            last_e = u_hist_e[:, -1, :]                               # (B, D)
-            last_valid = u_valid[:, -1].unsqueeze(-1)                 # (B, 1)
-            parts.append(last_e * last_valid)
-        if ITEM_HIST_LAST_POSITION:
-            last_e = i_hist_e[:, -1, :]                               # (B, D)
-            last_valid = i_valid[:, -1].unsqueeze(-1)                 # (B, 1)
-            parts.append(last_e * last_valid)
-        if USER_HIST_MEAN_POOL:
-            denom = u_valid.sum(dim=1, keepdim=True).clamp(min=1e-6)
-            mean_pool = (u_hist_e * u_valid.unsqueeze(-1)).sum(dim=1) / denom
-            parts.append(mean_pool)
-        if ITEM_HIST_MEAN_POOL:
-            denom = i_valid.sum(dim=1, keepdim=True).clamp(min=1e-6)
-            mean_pool = (i_hist_e * i_valid.unsqueeze(-1)).sum(dim=1) / denom
-            parts.append(mean_pool)
-
-        # Multiplicative cross-feature fields (no learnable params here; the head's
-        # Linear layer absorbs the +84 dims when CROSS_FIELDS=1).
-        if CROSS_FIELDS:
-            parts.append(u_e * i_e)                                   # (B, D)
-            parts.append(u_hist_pool * i_e)                           # (B, D)
-            parts.append(i_hist_pool * u_e)                           # (B, D)
-        # Optional 4th cross field: time-modulated item embedding (ts broadcast over D).
-        # Independent flag, but only meaningful when CROSS_FIELDS=1 (the head's in_dim
-        # arithmetic assumes the 84-d cross block precedes this 28-d field).
-        if CROSS_TS_ITEM:
-            parts.append(ts * i_e)                                    # (B, D)
-        # Optional user × candidate genome compatibility scalar.
-        # user_genome_agg is precomputed (rating-centered weighted mean of historical
-        # movies' genomes); dot with the candidate's genome and normalize by 1/genome_dim.
-        if USER_GENOME_AGG_DOT:
-            u_gen = _user_genome_agg_t[uids]                          # (B, GENOME_DIM)
-            ug_dot = (u_gen * genome_e).sum(dim=-1, keepdim=True) / GENOME_DIM  # (B, 1)
-            parts.append(ug_dot)
-        # Optional user × candidate genre Hadamard cross.
-        if USER_GENRE_AFFINITY_CROSS:
-            u_gaff = _user_genre_affinity_t[uids]                     # (B, num_genres)
-            parts.append(u_gaff * genre_raw)                          # (B, num_genres)
-        # Optional per-movie genre × genome alignment scalar (per-movie, no user).
-        if CROSS_GENRE_GENOME:
-            parts.append(_gg_align_t[mids].unsqueeze(-1))             # (B, 1)
-        # apr28ac per-movie tag-text embedding (384-d, all-MiniLM-L6-v2).
-        if MOVIE_TAG_TEXT:
-            parts.append(_movie_tag_embed_t[mids])                    # (B, 384)
-        # apr28ak (c): per-movie log-popularity scalar.
-        if POPULARITY_PRIOR:
-            parts.append(_movie_popularity_t[mids].unsqueeze(-1))     # (B, 1)
-        # apr28ab cold-conditional cross fields. Each is `is_cold_user × <field>`.
-        # Cold rows get the field's value; warm rows get zero. The head learns
-        # cold-mode-specific weights for these fields without sharing with
-        # the unconditional warm-mode features.
-        if is_cold_user is not None:
-            if "i_e" in COLD_CROSS_FIELDS:
-                parts.append(is_cold_user * i_e)                       # (B, D)
-            if "genre" in COLD_CROSS_FIELDS:
-                parts.append(is_cold_user * genre_raw)                 # (B, num_genres)
-            # apr28ab warm-gated extra copy of u_hist_pool ⊙ i_e. NOTE: u_hist_pool
-            # was zeroed for cold rows above, so this is effectively gated by
-            # (1 - is_cold_user). Adding the explicit gate as belt-and-suspenders.
-            if WARM_GATED_UHIST:
-                parts.append((1.0 - is_cold_user) * (u_hist_pool * i_e))   # (B, D)
-
-        x = torch.cat(parts, dim=-1)
-        main_logit = self.head(x).squeeze(-1)
-        # Aux head is constructed only when AUX_RATING_WEIGHT > 0 (off-state byte-equiv).
-        # When off, aux_pred is None and forward returns just main_logit (unchanged).
-        if AUX_RATING_WEIGHT > 0:
-            aux_pred = self.aux_head(x).squeeze(-1)
-            return main_logit, aux_pred
-        return main_logit
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        # placeholder: vanilla pre-norm transformer block, no relative bias
+        h = self.norm(x)
+        attn_out, _ = self.attn(h, h, h, key_padding_mask=(mask < 0.5), need_weights=False)
+        x = x + attn_out
+        x = x + self.ffn(x)
+        return x
 
 
-model = LinearBaseline(num_users, num_items, num_genres, GENOME_DIM, EMBED_DIM).to(DEVICE)
-n_params = sum(p.numel() for p in model.parameters())
-log.info(f"Parameters: {n_params/1e6:.1f}M | genome_dim={GENOME_DIM} | "
-         f"in_dim={model.in_dim} | head_params={(model.in_dim + 1)}")
+class PlaceholderHSTU(nn.Module):
+    """Stub model: embedding sum + tiny transformer + scoring head.
 
-opt = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-loss_fn = nn.BCEWithLogitsLoss()
+    The real HSTU implementation (per Meta 2024) replaces the body with the
+    HSTU block stack and adds relative-position bias from time deltas.
+    """
+
+    def __init__(self, num_items: int, num_rating_buckets: int):
+        super().__init__()
+        self.item_embed = nn.Embedding(num_items + 1, EMBED_DIM, padding_idx=0)
+        self.rating_embed = nn.Embedding(num_rating_buckets, EMBED_DIM)
+        self.blocks = nn.ModuleList([
+            HSTUBlock(EMBED_DIM, NUM_HEADS, DROPOUT) for _ in range(NUM_LAYERS)
+        ])
+        self.head = nn.Linear(EMBED_DIM * 2, 1)
+        # TODO: relative-position bias from log-bucketed time deltas
+        # TODO: action-type embedding (binary engaged vs implicit) once we add easy negs to history
+
+    def forward(self, hist_items, hist_ratings, hist_mask, candidate_items):
+        h = self.item_embed(hist_items) + self.rating_embed(hist_ratings)
+        for block in self.blocks:
+            h = block(h, hist_mask)
+        # take the last valid position as the user representation
+        # TODO: replace with proper next-position decoding
+        last_pos = hist_mask.sum(dim=1).clamp(min=1).long() - 1
+        batch_idx = torch.arange(h.size(0), device=h.device)
+        user_rep = h[batch_idx, last_pos]
+        cand_rep = self.item_embed(candidate_items)
+        logit = self.head(torch.cat([user_rep, cand_rep], dim=-1)).squeeze(-1)
+        return logit
 
 
-# ═══════════════════════════════════════════════════════════════════
-# TRAINING LOOP — patience-based early stopping, sub-epoch eval
-# ═══════════════════════════════════════════════════════════════════
+# ─── Train + eval ───────────────────────────────────────────────────
+def run_epoch(model, loader, optimizer, *, train: bool):
+    model.train(train)
+    total_loss = 0.0
+    total_n = 0
+    all_scores, all_labels = [], []
+    bce = nn.BCEWithLogitsLoss(reduction="sum")
+    for batch in loader:
+        hist_items = batch["hist_items"].to(DEVICE)
+        hist_ratings = batch["hist_ratings"].to(DEVICE)
+        hist_mask = batch["hist_mask"].to(DEVICE)
+        cand = torch.tensor(batch["mid"], device=DEVICE)
+        label = torch.tensor(batch["label"], device=DEVICE, dtype=torch.float32)
+        logit = model(hist_items, hist_ratings, hist_mask, cand)
+        loss = bce(logit, label)
+        if train:
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        total_loss += loss.item()
+        total_n += label.numel()
+        all_scores.append(torch.sigmoid(logit).detach().cpu().numpy())
+        all_labels.append(label.detach().cpu().numpy())
+    scores = np.concatenate(all_scores)
+    labels = np.concatenate(all_labels)
+    return total_loss / max(1, total_n), evaluate(labels, scores)["auc"]
 
-def run_eval():
-    model.eval()
-    eval_batch = BATCH_SIZE * 2
-    scores = []
-    with torch.no_grad():
-        for s in range(0, n_eval, eval_batch):
-            e = min(s + eval_batch, n_eval)
-            _hist_idx = torch.arange(s, e, device=DEVICE) if (EVAL_DYNAMIC_HIST or EVAL_DYNAMIC_ITEM_HIST) else None
-            out = model(eval_uids[s:e], eval_mids[s:e], eval_ts[s:e],
-                        ts_raw=eval_ts_raw[s:e], hist_idx=_hist_idx)
-            logits = out[0] if isinstance(out, tuple) else out
-            scores.append(torch.sigmoid(logits).cpu().numpy())
-    model.train()
-    scores = np.concatenate(scores)
-    labels = eval_labels_t.cpu().numpy()
-    return evaluate(labels, scores)
+
+def main():
+    t0 = time.time()
+    log.info(f"Loading {DATASET} (raw rating events; no feature engineering)")
+    data = load_data(DATASET)
+    train_df, val_df, test_df = data["train"], data["val"], data["test"]
+    stats = data["stats"]
+    log.info(f"  num_users={stats['num_users']}  num_items={stats['num_items']}  "
+             f"num_train={stats['num_train']}  num_val={stats['num_val']}  num_test={stats['num_test']}")
+
+    # Build per-user sequences from train + val (for val we use train-only history;
+    # for test we use train+val history — same semantics as simple_v2's
+    # EVAL_DYNAMIC_HIST=1 mechanism, which is the bar to clear).
+    log.info("Building per-user event sequences")
+    train_history = build_user_sequences(train_df)
+    eval_history = build_user_sequences(pd.concat([train_df, val_df], ignore_index=True))
+
+    # TODO: collator that packs sequences for the real HSTU; for now per-sample slice.
+    def collate(batch):
+        return {
+            "uid": [b["uid"] for b in batch],
+            "mid": [b["mid"] for b in batch],
+            "label": [b["label"] for b in batch],
+            "hist_items": torch.tensor(np.stack([b["hist_items"] for b in batch])),
+            "hist_ratings": torch.tensor(np.stack([b["hist_ratings"] for b in batch])),
+            "hist_mask": torch.tensor(np.stack([b["hist_mask"] for b in batch])),
+        }
+
+    train_ds = HSTUDataset(train_df, train_history, SEQ_LEN)
+    val_ds = HSTUDataset(val_df, eval_history, SEQ_LEN)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate)
+
+    model = PlaceholderHSTU(stats["num_items"], NUM_RATING_BUCKETS).to(DEVICE)
+    n_params = sum(p.numel() for p in model.parameters())
+    log.info(f"PlaceholderHSTU: {n_params/1e6:.2f}M params on {DEVICE}")
+    log.info("⚠️  Placeholder model — replace with real HSTU block stack to make this meaningful.")
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+
+    best_val_auc = 0.0
+    for epoch in range(MAX_EPOCHS):
+        train_loss, train_auc = run_epoch(model, train_loader, optimizer, train=True)
+        val_loss, val_auc = run_epoch(model, val_loader, optimizer=None, train=False)
+        log.info(f"epoch {epoch}: train_loss={train_loss:.4f} train_auc={train_auc:.4f} "
+                 f"val_loss={val_loss:.4f} val_auc={val_auc:.4f}")
+        best_val_auc = max(best_val_auc, val_auc)
+
+    total = time.time() - t0
+    print(f"\nval_auc:          {best_val_auc:.6f}")
+    print(f"total_seconds:    {total:.1f}")
+    print(f"dataset:          {DATASET}")
+    print(f"num_params_M:     {n_params/1e6:.2f}")
+    print(f"# bar to clear (simple_v2 locked): val 0.8594 / test 0.8455")
 
 
-t_train_start = time.time()
-best_auc = -1.0
-best_state = None
-no_improve = 0
-n_batches_per_epoch = n_train // BATCH_SIZE
-eval_interval = max(1, n_batches_per_epoch // EVAL_PER_EPOCH)
-step = 0
-loss_sum = 0.0
-loss_n = 0
-done = False
-
-for epoch in range(MAX_EPOCHS):
-    perm = torch.randperm(n_train, device=DEVICE)
-    for b in range(n_batches_per_epoch):
-        idx = perm[b * BATCH_SIZE:(b + 1) * BATCH_SIZE]
-        # When TRAIN_DYNAMIC_HIST=1, idx serves as hist_idx for per-sample
-        # cut lookup. The flag-gated forward block uses `self.training` to
-        # distinguish train-time vs eval-time dynamic history.
-        out = model(train_uids[idx], train_mids[idx], train_ts[idx],
-                    ts_raw=train_ts_raw[idx],
-                    hist_idx=idx if (TRAIN_DYNAMIC_HIST or TRAIN_DYNAMIC_HIST_TRAIN_ONLY) else None)
-        if isinstance(out, tuple):
-            logits, aux_pred = out
-        else:
-            logits, aux_pred = out, None
-        loss = loss_fn(logits, train_labels[idx])
-        if AUX_RATING_WEIGHT > 0 and aux_pred is not None:
-            # MSE between predicted rating and true normalized rating, masked
-            # to samples that have a real rating (rating > 0; random easy
-            # negatives stored as 0 are skipped). Denominator clamped to 1
-            # to handle the all-easy-negative degenerate case.
-            true_rating = train_ratings_norm[idx]
-            mask = (true_rating > 0).float()
-            sq = (aux_pred - true_rating) ** 2
-            masked_mse = (mask * sq).sum() / mask.sum().clamp(min=1.0)
-            loss = loss + AUX_RATING_WEIGHT * masked_mse
-        if FREQ_WD_LAMBDA > 0:
-            # Frequency-weighted L2 on item_embed. Tail items get more penalty.
-            # Additive on top of the standard Adam WD applied to item_embed.weight.
-            l2_per_item = (model.item_embed.weight ** 2).sum(dim=-1)  # (num_items + 1,)
-            freq_penalty = FREQ_WD_LAMBDA * (l2_per_item * _item_freq_weight_t).sum()
-            loss = loss + freq_penalty
-        if USER_FREQ_WD_LAMBDA > 0:
-            l2_per_user = (model.user_embed.weight ** 2).sum(dim=-1)  # (num_users + 1,)
-            user_freq_penalty = USER_FREQ_WD_LAMBDA * (l2_per_user * _user_freq_weight_t).sum()
-            loss = loss + user_freq_penalty
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
-        loss_sum += float(loss.item())
-        loss_n += 1
-        step += 1
-
-        if step % eval_interval == 0:
-            metrics = run_eval()
-            avg_loss = loss_sum / max(1, loss_n)
-            elapsed = time.time() - t_train_start
-            star = ""
-            if metrics["auc"] > best_auc:
-                best_auc = metrics["auc"]
-                best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
-                no_improve = 0
-                star = " ***"
-            else:
-                no_improve += 1
-            log.info(f"Step {step:6d} | Loss {avg_loss:.4f} | Val AUC {metrics['auc']:.4f}{star} | {elapsed:.0f}s")
-            loss_sum = 0.0
-            loss_n = 0
-            if no_improve >= PATIENCE:
-                log.info(f"Early stopping: no improvement for {PATIENCE} evals (best AUC: {best_auc:.4f})")
-                done = True
-                break
-    if done:
-        break
-
-if best_state is not None:
-    model.load_state_dict(best_state)
-    log.info(f"Restored best model (AUC: {best_auc:.4f})")
-
-# ─── apr28ai: per-user incremental fine-tune at eval ────────────────
-# After model training (best_state restored), update user_embed.weight[u]
-# per-user using each user's strictly-prior ratings as labels. All other
-# params frozen. Per-user causal: cutoff = min(eval_row_ts) for that user.
-if INCR_TUNE_LR > 0.0:
-    log.info(f"Starting incremental per-user fine-tune (LR={INCR_TUNE_LR}, K={INCR_TUNE_K}, max_prior={INCR_TUNE_MAX_PRIOR})...")
-    # Pre-flight diagnostic: head coefficient norms on key u-side slices
-    _head_w = model.head.weight.detach()  # (1, in_dim)
-    _D = EMBED_DIM
-    log.info(
-        f"Pre-flight head norms — u_e: {_head_w[0, :_D].norm().item():.4f}, "
-        f"i_e: {_head_w[0, _D:2*_D].norm().item():.4f}, "
-        f"u_hist_pool: {_head_w[0, 2*_D:3*_D].norm().item():.4f}, "
-        f"i_hist_pool: {_head_w[0, 3*_D+1:4*_D+1].norm().item():.4f}, "
-        f"head_total: {_head_w.norm().item():.4f}"
-    )
-    # 1. Compute min eval row ts per user (numpy)
-    _min_eval_ts = np.full(num_users + 1, np.iinfo(np.int64).max, dtype=np.int64)
-    _eval_uids_np = eval_uids.cpu().numpy()
-    _eval_ts_raw_np = eval_ts_raw.cpu().numpy()
-    np.minimum.at(_min_eval_ts, _eval_uids_np, _eval_ts_raw_np)
-    # 2. Build per-user fine-tune set from train+val (rating > 0 means real, not easy-neg).
-    # For each user, take last MAX_PRIOR ratings with ts < min_eval_ts[u]. Label = (rating >= 4).
-    _comb = pd.concat([
-        train_df[train_df["rating"] > 0][["userId", "movieId", "rating", "timestamp"]],
-        val_df[val_df["rating"] > 0][["userId", "movieId", "rating", "timestamp"]],
-    ], ignore_index=True)
-    _comb = _comb.sort_values(["userId", "timestamp"]).reset_index(drop=True)
-    _ft_uid_arr = _comb["userId"].values.astype(np.int64)
-    _ft_mid_arr = _comb["movieId"].values.astype(np.int64)
-    _ft_rat_arr = _comb["rating"].values.astype(np.float32)
-    _ft_ts_arr = _comb["timestamp"].values.astype(np.int64)
-    _user_starts = np.searchsorted(_ft_uid_arr, np.arange(num_users + 1), side="left")
-    _ft_uids_kept = []
-    _ft_mids_kept = []
-    _ft_labels_kept = []
-    _ft_ts_kept = []
-    _n_users_with_ft = 0
-    for _uid in range(num_users):
-        _us, _ue = int(_user_starts[_uid]), int(_user_starts[_uid + 1])
-        if _us == _ue:
-            continue
-        _user_ts = _ft_ts_arr[_us:_ue]
-        _cutoff = _min_eval_ts[_uid]
-        if _cutoff == np.iinfo(np.int64).max:
-            continue  # user has no eval rows; skip
-        _cut = int(np.searchsorted(_user_ts, _cutoff, side="left"))
-        if _cut < 2:
-            continue  # need at least 2 prior ratings
-        _take = min(_cut, INCR_TUNE_MAX_PRIOR)
-        _slice = slice(_us + _cut - _take, _us + _cut)
-        _ft_uids_kept.append(np.full(_take, _uid, dtype=np.int64))
-        _ft_mids_kept.append(_ft_mid_arr[_slice])
-        _ft_labels_kept.append((_ft_rat_arr[_slice] >= 4.0).astype(np.float32))
-        _ft_ts_kept.append(_ft_ts_arr[_slice])
-        _n_users_with_ft += 1
-    if _n_users_with_ft == 0:
-        log.info("No users qualified for fine-tune (need ≥2 prior real ratings before earliest eval ts).")
-    else:
-        _ft_uids_t = torch.from_numpy(np.concatenate(_ft_uids_kept)).to(DEVICE)
-        _ft_mids_t = torch.from_numpy(np.concatenate(_ft_mids_kept)).to(DEVICE)
-        _ft_labels_t = torch.from_numpy(np.concatenate(_ft_labels_kept)).to(DEVICE)
-        _ft_ts_raw_t = torch.from_numpy(np.concatenate(_ft_ts_kept)).to(DEVICE)
-        _ft_ts_norm = ((_ft_ts_raw_t.float() - ts_min) / ts_range).unsqueeze(-1)
-        n_ft = len(_ft_uids_t)
-        log.info(f"Fine-tune set: {_n_users_with_ft} users, {n_ft} total rows")
-        # Freeze all params except user_embed.weight
-        _param_grad_state = {}
-        for _name, _p in model.named_parameters():
-            _param_grad_state[_name] = _p.requires_grad
-            _p.requires_grad = (_name == "user_embed.weight")
-        _ft_optim = torch.optim.SGD([model.user_embed.weight], lr=INCR_TUNE_LR)
-        _ft_loss_fn = nn.BCEWithLogitsLoss()
-        # Run K big-batch steps. With batch_size=BATCH_SIZE for fine-tune.
-        model.eval()  # disable any train-mode dropout etc; we only want grads on user_embed
-        _ft_batch = BATCH_SIZE
-        for _step in range(INCR_TUNE_K):
-            _step_loss = 0.0
-            _step_n = 0
-            _perm = torch.randperm(n_ft, device=DEVICE)
-            for _s in range(0, n_ft, _ft_batch):
-                _e = min(_s + _ft_batch, n_ft)
-                _idx = _perm[_s:_e]
-                _bu, _bm = _ft_uids_t[_idx], _ft_mids_t[_idx]
-                _bts = _ft_ts_norm[_idx]
-                _bts_raw = _ft_ts_raw_t[_idx]
-                _bl = _ft_labels_t[_idx]
-                _ft_optim.zero_grad()
-                _out = model(_bu, _bm, _bts, ts_raw=_bts_raw, hist_idx=None)
-                _logits = _out[0] if isinstance(_out, tuple) else _out
-                _loss = _ft_loss_fn(_logits, _bl)
-                _loss.backward()
-                # Block cross-user gradient leakage via i_hist_e (Validator flag).
-                # Forward path's i_hist_e = self.user_embed(i_hist) means raters
-                # of items in this batch receive gradient too. We want only the
-                # SUPERVISED users' embedding rows to update.
-                if model.user_embed.weight.grad is not None:
-                    _supervised = torch.zeros(num_users + 1, device=DEVICE, dtype=torch.bool)
-                    _supervised[_bu] = True
-                    model.user_embed.weight.grad[~_supervised] = 0
-                _ft_optim.step()
-                _step_loss += float(_loss.item()) * (_e - _s)
-                _step_n += (_e - _s)
-            log.info(f"Fine-tune step {_step+1}/{INCR_TUNE_K}: avg loss = {_step_loss / max(_step_n, 1):.4f}")
-        # Restore param requires_grad state (not strictly needed since we don't train more)
-        for _name, _p in model.named_parameters():
-            _p.requires_grad = _param_grad_state[_name]
-        del _ft_uids_t, _ft_mids_t, _ft_labels_t, _ft_ts_raw_t, _ft_ts_norm
-        del _ft_uids_kept, _ft_mids_kept, _ft_labels_kept, _ft_ts_kept
-        del _comb, _ft_uid_arr, _ft_mid_arr, _ft_rat_arr, _ft_ts_arr, _user_starts, _min_eval_ts
-
-t_train_end = time.time()
-final_metrics = run_eval()
-
-# ─── OOV-decomposed eval (apr28aa diagnostic) ──────────────────────
-# Stratifies val_auc by whether user/item appear in the (post-recency) train set.
-# Diagnostic only; does NOT change keep decisions (which use overall val_auc).
-try:
-    from sklearn.metrics import roc_auc_score
-    _train_real = train_df[train_df["rating"] > 0]
-    _train_user_set = set(_train_real["userId"].unique().tolist())
-    _train_item_set = set(_train_real["movieId"].unique().tolist())
-    _eval_uid_arr = _eval_df["userId"].values.astype(np.int64)
-    _eval_mid_arr = _eval_df["movieId"].values.astype(np.int64)
-    _cold_user_mask = ~np.isin(_eval_uid_arr, list(_train_user_set))
-    _cold_item_mask = ~np.isin(_eval_mid_arr, list(_train_item_set))
-    # Recompute scores once (already done in run_eval but discarded)
-    model.eval()
-    _scores = []
-    with torch.no_grad():
-        eval_batch = BATCH_SIZE * 2
-        for s in range(0, n_eval, eval_batch):
-            e = min(s + eval_batch, n_eval)
-            _hist_idx = torch.arange(s, e, device=DEVICE) if (EVAL_DYNAMIC_HIST or EVAL_DYNAMIC_ITEM_HIST) else None
-            out = model(eval_uids[s:e], eval_mids[s:e], eval_ts[s:e],
-                        ts_raw=eval_ts_raw[s:e], hist_idx=_hist_idx)
-            logits = out[0] if isinstance(out, tuple) else out
-            _scores.append(torch.sigmoid(logits).cpu().numpy())
-    model.train()
-    _scores = np.concatenate(_scores)
-    _labels = eval_labels_t.cpu().numpy()
-    _strata = [
-        ("warm", ~_cold_user_mask & ~_cold_item_mask),
-        ("cold_user", _cold_user_mask & ~_cold_item_mask),
-        ("cold_item", ~_cold_user_mask & _cold_item_mask),
-        ("cold_both", _cold_user_mask & _cold_item_mask),
-    ]
-    # apr28ad: split cold_user into first-row (no prior val items) and
-    # later-row (has prior val items). Only meaningful when EVAL_DYNAMIC_HIST=1
-    # (else dynamic histories aren't built and we can't tell prior history).
-    if EVAL_DYNAMIC_HIST:
-        _has_prior = (_eval_user_hist_t != PAD_IDX).any(dim=1).cpu().numpy()
-        _cold_user_first = _cold_user_mask & ~_cold_item_mask & ~_has_prior
-        _cold_user_later = _cold_user_mask & ~_cold_item_mask & _has_prior
-        _strata.append(("cold_user_first", _cold_user_first))
-        _strata.append(("cold_user_later", _cold_user_later))
-    log.info("OOV-decomposed val AUC:")
-    for name, mask in _strata:
-        if mask.sum() == 0 or len(np.unique(_labels[mask])) < 2:
-            log.info(f"  val_auc_{name}: n/a (n={int(mask.sum())})")
-            continue
-        auc = roc_auc_score(_labels[mask], _scores[mask])
-        log.info(f"  val_auc_{name}: {auc:.6f}  n={int(mask.sum())}")
-except Exception as _e:
-    log.info(f"OOV-decomp eval skipped: {_e}")
-
-# ─── apr28aj: held-out test set evaluation (single-shot reporting) ──
-# Single-shot: this is the only test-set evaluation. No iteration on test.
-if RUN_TEST:
-    log.info("===== apr28aj: held-out test set evaluation (single-shot) =====")
-    # Build _test_eval_df mirroring val construction:
-    # test pos + test hard neg + sampled easy neg anchored to test pos.
-    _test_pos_mask = test_df["label"] == 1
-    _test_pos = test_df[_test_pos_mask]
-    _test_hard_neg = test_df[~_test_pos_mask]
-    _n_test_pos = len(_test_pos)
-    log.info(f"Test set raw: {_n_test_pos} pos + {len(_test_hard_neg)} hard neg")
-    # Build per-user "all rated" set covering train+val+test (Critic flag 3)
-    _test_user_all = {uid: set(items) for uid, items in user_all_items.items()}
-    for uid, group in val_df.groupby("userId"):
-        _test_user_all.setdefault(uid, set()).update(group["movieId"].values)
-    for uid, group in test_df.groupby("userId"):
-        _test_user_all.setdefault(uid, set()).update(group["movieId"].values)
-    # Distinct RNG (Critic flag 2): SEED=42 baseline used 42 for val easy-negs;
-    # use 43 for test easy-negs to keep them independent.
-    _test_rng = np.random.RandomState(43)
-    _test_easy_users = _test_pos["userId"].values.astype(np.int64)
-    _test_easy_items = np.empty(_n_test_pos, dtype=np.int64)
-    for _i in range(_n_test_pos):
-        _rated = _test_user_all.get(_test_easy_users[_i], set())
-        _mid = _test_rng.randint(0, num_items)
-        while _mid in _rated:
-            _mid = _test_rng.randint(0, num_items)
-        _test_easy_items[_i] = _mid
-    _test_eval_df = pd.DataFrame({
-        "userId": np.concatenate([_test_pos["userId"].values, _test_hard_neg["userId"].values, _test_easy_users]),
-        "movieId": np.concatenate([_test_pos["movieId"].values, _test_hard_neg["movieId"].values, _test_easy_items]),
-        "timestamp": np.concatenate([_test_pos["timestamp"].values, _test_hard_neg["timestamp"].values, _test_pos["timestamp"].values]),
-        "label": np.concatenate([np.ones(_n_test_pos), np.zeros(len(_test_hard_neg)), np.zeros(_n_test_pos)]),
-    })
-    test_uids, test_mids, test_ts, test_ts_raw, test_labels_t, _ = _build_sample_tensors(_test_eval_df)
-    n_test = len(test_uids)
-    log.info(f"Test eval set: {_n_test_pos} pos + {len(_test_hard_neg)} hard neg + {_n_test_pos} easy neg = {n_test}")
-
-    # Build per-test-sample dynamic histories from combined train+val+test-prior
-    # (same per-row causal methodology as val's _eval_user_hist_t).
-    if EVAL_DYNAMIC_HIST:
-        log.info("Building test-time dynamic user histories...")
-        _comb = pd.concat([
-            train_df[train_df["rating"] > 0][["userId", "movieId", "rating", "timestamp"]],
-            val_df[val_df["rating"] > 0][["userId", "movieId", "rating", "timestamp"]],
-            test_df[test_df["rating"] > 0][["userId", "movieId", "rating", "timestamp"]],
-        ], ignore_index=True)
-        _comb = _comb.sort_values(["userId", "timestamp"]).reset_index(drop=True)
-        _all_uid = _comb["userId"].values.astype(np.int64)
-        _all_mid = _comb["movieId"].values.astype(np.int64)
-        _all_rat = (_comb["rating"].values.astype(np.float32) / 5.0)
-        _all_ts = _comb["timestamp"].values.astype(np.int64)
-        _uid_starts = np.searchsorted(_all_uid, np.arange(num_users), side="left")
-        _uid_ends = np.searchsorted(_all_uid, np.arange(num_users), side="right")
-        _test_user_hist_np = np.full((n_test, HISTORY_LEN), PAD_IDX, dtype=np.int64)
-        _test_user_hist_rat_np = np.zeros((n_test, HISTORY_LEN), dtype=np.float32)
-        _test_user_hist_ts_np = np.zeros((n_test, HISTORY_LEN), dtype=np.int32)
-        _test_uids_np_arr = test_uids.cpu().numpy()
-        _test_ts_np_arr = test_ts_raw.cpu().numpy()
-        _test_order = np.argsort(_test_uids_np_arr, kind="stable")
-        _test_uids_sorted = _test_uids_np_arr[_test_order]
-        _test_uid_starts = np.searchsorted(_test_uids_sorted, np.arange(num_users), side="left")
-        _test_uid_ends = np.searchsorted(_test_uids_sorted, np.arange(num_users), side="right")
-        for _uid in range(num_users):
-            _es, _ee = int(_test_uid_starts[_uid]), int(_test_uid_ends[_uid])
-            if _es == _ee:
-                continue
-            _us, _ue = int(_uid_starts[_uid]), int(_uid_ends[_uid])
-            if _us == _ue:
-                continue
-            _user_ts = _all_ts[_us:_ue]
-            _user_mid = _all_mid[_us:_ue]
-            _user_rat = _all_rat[_us:_ue]
-            _test_rows = _test_order[_es:_ee]
-            _row_ts = _test_ts_np_arr[_test_rows]
-            _cuts = np.searchsorted(_user_ts, _row_ts, side="left")
-            for _row_idx, _cut in zip(_test_rows, _cuts):
-                if _cut == 0:
-                    continue
-                _take = min(int(_cut), HISTORY_LEN)
-                _test_user_hist_np[_row_idx, -_take:] = _user_mid[_cut - _take:_cut]
-                _test_user_hist_rat_np[_row_idx, -_take:] = _user_rat[_cut - _take:_cut]
-                _test_user_hist_ts_np[_row_idx, -_take:] = _user_ts[_cut - _take:_cut].astype(np.int32)
-        # Override the global eval tensors so model.forward picks up the test versions.
-        # The forward branch uses _eval_user_hist_t[hist_idx]; we'll point it at the test data.
-        _eval_user_hist_t_test = torch.from_numpy(_test_user_hist_np).to(DEVICE)
-        _eval_user_hist_rat_t_test = torch.from_numpy(_test_user_hist_rat_np).to(DEVICE)
-        _eval_user_hist_ts_t_test = torch.from_numpy(_test_user_hist_ts_np).to(DEVICE)
-        # Save val versions, swap in test versions
-        _saved_eval_user_hist_t = _eval_user_hist_t
-        _saved_eval_user_hist_rat_t = _eval_user_hist_rat_t
-        _saved_eval_user_hist_ts_t = _eval_user_hist_ts_t
-        _eval_user_hist_t = _eval_user_hist_t_test
-        _eval_user_hist_rat_t = _eval_user_hist_rat_t_test
-        _eval_user_hist_ts_t = _eval_user_hist_ts_t_test
-        del _comb, _all_uid, _all_mid, _all_rat, _all_ts, _uid_starts, _uid_ends
-        del _test_user_hist_np, _test_user_hist_rat_np, _test_user_hist_ts_np
-        del _test_uids_np_arr, _test_ts_np_arr, _test_order, _test_uids_sorted
-        del _test_uid_starts, _test_uid_ends
-
-    # Run test eval forward
-    model.eval()
-    _test_scores = []
-    with torch.no_grad():
-        eval_batch = BATCH_SIZE * 2
-        for s in range(0, n_test, eval_batch):
-            e = min(s + eval_batch, n_test)
-            _hist_idx = torch.arange(s, e, device=DEVICE) if (EVAL_DYNAMIC_HIST or EVAL_DYNAMIC_ITEM_HIST) else None
-            out = model(test_uids[s:e], test_mids[s:e], test_ts[s:e],
-                        ts_raw=test_ts_raw[s:e], hist_idx=_hist_idx)
-            logits = out[0] if isinstance(out, tuple) else out
-            _test_scores.append(torch.sigmoid(logits).cpu().numpy())
-    model.train()
-    _test_scores = np.concatenate(_test_scores)
-    _test_labels = test_labels_t.cpu().numpy()
-    test_metrics = evaluate(_test_labels, _test_scores)
-    log.info(f"test_auc: {test_metrics['auc']:.6f}")
-
-    # OOV decomp on test (Critic flag 3: include cold_user_first_test stratum)
-    try:
-        from sklearn.metrics import roc_auc_score
-        _train_real = train_df[train_df["rating"] > 0]
-        _train_user_set = set(_train_real["userId"].unique().tolist())
-        _train_item_set = set(_train_real["movieId"].unique().tolist())
-        _val_real = val_df[val_df["rating"] > 0]
-        _val_user_set = set(_val_real["userId"].unique().tolist())
-        _test_uid_arr = _test_eval_df["userId"].values.astype(np.int64)
-        _test_mid_arr = _test_eval_df["movieId"].values.astype(np.int64)
-        _cold_user_mask = ~np.isin(_test_uid_arr, list(_train_user_set))
-        _cold_item_mask = ~np.isin(_test_mid_arr, list(_train_item_set))
-        _strata = [
-            ("warm",       ~_cold_user_mask & ~_cold_item_mask),
-            ("cold_user",   _cold_user_mask & ~_cold_item_mask),
-            ("cold_item",  ~_cold_user_mask &  _cold_item_mask),
-            ("cold_both",   _cold_user_mask &  _cold_item_mask),
-        ]
-        # cold_user_first_test: cold relative to BOTH train AND val (truly new at test)
-        _cold_user_test_only = ~np.isin(_test_uid_arr, list(_train_user_set | _val_user_set))
-        _strata.append(("cold_user_first_test", _cold_user_test_only & ~_cold_item_mask))
-        log.info("OOV-decomposed TEST AUC:")
-        for name, mask in _strata:
-            if mask.sum() == 0 or len(np.unique(_test_labels[mask])) < 2:
-                log.info(f"  test_auc_{name}: n/a (n={int(mask.sum())})")
-                continue
-            auc = roc_auc_score(_test_labels[mask], _test_scores[mask])
-            log.info(f"  test_auc_{name}: {auc:.6f}  n={int(mask.sum())}")
-    except Exception as _e:
-        log.info(f"Test OOV-decomp skipped: {_e}")
-
-    # Restore val tensors (defensive; not used after this point but clean state)
-    if EVAL_DYNAMIC_HIST:
-        _eval_user_hist_t = _saved_eval_user_hist_t
-        _eval_user_hist_rat_t = _saved_eval_user_hist_rat_t
-        _eval_user_hist_ts_t = _saved_eval_user_hist_ts_t
-
-if torch.cuda.is_available():
-    peak_mem_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
-else:
-    peak_mem_mb = 0.0
-
-print_summary(
-    metrics=final_metrics,
-    training_seconds=t_train_end - t_train_start,
-    total_seconds=time.time() - t_total_start,
-    peak_memory_mb=peak_mem_mb,
-    num_params=n_params,
-    stats=stats,
-)
+if __name__ == "__main__":
+    main()
