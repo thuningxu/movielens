@@ -1,0 +1,3 @@
+[
+  {"name": "al_leakfix_s42", "env": {"EVAL_DYNAMIC_HIST": "1", "FREQ_WD_LAMBDA": "0", "LR": "1e-3", "TRAIN_DYNAMIC_HIST_TRAIN_ONLY": "1"}}
+]

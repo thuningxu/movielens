@@ -51,6 +51,30 @@ Brief notes on cycles run on the restart. Detailed per-trial data lives in `resu
 
 Legacy DLRM ceiling: 0.8284 (val). Restart linear-head + `EVAL_DYNAMIC_HIST=1 FREQ_WD_LAMBDA=0 LR=1e-3` **exceeds the legacy ceiling by +0.031 on val and +0.023 on test**. Static-history linear baseline still matches legacy within 0.0002 (apr28o at 0.8282 val). Project headline: **test AUC 0.8455** with single linear-head model.
 
+### `autoresearch/apr28al` — train-time time-leak fix only — regresses
+
+**Null/regress** (`31e6c71`). Isolated test of "train-time causal u_hist" without the val-data injection that apr28ae bundled. New flag `TRAIN_DYNAMIC_HIST_TRAIN_ONLY=1` rebuilds each train sample's u_hist from `train_df` ratings strictly prior to that sample's ts (vs the static `user_histories[uid]` which was built once from all of train, mixing future items into early samples' history).
+
+Hypothesis: the static training regime has an in-user temporal leak (sample at ts=T sees items at ts > T from same user); fixing it should align train with the strict-causal eval regime (`EVAL_DYNAMIC_HIST=1`) and lift generalization.
+
+Single cell at SEED=42 (vs apr28ah baseline 0.859384):
+
+| Cell | val_auc | Δ |
+|---|---|---|
+| `TRAIN_DYNAMIC_HIST_TRAIN_ONLY=1` | 0.851652 | **-0.0077** |
+
+**Regresses well below the +0.002 kill threshold.** No multi-seed verify, no LR sweep — dead per Critic's converged plan.
+
+**Diagnosis**: train-only strict-causal u_hist is *too sparse* for early-in-timeline train samples. The static history had ~100 items per warm user regardless of the sample's ts; train-only causal gives early samples nearly empty history. This creates a train↔eval distribution shift in the *opposite* direction of the intended fix:
+- Train (apr28al): u_hist built from train-only items < sample.ts → sparse for early samples
+- Eval (`EVAL_DYNAMIC_HIST=1`): u_hist built from train+val items < sample.ts → dense (eval samples are temporally late, so most of train is < eval.ts)
+
+The model fits on sparse-history training and is evaluated on dense-history rows it never trained on. Worse than the original "leaky-but-dense" static regime which at least matched the eval pool's density.
+
+**Lesson**: the in-user temporal leak in the static training history was *informative*, not harmful — because at eval time the row sees a denser u_hist than it would have if train were strict-causal. Removing the leak without compensating for the density drop hurts. apr28ae's train+val variant was closer to neutral because val items partially restored the density for late-train samples; the train-only variant has no such buffer.
+
+**Baseline unchanged at apr28ah: 5-seed mean 0.859289 / SEED=42 0.859384 / test 0.845497.**
+
 ### `autoresearch/apr28ak` — recency decay + popularity prior — null
 
 **Null** (`db43a7c`). Two mechanisms post-Phase-C, picked from a 7-idea brainstorm. Researcher proposed three; Critic dropped (b) warm-row dropout (re-implements apr28ab's already-null WARM_MASK_P).
