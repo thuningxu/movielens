@@ -80,6 +80,18 @@ USE_GENOME = int(os.environ.get("USE_GENOME", "0"))
 USE_GENRE = int(os.environ.get("USE_GENRE", "0"))
 USE_YEAR = int(os.environ.get("USE_YEAR", "0"))
 
+# Stabilization mechanisms (apr30, post-spike). Both default OFF (off-state
+# byte-equivalent to 200bc86). Motivation: with USE_GENOME/GENRE/YEAR=1
+# (M1), training spikes at epoch 5 — train_loss 0.515 → 7.21, val_auc drops
+# 0.05. Reproducible across M1 and M2 (genome-only); M0 (no metadata) is
+# stable. Hypothesis: zero-init projections + Adam moment cascade at the
+# activation transition; gradient clipping is a direct counter, and Xavier
+# init is an alternative path that avoids the cascade entirely.
+GRAD_CLIP = float(os.environ.get("GRAD_CLIP", "0.0"))   # >0 → clip_grad_norm_ each step
+PROJ_INIT_MODE = os.environ.get("PROJ_INIT_MODE", "zero")
+if PROJ_INIT_MODE not in {"zero", "xavier"}:
+    raise ValueError(f"PROJ_INIT_MODE must be 'zero' or 'xavier', got {PROJ_INIT_MODE!r}")
+
 # Year embedding bucket scheme. ml-25m titles span 1874..2019; ml-100k spans
 # 1922..1998. Coverage 1850..2049 = 200 buckets handles all observed datasets
 # with safety margin and costs ~12 KB at D=64. year_id = clip(year - YEAR_MIN,
@@ -556,15 +568,24 @@ class HSTU(nn.Module):
         self.use_genome = bool(USE_GENOME) and self.genome_dim > 0
         self.use_genre = bool(USE_GENRE) and self.genre_dim > 0
         self.use_year = bool(USE_YEAR)
+        # PROJ_INIT_MODE controls whether the metadata projections start at
+        # zero (OFF→ON byte-equivalent at step 0; default) or Xavier-uniform
+        # (non-trivial step-0 metadata signal; tests the "zero-init causes
+        # Adam moment cascade at activation transition" spike hypothesis).
+        def _init_proj(weight: torch.Tensor) -> None:
+            if PROJ_INIT_MODE == "xavier":
+                nn.init.xavier_uniform_(weight)
+            else:
+                nn.init.zeros_(weight)
         if self.use_genome:
             self.genome_proj = nn.Linear(self.genome_dim, EMBED_DIM, bias=False)
-            nn.init.zeros_(self.genome_proj.weight)  # OFF→ON byte-equivalent at step 0
+            _init_proj(self.genome_proj.weight)
         if self.use_genre:
             self.genre_proj = nn.Linear(self.genre_dim, EMBED_DIM, bias=False)
-            nn.init.zeros_(self.genre_proj.weight)
+            _init_proj(self.genre_proj.weight)
         if self.use_year:
             self.year_embed = nn.Embedding(NUM_YEAR_BUCKETS, EMBED_DIM)
-            nn.init.zeros_(self.year_embed.weight)
+            _init_proj(self.year_embed.weight)
 
     def item_full_embed(self, item_ids: torch.Tensor) -> torch.Tensor:
         """Symmetric per-position item-side embedding used for both sequence
@@ -621,10 +642,21 @@ class HSTU(nn.Module):
 
 # ─── Train + eval ───────────────────────────────────────────────────
 def train_one_epoch(model, loader, optimizer):
-    """Sequence-level training: per-position causal BCE on next-event engagement."""
+    """Sequence-level training: per-position causal BCE on next-event engagement.
+
+    When GRAD_CLIP > 0, clip global grad norm between backward and step. The
+    pre-clip norm is averaged across batches and returned for diagnostic
+    logging — useful for confirming the clip threshold is actually firing
+    (if avg pre-clip norm << GRAD_CLIP, the clip is a no-op; if avg >> GRAD_CLIP,
+    most steps are clipped). When GRAD_CLIP == 0.0, no clip call is made and
+    grad-norm is not measured (preserving byte-equivalence with the prior
+    baseline; avg_grad_norm returns as None in that case).
+    """
     model.train()
     total_loss = 0.0
     total_positions = 0
+    grad_norm_sum = 0.0
+    grad_norm_count = 0
     bce = nn.BCEWithLogitsLoss(reduction="none")
     for batch in loader:
         hist_items = batch["hist_items"].to(DEVICE)         # (B, T)
@@ -653,12 +685,18 @@ def train_one_epoch(model, loader, optimizer):
 
         optimizer.zero_grad()
         loss.backward()
+        if GRAD_CLIP > 0.0:
+            # clip_grad_norm_ returns the pre-clip global norm (a tensor).
+            pre_clip = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP)
+            grad_norm_sum += float(pre_clip)
+            grad_norm_count += 1
         optimizer.step()
 
         total_loss += masked.sum().item()
         total_positions += int(pair_mask.sum().item())
     avg_loss = total_loss / max(1, total_positions)
-    return avg_loss
+    avg_grad_norm = (grad_norm_sum / grad_norm_count) if grad_norm_count > 0 else None
+    return avg_loss, avg_grad_norm
 
 
 @torch.no_grad()
@@ -730,9 +768,12 @@ def main():
 
     best_val_auc = 0.0
     for epoch in range(MAX_EPOCHS):
-        train_loss = train_one_epoch(model, train_loader, optimizer)
+        train_loss, avg_grad_norm = train_one_epoch(model, train_loader, optimizer)
         val_auc = evaluate_model(model, val_loader)
-        log.info(f"epoch {epoch}: train_loss={train_loss:.4f} val_auc={val_auc:.4f}")
+        # Only append grad_norm when GRAD_CLIP fired (avg_grad_norm not None);
+        # OFF-state log line is unchanged from the prior baseline.
+        gn_part = f" grad_norm={avg_grad_norm:.2f}" if avg_grad_norm is not None else ""
+        log.info(f"epoch {epoch}: train_loss={train_loss:.4f} val_auc={val_auc:.4f}{gn_part}")
         best_val_auc = max(best_val_auc, val_auc)
 
     total = time.time() - t0
