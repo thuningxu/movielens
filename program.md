@@ -14,6 +14,29 @@ Any HSTU cycle is measured against **val 0.8594 / test 0.8455** to be called a w
 
 ## Cycles
 
+### `apr30` stabilization S1+S2 — clip 1.0 catches but doesn't prevent recurring spikes; **+0.0014 over M1 sub-noise**
+
+**Stabilization sweep, sub-noise lift** (`a768f4d`). 2-cell sweep of M1 stack with `GRAD_CLIP=1.0`:
+
+| Cell | Init mode | best val_auc | trajectory |
+|---|---|---|---|
+| S1 | zero-init projections | 0.8444 (peak ep 10) | spikes at eps 3, 6, 7, 11, 13, 14 |
+| **S2** | **xavier-init projections** | **0.8467 (peak ep 14)** | spikes at eps 2, 5, 8, 9, 12 |
+
+Spike pattern is **recurring** (every 3-4 epochs) and **clip 1.0 catches but doesn't prevent**. Each spike: train_loss jumps 0.5 → 1.5-2.5, val_auc drops 0.03-0.10, recovers in 1-2 epochs. The clip-as-safety-net is working but the underlying training instability remains.
+
+**Findings**:
+- Xavier init is mildly better than zero-init (+0.0023 raw lift S2 over S1) but doesn't prevent spikes — refutes the "zero-init alone causes the spikes" hypothesis.
+- vs M1 (no clip, peak 0.8453): S2 is +0.0014 (sub-noise at lift-σ ~0.003).
+- vs HSTU baseline (M0=0.8370): S2 is +0.0097 — content metadata DOES lift HSTU meaningfully, just at the cost of training stability.
+- vs simple_v2 bar 0.8594: gap **−0.0127** (was −0.022 at 0.8367, now −0.013 at 0.8467).
+
+**Spike interpretation (Critic)**: metastable around asymptote — the spikes ARE the asymptote with clip catching periodic outlier batches; the mean trajectory is the right value, not blocked from climbing higher.
+
+**Spike interpretation (Researcher)**: prevention possible — tighter clip or different intervention could yield monotonic climb past 0.847.
+
+S2's tail trajectory: ep 11=0.8463, ep 12=0.8241 (spike), ep 13=0.8460, ep 14=0.8467. Suggests still climbing post-spike. Test: extend to 25 epochs.
+
 ### `apr30` metadata-1 — content features lift **+0.008 (M1: genome+genre+year)** but training spikes at epoch 5
 
 **Pre-spike peak win, post-spike instability** (`ab4bdda`). 3-cell sweep at 4L/64D, LR=5e-3, MAX_EPOCHS=15, SEED=42:
