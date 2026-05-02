@@ -14,6 +14,31 @@ Any HSTU cycle is measured against **val 0.8594 / test 0.8455** to be called a w
 
 ## Cycles
 
+### `apr30` C2 — **MLP head + LR=1e-3 → val=0.8561**, gap to simple_v2 just −0.0033
+
+`MLP_HEAD=1 MLP_HEAD_DROPOUT=0.1 LR=1e-3 GRAD_CLIP=1.0 PROJ_INIT_MODE=xavier USE_GENOME+GENRE+YEAR=1 MAX_EPOCHS=20` on M1 stack.
+
+**Result: val_auc=0.8561 at epoch 19** (peak). Smooth monotonic climb throughout — NO spikes, grad_norm steady at 0.08-0.23, still gaining +0.0002/epoch at the end (model not converged).
+
+| epoch | C1 (no MLP) | C2 (MLP) | Δ |
+|---|---|---|---|
+| 0 | 0.776 | 0.827 | +0.051 |
+| 6 | 0.844 | 0.850 | +0.006 |
+| 13 | 0.851 | 0.855 | +0.004 |
+| 19 | 0.855 | **0.856** | +0.001 |
+
+C2 lift over C1: +0.0014. Below +0.005 multi-seed threshold but consistent (smooth trajectory, no spikes, still climbing at ep 19). Decision rule applied: 0-0.005 lift → "keep, proceed to interleaving."
+
+**Cumulative apr30 progression**:
+- M0 (pure HSTU): 0.8370
+- M1 (metadata, no clip): 0.8453 (+0.008 from metadata)
+- Cycle 2 (LR=2e-3, clip, xavier): 0.8541 (+0.009 from stabilization)
+- C1 (LR=1e-3): 0.8547 (+0.001 from LR step)
+- **C2 (MLP head): 0.8561** (+0.001 from MLP head)
+- vs simple_v2 0.8594: gap **−0.0033** (was −0.022 at HSTU baseline)
+
+C2 still climbing at ep 19 → extending to 30 epochs OR multi-seed verify (next decision).
+
 ### `apr30` C1 — LR=1e-3 marginal lift, much cleaner training (**val=0.8547**)
 
 `LR=1e-3 GRAD_CLIP=1.0 PROJ_INIT_MODE=xavier USE_GENOME+GENRE+YEAR=1 MAX_EPOCHS=20` on M1 stack.
