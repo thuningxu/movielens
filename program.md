@@ -14,6 +14,40 @@ Any HSTU cycle is measured against **val 0.8594 / test 0.8455** to be called a w
 
 ## Cycles
 
+### `apr30` metadata-1 — content features lift **+0.008 (M1: genome+genre+year)** but training spikes at epoch 5
+
+**Pre-spike peak win, post-spike instability** (`ab4bdda`). 3-cell sweep at 4L/64D, LR=5e-3, MAX_EPOCHS=15, SEED=42:
+
+| Cell | Flags | val_auc (best_val_auc) | params |
+|---|---|---|---|
+| M0 control | none | 0.837035 | 3.86M |
+| M2 | USE_GENOME=1 | 0.837405 | 3.94M |
+| **M1** | **GENOME+GENRE+YEAR** | **0.845293** | 3.95M |
+
+Per-epoch comparison up to the spike:
+
+| epoch | M0 | M2 | M1 | M1−M0 |
+|---|---|---|---|---|
+| 0 | 0.794 | 0.812 | 0.812 | +0.018 |
+| 1 | 0.811 | 0.826 | 0.831 | +0.020 |
+| 2 | 0.819 | 0.833 | 0.840 | +0.021 |
+| 3 | 0.822 | 0.837 | 0.842 | +0.020 |
+| 4 | 0.824 | **0.8374** | **0.8453** | **+0.021** |
+| 5 | 0.828 | 0.784 (spike) | 0.786 (spike) | -0.042 |
+
+**Reproducible training instability** at epoch 5: train_loss in M2 jumped 0.516→7.38 and in M1 jumped 0.515→7.21 (~14× spike). Same epoch, similar magnitude — clearly an LR=5e-3 + content-feature interaction, not random. Post-spike both cells slowly recover but never re-reach the pre-spike peak.
+
+The reported best_val_auc captures the pre-spike peak: **M1=0.8453 (+0.008 over M0).**
+
+**Findings**:
+- Content metadata genuinely lifts HSTU. M1's +0.008 over M0 (already +0.0083 over the prior 0.8367 LR=5e-3 baseline) closes ~36% of the remaining gap to simple_v2's 0.8594.
+- Genre+year add orthogonal signal on top of genome (M1=0.8453 vs M2=0.8374 = +0.008). Genome covers only 23.4% of movies (long tail has zero rows); cheap genre+year cover all movies.
+- LR=5e-3 is too aggressive for the metadata-enabled regime. Need stabilization (lower LR / gradient clipping / warmup) to preserve the lift over a full stable run.
+
+**Next cycle**: stabilize the M1 config to lock in the +0.008 lift and explore whether a stable run reaches significantly higher than 0.8453.
+
+vs simple_v2 0.8594: gap shrunk from -0.022 to **-0.014**.
+
 ### `apr30` Bug #1 fix + LR=5e-3 / 15-epoch cell — **+0.015 lift, asymptote confirmed at this config**
 
 **Below bar but trajectory clear** (`3ea5c1b`). Bug #1 fix (movieId +1 shift to avoid PAD/movieId-0 collision in `nn.Embedding(..., padding_idx=0)`) + Critic's path: LR=5e-3, MAX_EPOCHS=15, ml-25m SEED=42. Bug #2 (cold-user fallback) intentionally skipped — refined impact estimate ~0.001 AUC, sub-noise.
