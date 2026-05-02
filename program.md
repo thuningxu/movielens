@@ -14,6 +14,24 @@ Any HSTU cycle is measured against **val 0.8594 / test 0.8455** to be called a w
 
 ## Cycles
 
+### `apr30` C1 — LR=1e-3 marginal lift, much cleaner training (**val=0.8547**)
+
+`LR=1e-3 GRAD_CLIP=1.0 PROJ_INIT_MODE=xavier USE_GENOME+GENRE+YEAR=1 MAX_EPOCHS=20` on M1 stack.
+
+**Result: val_auc=0.8547 at epoch 18** (peak). +0.0006 over Cycle 2 (0.8541) — within seed-σ, NOT multi-seed-verifiable on its own. But the trajectory is qualitatively cleaner: NO major spikes (grad_norm stayed <1.0 in late epochs vs Cycle 2's 1.2-2.6 mild spikes).
+
+| metric | C1 (LR=1e-3) | Cycle 2 (LR=2e-3) |
+|---|---|---|
+| Final val_auc | 0.8547 | 0.8541 |
+| Late epochs grad_norm | 0.17 | 0.13-2.6 (with mild spikes) |
+| Visible spikes | 0 | 3 mild (eps 7, 12, 15) |
+
+C1 caught up to Cycle 2 around epoch 13 then slightly exceeded it in late epochs. This validates the **LR=1e-3 + clip + xavier + metadata stack** as the new operational baseline — same/better AUC, qualitatively cleaner training.
+
+**Decision rule applied** (per team converge): lift in [0, 0.005) → keep, proceed to C2. C2 (MLP head) will run at LR=1e-3.
+
+vs simple_v2 0.8594: gap **−0.0047** (was −0.0053 at Cycle 2).
+
 ### `apr30` SEED=43 verify — **Cycle 2 reproduces (val=0.8531)**
 
 First reproducibility check on Cycle 2's winning config (`LR=2e-3 GRAD_CLIP=1.0 PROJ_INIT_MODE=xavier USE_GENOME+GENRE+YEAR=1 MAX_EPOCHS=20`).
