@@ -14,6 +14,27 @@ Any HSTU cycle is measured against **val 0.8594 / test 0.8455** to be called a w
 
 ## Cycles
 
+### `apr30` S3 — extend S2 to 25 epochs: **0.8481 peak (+0.0014 over S2)**, but ep 20-25 mean = 0.844 (below multi-seed threshold)
+
+S2 stack (USE_GENOME+GENRE+YEAR=1, GRAD_CLIP=1.0, PROJ_INIT_MODE=xavier, LR=5e-3) extended to MAX_EPOCHS=25. Tests the asymptote-vs-blocked-by-spikes hypothesis.
+
+| epoch | val_auc | event |
+|---|---|---|
+| 14 | 0.810 | spike |
+| 17 | 0.848 | new peak |
+| 18 | 0.829 | spike |
+| 20 | **0.8481** | peak |
+| 21 | 0.834 | spike |
+| 24 | 0.841 | spike (final epoch) |
+
+Late-trajectory mean ep 20-24: 0.8435. Well below the 0.852 multi-seed threshold.
+
+Spike pattern continues throughout — not an early-training phenomenon. The model breaks through the spike ceiling slowly: S2 ep 14 = 0.8467, S3 ep 20 = 0.8481 (+0.0014 over 6 more epochs). Net: extension adds ~+0.0001/epoch on average — confirms Critic's "metastable around asymptote" interpretation is dominant, with a slow climb component the Researcher correctly identified.
+
+**Decision per team rule**: ep 20-25 mean < 0.852 → "asymptote confirmed; try LR=2e-3 once before pivoting to interleaving."
+
+Next cycle: Cycle 2 — LR=2e-3 + xavier + clip 1.0 at MAX_EPOCHS=20. Tests if lower LR cures the spike instability orthogonally.
+
 ### `apr30` stabilization S1+S2 — clip 1.0 catches but doesn't prevent recurring spikes; **+0.0014 over M1 sub-noise**
 
 **Stabilization sweep, sub-noise lift** (`a768f4d`). 2-cell sweep of M1 stack with `GRAD_CLIP=1.0`:
