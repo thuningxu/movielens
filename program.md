@@ -14,6 +14,33 @@ Any HSTU cycle is measured against **val 0.8594 / test 0.8455** to be called a w
 
 ## Cycles
 
+### `apr30` Cycle 2 — **LR=2e-3 wins: 0.8541 single-seed (+0.0088 over M1, +0.006 over S3)**
+
+`LR=2e-3 GRAD_CLIP=1.0 PROJ_INIT_MODE=xavier USE_GENOME=1 USE_GENRE=1 USE_YEAR=1 MAX_EPOCHS=20` on M1 metadata stack.
+
+**Key result: val_auc = 0.8541 at epoch 18 (peak)**, ep 19 = 0.8536. Trajectory was monotonically climbing with only mild residual spikes (grad_norm 1.19-2.64 at eps 7, 12, 15 — vs S3's 6-15 spikes). Recovery within 1 epoch.
+
+| epoch | val_auc | grad_norm |
+|---|---|---|
+| 5 | 0.8470 | 0.19 |
+| 9 | 0.8502 | 0.15 (crosses 0.85) |
+| 11 | 0.8519 | 0.15 |
+| 14 | 0.8526 | 0.14 |
+| 16 | 0.8535 | 0.12 |
+| 18 | **0.8541** | 0.13 |
+
+**Lift vs prior best HSTU configs:**
+- vs S3 extended (0.8481): +0.0060
+- vs S2 stabilized (0.8467): +0.0074
+- vs M1 spike-locked (0.8453): **+0.0088**
+- vs HSTU baseline M0 (0.8370): +0.017
+
+**Diagnosis confirmed**: Critic's "LR=5e-3 too aggressive once metadata raises curvature" hypothesis is validated. Lower LR+clip+xavier preserves the metadata signal AND eliminates most of the spike-driven training loss. Spikes still occur but are 5-10× milder and recover in one epoch instead of permanently damaging the model.
+
+**vs simple_v2 0.8594: gap -0.0053** (was -0.022 at HSTU baseline).
+
+**Multi-seed verification authorized**: lift +0.0088 over M1 clears the +0.005 threshold cleanly. Next cycle: 4-seed verify (SEEDs 43, 44, 45, 46) at the same config to confirm reproducibility.
+
 ### `apr30` S3 — extend S2 to 25 epochs: **0.8481 peak (+0.0014 over S2)**, but ep 20-25 mean = 0.844 (below multi-seed threshold)
 
 S2 stack (USE_GENOME+GENRE+YEAR=1, GRAD_CLIP=1.0, PROJ_INIT_MODE=xavier, LR=5e-3) extended to MAX_EPOCHS=25. Tests the asymptote-vs-blocked-by-spikes hypothesis.
