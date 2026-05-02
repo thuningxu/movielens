@@ -14,6 +14,22 @@ Any HSTU cycle is measured against **val 0.8594 / test 0.8455** to be called a w
 
 ## Cycles
 
+### `apr30` SEED=43 verify — **Cycle 2 reproduces (val=0.8531)**
+
+First reproducibility check on Cycle 2's winning config (`LR=2e-3 GRAD_CLIP=1.0 PROJ_INIT_MODE=xavier USE_GENOME+GENRE+YEAR=1 MAX_EPOCHS=20`).
+
+| Seed | val_auc | Best epoch |
+|---|---|---|
+| 42 (Cycle 2) | 0.8541 | ep 18 |
+| 43 (verify) | 0.8531 | ep 19 |
+| **2-seed mean** | **0.8536** | |
+
+Inter-seed diff: 0.0010 (within seed-σ ~0.003). Win reproduces cleanly.
+
+Multi-seed lift over M1 (0.8453): +0.0083 (clears +0.005 threshold).
+
+Notable: SEED=43 had an unusual epoch-16 val drop (0.8522 → 0.7258) with only mild grad_norm=0.74 — a different failure mode than the LR=5e-3 spikes, and recovered in one epoch. Suggests there's a residual instability mechanism even at LR=2e-3 that doesn't show in train_loss / grad_norm but transiently degrades the model's eval representation. Worth investigating later.
+
 ### `apr30` Cycle 2 — **LR=2e-3 wins: 0.8541 single-seed (+0.0088 over M1, +0.006 over S3)**
 
 `LR=2e-3 GRAD_CLIP=1.0 PROJ_INIT_MODE=xavier USE_GENOME=1 USE_GENRE=1 USE_YEAR=1 MAX_EPOCHS=20` on M1 metadata stack.
