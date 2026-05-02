@@ -92,6 +92,21 @@ PROJ_INIT_MODE = os.environ.get("PROJ_INIT_MODE", "zero")
 if PROJ_INIT_MODE not in {"zero", "xavier"}:
     raise ValueError(f"PROJ_INIT_MODE must be 'zero' or 'xavier', got {PROJ_INIT_MODE!r}")
 
+# MLP head on h_t (apr30, Critic Round 1 pick). Default OFF (off-state
+# byte-equivalent to commit 8368ebb). When MLP_HEAD=1, h_t is projected
+# through a 2-layer MLP (D → 2D → D) before the dot product against the
+# candidate item embedding, allowing non-linear interactions between the
+# contextualized user state and content features. The head_mlp module is
+# constructed only when MLP_HEAD=1 so OFF-state RNG is preserved exactly.
+# Init: standard PyTorch defaults (Kaiming-uniform on Linear weights). We
+# do NOT zero-init the final layer because the MLP REPLACES h_t (no
+# residual), so a zero output would collapse all logits to zero and val_auc
+# to 0.5 at step 0. With Kaiming init the MLP starts as a non-trivial
+# function of h_t — the model loses byte-equivalence on ON path but begins
+# learning immediately. Param cost at D=64: 2*D*D + 2D + D*2D + D = 16,576.
+MLP_HEAD = int(os.environ.get("MLP_HEAD", "0"))
+MLP_HEAD_DROPOUT = float(os.environ.get("MLP_HEAD_DROPOUT", "0.1"))
+
 # Year embedding bucket scheme. ml-25m titles span 1874..2019; ml-100k spans
 # 1922..1998. Coverage 1850..2049 = 200 buckets handles all observed datasets
 # with safety margin and costs ~12 KB at D=64. year_id = clip(year - YEAR_MIN,
@@ -587,6 +602,20 @@ class HSTU(nn.Module):
             self.year_embed = nn.Embedding(NUM_YEAR_BUCKETS, EMBED_DIM)
             _init_proj(self.year_embed.weight)
 
+        # MLP head on h_t. Constructed ONLY when MLP_HEAD=1 so OFF-state RNG
+        # state is byte-identical to commit 8368ebb (the dropout, dense, and
+        # init RNG draws would all shift if we built this module unconditionally).
+        # Default PyTorch init (Kaiming-uniform) is intentional: see MLP_HEAD
+        # config-comment for why zero-init would be wrong here.
+        self.use_mlp_head = bool(MLP_HEAD)
+        if self.use_mlp_head:
+            self.head_mlp = nn.Sequential(
+                nn.Linear(EMBED_DIM, 2 * EMBED_DIM),
+                nn.GELU(),
+                nn.Dropout(MLP_HEAD_DROPOUT),
+                nn.Linear(2 * EMBED_DIM, EMBED_DIM),
+            )
+
     def item_full_embed(self, item_ids: torch.Tensor) -> torch.Tensor:
         """Symmetric per-position item-side embedding used for both sequence
         input AND candidate scoring. Same construction in both spots is the
@@ -620,8 +649,23 @@ class HSTU(nn.Module):
             h = block(h, hist_mask, causal_bool, time_buckets)
         return h
 
+    def _project_head(self, h: torch.Tensor) -> torch.Tensor:
+        """Apply the MLP head to h, if enabled. OFF-state: pass-through.
+
+        When MLP_HEAD=1, replaces h with head_mlp(h) before the dot product
+        against the candidate item embedding. The MLP shape (D → 2D → D)
+        preserves the contract that scoring is dot(h_proj, item_full_embed),
+        so the rest of the scoring path is untouched. Works on any shape
+        ending in EMBED_DIM (handles both per-position (B,T,D) and last-token
+        (B,D) tensors via Sequential's broadcasting over leading dims).
+        """
+        if self.use_mlp_head:
+            return self.head_mlp(h)
+        return h
+
     def score_per_position(self, h: torch.Tensor, target_items: torch.Tensor) -> torch.Tensor:
         """Dot-product scoring at every position. h:(B,T,D), target_items:(B,T)."""
+        h = self._project_head(h)                             # (B, T, D)
         target_e = self.item_full_embed(target_items)         # (B, T, D)
         return (h * target_e).sum(dim=-1)                     # (B, T)
 
@@ -636,6 +680,7 @@ class HSTU(nn.Module):
         with the candidate embedding gives the model's cold-user prior.
         """
         last_h = h[:, -1, :]                                  # (B, D)
+        last_h = self._project_head(last_h)                   # (B, D)
         cand_e = self.item_full_embed(candidate)              # (B, D)
         return (last_h * cand_e).sum(dim=-1)                  # (B,)
 
@@ -762,7 +807,8 @@ def main():
     log.info(f"HSTU: {n_params/1e6:.2f}M params on {DEVICE}  "
              f"(layers={NUM_LAYERS}, heads={NUM_HEADS}, dim={EMBED_DIM}, "
              f"time_buckets={NUM_TIME_BUCKETS}) "
-             f"use_genome={model.use_genome} use_genre={model.use_genre} use_year={model.use_year}")
+             f"use_genome={model.use_genome} use_genre={model.use_genre} use_year={model.use_year} "
+             f"use_mlp_head={model.use_mlp_head}")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
