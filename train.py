@@ -28,6 +28,7 @@ import os
 import re
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -156,6 +157,19 @@ assert LR_SCHEDULE in {"constant", "cosine_warmup"}, f"unknown LR_SCHEDULE={LR_S
 WARMUP_STEPS = int(os.environ.get("WARMUP_STEPS", "500"))
 OPTIMIZER = os.environ.get("OPTIMIZER", "adam")
 assert OPTIMIZER in {"adam", "adamw"}, f"unknown OPTIMIZER={OPTIMIZER}"
+
+# Mixed-precision flag (apr30). Default OFF for byte-equivalence with the prior
+# baseline. When USE_BF16=1 the forward pass and loss computation in both
+# train_one_epoch and evaluate_model run inside torch.amp.autocast with
+# dtype=bfloat16 on CUDA; optimizer keeps fp32 master weights (PyTorch AMP
+# standard — no GradScaler needed for bf16, whose dynamic range matches fp32).
+# OFF state uses contextlib.nullcontext, a no-op CM that doesn't touch dtype
+# or RNG, so val_auc is byte-identical to commit 765596c. Bf16 path may differ
+# by <0.005 due to reduced mantissa precision in matmul accumulators; that's
+# the standard accuracy/throughput tradeoff and should not affect AUC at our
+# scale. Only meaningful on CUDA — on CPU/MPS the autocast is a no-op for the
+# bf16 dtype, so the flag silently degrades to fp32.
+USE_BF16 = int(os.environ.get("USE_BF16", "0"))
 
 # Year embedding bucket scheme. ml-25m titles span 1874..2019; ml-100k spans
 # 1922..1998. Coverage 1850..2049 = 200 buckets handles all observed datasets
@@ -1052,6 +1066,10 @@ def train_one_epoch(model, loader, optimizer, scheduler=None):
     grad_norm_sum = 0.0
     grad_norm_count = 0
     bce = nn.BCEWithLogitsLoss(reduction="none")
+    autocast_ctx = (
+        torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if (USE_BF16 and DEVICE == "cuda") else nullcontext()
+    )
     for batch in loader:
         if INTERLEAVE:
             content_ids = batch["content_ids"].to(DEVICE)        # (B, 2N)
@@ -1061,23 +1079,24 @@ def train_one_epoch(model, loader, optimizer, scheduler=None):
             is_content = batch["is_content"].to(DEVICE)          # (B, 2N) bool
             content_rb = batch["content_rating_bucket"].to(DEVICE)  # (B, 2N)
 
-            h = model.encode_interleaved(content_ids, action_ids,
-                                         ts_2n, mask_2n, is_content)  # (B, 2N, D)
+            with autocast_ctx:
+                h = model.encode_interleaved(content_ids, action_ids,
+                                             ts_2n, mask_2n, is_content)  # (B, 2N, D)
 
-            # Per-content-position scoring:
-            #   At even position 2i (content c_i), score h_{2i} against
-            #   item_full_embed(c_i). Target = engaged(rating_bucket_i).
-            # The dot product is "the user's hidden state at the content
-            # slot agrees with this item's embedding when they engaged."
-            logits = model.score_per_position(h, content_ids)    # (B, 2N)
-            targets = (content_rb >= ENGAGED_BUCKET_THRESHOLD).float()
-            # Loss mask: only at valid CONTENT positions. Action positions
-            # contribute 0; pad pairs (mask_2n=0) contribute 0.
-            loss_mask = mask_2n * is_content.float()
-            loss_per = bce(logits, targets)                      # (B, 2N)
-            masked = loss_per * loss_mask
-            n_valid = loss_mask.sum().clamp(min=1.0)
-            loss = masked.sum() / n_valid
+                # Per-content-position scoring:
+                #   At even position 2i (content c_i), score h_{2i} against
+                #   item_full_embed(c_i). Target = engaged(rating_bucket_i).
+                # The dot product is "the user's hidden state at the content
+                # slot agrees with this item's embedding when they engaged."
+                logits = model.score_per_position(h, content_ids)    # (B, 2N)
+                targets = (content_rb >= ENGAGED_BUCKET_THRESHOLD).float()
+                # Loss mask: only at valid CONTENT positions. Action positions
+                # contribute 0; pad pairs (mask_2n=0) contribute 0.
+                loss_mask = mask_2n * is_content.float()
+                loss_per = bce(logits, targets)                      # (B, 2N)
+                masked = loss_per * loss_mask
+                n_valid = loss_mask.sum().clamp(min=1.0)
+                loss = masked.sum() / n_valid
             n_positions = int(loss_mask.sum().item())
         else:
             hist_items = batch["hist_items"].to(DEVICE)         # (B, T)
@@ -1085,24 +1104,25 @@ def train_one_epoch(model, loader, optimizer, scheduler=None):
             hist_ts = batch["hist_ts"].to(DEVICE)               # (B, T)
             hist_mask = batch["hist_mask"].to(DEVICE)           # (B, T)
 
-            h = model.encode(hist_items, hist_ratings, hist_ts, hist_mask)  # (B, T, D)
+            with autocast_ctx:
+                h = model.encode(hist_items, hist_ratings, hist_ts, hist_mask)  # (B, T, D)
 
-            # Per-position next-event prediction:
-            #   At position t (0..T-2), score h_t against item_embed(events[t+1])
-            #   target = engagement bucket of events[t+1] (rating >= 4 → 1)
-            # h, items, ratings, mask are all aligned over T positions.
-            h_in = h[:, :-1, :]                                 # (B, T-1, D)
-            next_items = hist_items[:, 1:]                      # (B, T-1)
-            next_ratings = hist_ratings[:, 1:]                  # (B, T-1)
-            # valid position = both current AND next event are real (not pad)
-            pair_mask = hist_mask[:, :-1] * hist_mask[:, 1:]    # (B, T-1)
+                # Per-position next-event prediction:
+                #   At position t (0..T-2), score h_t against item_embed(events[t+1])
+                #   target = engagement bucket of events[t+1] (rating >= 4 → 1)
+                # h, items, ratings, mask are all aligned over T positions.
+                h_in = h[:, :-1, :]                                 # (B, T-1, D)
+                next_items = hist_items[:, 1:]                      # (B, T-1)
+                next_ratings = hist_ratings[:, 1:]                  # (B, T-1)
+                # valid position = both current AND next event are real (not pad)
+                pair_mask = hist_mask[:, :-1] * hist_mask[:, 1:]    # (B, T-1)
 
-            logits = model.score_per_position(h_in, next_items)  # (B, T-1)
-            targets = (next_ratings >= ENGAGED_BUCKET_THRESHOLD).float()
-            loss_per = bce(logits, targets)                     # (B, T-1)
-            masked = loss_per * pair_mask
-            n_valid = pair_mask.sum().clamp(min=1.0)
-            loss = masked.sum() / n_valid
+                logits = model.score_per_position(h_in, next_items)  # (B, T-1)
+                targets = (next_ratings >= ENGAGED_BUCKET_THRESHOLD).float()
+                loss_per = bce(logits, targets)                     # (B, T-1)
+                masked = loss_per * pair_mask
+                n_valid = pair_mask.sum().clamp(min=1.0)
+                loss = masked.sum() / n_valid
             n_positions = int(pair_mask.sum().item())
 
         optimizer.zero_grad()
@@ -1135,6 +1155,10 @@ def evaluate_model(model, loader):
     """
     model.eval()
     all_scores, all_labels = [], []
+    autocast_ctx = (
+        torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if (USE_BF16 and DEVICE == "cuda") else nullcontext()
+    )
     for batch in loader:
         cand = batch["mid"].to(DEVICE)
         label = batch["label"]
@@ -1145,21 +1169,26 @@ def evaluate_model(model, loader):
             mask_2n = batch["mask_2n"].to(DEVICE)
             is_content = batch["is_content"].to(DEVICE)
             target_ts = batch["target_ts"].to(DEVICE)
-            last_h = model.encode_interleaved_with_candidate(
-                content_ids, action_ids, ts_2n, mask_2n, is_content,
-                cand, target_ts,
-            )                                                    # (B, D)
-            last_h = model._project_head(last_h)
-            cand_e = model.item_full_embed(cand)                 # (B, D)
-            logit = (last_h * cand_e).sum(dim=-1)                # (B,)
+            with autocast_ctx:
+                last_h = model.encode_interleaved_with_candidate(
+                    content_ids, action_ids, ts_2n, mask_2n, is_content,
+                    cand, target_ts,
+                )                                                    # (B, D)
+                last_h = model._project_head(last_h)
+                cand_e = model.item_full_embed(cand)                 # (B, D)
+                logit = (last_h * cand_e).sum(dim=-1)                # (B,)
         else:
             hist_items = batch["hist_items"].to(DEVICE)
             hist_ratings = batch["hist_ratings"].to(DEVICE)
             hist_ts = batch["hist_ts"].to(DEVICE)
             hist_mask = batch["hist_mask"].to(DEVICE)
-            h = model.encode(hist_items, hist_ratings, hist_ts, hist_mask)
-            logit = model.score_eval(h, hist_mask, cand)
-        all_scores.append(torch.sigmoid(logit).detach().cpu().numpy())
+            with autocast_ctx:
+                h = model.encode(hist_items, hist_ratings, hist_ts, hist_mask)
+                logit = model.score_eval(h, hist_mask, cand)
+        # Cast to fp32 for sigmoid + AUC accumulation. Outside autocast scope
+        # bf16 tensors are returned as-is; .float() makes the numpy conversion
+        # match the fp32 path bit-equivalent. (No-op when autocast is null.)
+        all_scores.append(torch.sigmoid(logit.float()).detach().cpu().numpy())
         all_labels.append(label.numpy())
     scores = np.concatenate(all_scores)
     labels = np.concatenate(all_labels)
@@ -1219,7 +1248,8 @@ def main():
     scheduler = build_scheduler(optimizer, LR, LR_SCHEDULE, WARMUP_STEPS, total_steps)
     log.info(f"  optimizer={OPTIMIZER}  lr_schedule={LR_SCHEDULE}  "
              f"warmup_steps={WARMUP_STEPS}  total_steps={total_steps}  "
-             f"start_lr={optimizer.param_groups[0]['lr']:.2e}")
+             f"start_lr={optimizer.param_groups[0]['lr']:.2e}  "
+             f"use_bf16={bool(USE_BF16)}")
 
     best_val_auc = 0.0
     for epoch in range(MAX_EPOCHS):
