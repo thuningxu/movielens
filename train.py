@@ -107,6 +107,36 @@ if PROJ_INIT_MODE not in {"zero", "xavier"}:
 MLP_HEAD = int(os.environ.get("MLP_HEAD", "0"))
 MLP_HEAD_DROPOUT = float(os.environ.get("MLP_HEAD_DROPOUT", "0.1"))
 
+# Interleaving flag (apr30, post-1edb678). When 0 (default) sequence is the
+# fused (item+rating) representation: each event = one position, x_t =
+# item_full_embed(m_t) + rating_embed(rating_bucket_t). Byte-identical to
+# the prior baseline.
+#
+# When 1, switch to the paper-canonical interleaved representation per Meta
+# 2024 §3: each event becomes a (content, action) PAIR of tokens, so a
+# user's sequence of N events materializes as 2N positions:
+#     [c_0, a_0, c_1, a_1, ..., c_{N-1}, a_{N-1}]
+# where c_i is item-side (movieId-derived; metadata applied via
+# item_full_embed) and a_i is action-side (rating_bucket-derived; pure
+# learned embedding, no metadata since metadata is per-item not
+# per-rating-bucket).
+#
+# At training, BCE loss is applied at every CONTENT position 2i: the model
+# scores h_{2i} against item_full_embed(c_i) and is supervised by
+# is_engaged(rating_bucket_i). At eval, a candidate is appended as a
+# content token at position 2N, the model produces h_{2N}, and we score
+# dot(h_{2N}, item_full_embed(candidate)).
+#
+# OFF→ON is NOT byte-equivalent: a new action_embed table is constructed
+# only when INTERLEAVE=1 (so OFF-state RNG state is preserved exactly),
+# and the sequence layout differs entirely. Documented as such; this is
+# an architecture-level switch, not a regularization knob.
+#
+# SEQ_LEN keeps EVENT semantics in both regimes. INTERLEAVE=1 internally
+# allocates 2*SEQ_LEN tokens per sequence so a sweep at SEQ_LEN=100
+# matches the compute footprint of the SEQ_LEN=200 fused baseline.
+INTERLEAVE = int(os.environ.get("INTERLEAVE", "0"))
+
 # LR schedule + optimizer flags (apr30). Both default to OFF state matching
 # the prior baseline byte-for-byte: LR_SCHEDULE="constant" and OPTIMIZER="adam"
 # build the same plain `Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)`
@@ -309,6 +339,60 @@ def _pad_left(items: np.ndarray, ratings: np.ndarray, timestamps: np.ndarray, se
     return out_items, out_ratings, out_timestamps, out_mask
 
 
+def _build_interleaved(items: np.ndarray, ratings: np.ndarray, timestamps: np.ndarray,
+                       mask: np.ndarray, seq_len_events: int):
+    """Convert per-event arrays of length seq_len_events into the interleaved
+    2N-token layout [c_0, a_0, c_1, a_1, ..., c_{N-1}, a_{N-1}].
+
+    Returns six (2N,) numpy arrays:
+      content_ids:  +1-shifted movieId at content positions (2i), 0 elsewhere.
+      action_ids:   +1-shifted rating_bucket at action positions (2i+1), 0 elsewhere.
+                    Index 0 is PAD; ratings 0.5..5.0 → buckets 0..9 → action_ids 1..10.
+      ts_2n:        per-position timestamp, with c_i and a_i sharing event i's ts.
+      mask_2n:      per-position validity (1.0 at real positions, 0.0 at pad).
+                    A pair (c_i, a_i) is either both valid or both pad — pairs
+                    are padded as units from the left.
+      is_content:   bool, True at even positions (content), False at odd (action).
+      content_rating_bucket: per-position UN-SHIFTED rating bucket aligned to
+                             content positions (so [2i] holds rating_bucket_i).
+                             Used by training to compute the engaged target.
+                             Zeros at action positions and pad (harmless — those
+                             positions are masked out of loss).
+
+    The +1 shift on action_ids parallels the movieId shift: PAD index = 0,
+    real rating buckets occupy 1..NUM_RATING_BUCKETS so action_embed's
+    padding_idx=0 row is never gradient-updated by real events.
+    """
+    N = seq_len_events
+    L = 2 * N
+    content_ids = np.zeros(L, dtype=np.int64)
+    action_ids = np.zeros(L, dtype=np.int64)
+    ts_2n = np.zeros(L, dtype=np.int64)
+    mask_2n = np.zeros(L, dtype=np.float32)
+    content_rating_bucket = np.zeros(L, dtype=np.int64)
+    # Even indices = content, odd = action.
+    is_content = np.zeros(L, dtype=bool)
+    is_content[0::2] = True
+    # Place per-event values into the (c_i, a_i) pair.
+    content_ids[0::2] = items                              # already +1-shifted
+    action_ids[1::2] = ratings + 1                          # +1 shift; PAD slot = 0
+    # Action_ids at content positions stay 0 (PAD), and content_ids at action
+    # positions stay 0 (PAD); the embedding lookup never overlaps.
+    # If the original event was pad (mask=0), force action_ids/content_ids to 0
+    # so neither real-row gradients flow through PAD slots. Easy: action_ids
+    # already gets +1, but if mask[i] == 0 we want action_ids[2i+1] == 0.
+    pad_event = mask == 0
+    if pad_event.any():
+        action_ids[1::2] = np.where(pad_event, 0, action_ids[1::2])
+        content_ids[0::2] = np.where(pad_event, 0, content_ids[0::2])
+    ts_2n[0::2] = timestamps
+    ts_2n[1::2] = timestamps                                # pair shares one ts
+    mask_2n[0::2] = mask
+    mask_2n[1::2] = mask                                    # pair valid/pad together
+    content_rating_bucket[0::2] = ratings
+    return content_ids, action_ids, ts_2n, mask_2n, is_content, content_rating_bucket
+
+
 class SequenceTrainDataset(Dataset):
     """One sample = one user's full event sequence (truncated to last SEQ_LEN
     if longer). Per-position causal training: at every valid position t, the
@@ -332,13 +416,23 @@ class SequenceTrainDataset(Dataset):
         ratings = events[:, 1]
         timestamps = events[:, 2]
         items, ratings, timestamps, mask = _pad_left(items, ratings, timestamps, self.seq_len)
-        return {
+        out = {
             "uid": uid,
             "hist_items": items,
             "hist_ratings": ratings,
             "hist_ts": timestamps,
             "hist_mask": mask,
         }
+        if INTERLEAVE:
+            content_ids, action_ids, ts_2n, mask_2n, is_content, content_rb = \
+                _build_interleaved(items, ratings, timestamps, mask, self.seq_len)
+            out["content_ids"] = content_ids
+            out["action_ids"] = action_ids
+            out["ts_2n"] = ts_2n
+            out["mask_2n"] = mask_2n
+            out["is_content"] = is_content
+            out["content_rating_bucket"] = content_rb
+        return out
 
 
 class EvalDataset(Dataset):
@@ -376,7 +470,7 @@ class EvalDataset(Dataset):
             items, ratings, timestamps, mask = _pad_left(
                 window[:, 0], window[:, 1], window[:, 2], self.seq_len,
             )
-        return {
+        out = {
             "uid": uid,
             "mid": int(self.mid[idx]),
             "label": float(self.lbl[idx]),
@@ -385,20 +479,44 @@ class EvalDataset(Dataset):
             "hist_ts": timestamps,
             "hist_mask": mask,
         }
+        if INTERLEAVE:
+            content_ids, action_ids, ts_2n, mask_2n, is_content, content_rb = \
+                _build_interleaved(items, ratings, timestamps, mask, self.seq_len)
+            # Eval-time: also pass the candidate ts so the model can append the
+            # candidate as a content token at position 2N with its own ts (used
+            # for the time-delta bias against the prefix).
+            out["content_ids"] = content_ids
+            out["action_ids"] = action_ids
+            out["ts_2n"] = ts_2n
+            out["mask_2n"] = mask_2n
+            out["is_content"] = is_content
+            out["content_rating_bucket"] = content_rb
+            out["target_ts"] = ts
+        return out
 
 
 def collate_train(batch):
-    return {
+    out = {
         "uid": [b["uid"] for b in batch],
         "hist_items": torch.tensor(np.stack([b["hist_items"] for b in batch])),
         "hist_ratings": torch.tensor(np.stack([b["hist_ratings"] for b in batch])),
         "hist_ts": torch.tensor(np.stack([b["hist_ts"] for b in batch])),
         "hist_mask": torch.tensor(np.stack([b["hist_mask"] for b in batch])),
     }
+    if INTERLEAVE:
+        out["content_ids"] = torch.tensor(np.stack([b["content_ids"] for b in batch]))
+        out["action_ids"] = torch.tensor(np.stack([b["action_ids"] for b in batch]))
+        out["ts_2n"] = torch.tensor(np.stack([b["ts_2n"] for b in batch]))
+        out["mask_2n"] = torch.tensor(np.stack([b["mask_2n"] for b in batch]))
+        out["is_content"] = torch.tensor(np.stack([b["is_content"] for b in batch]))
+        out["content_rating_bucket"] = torch.tensor(
+            np.stack([b["content_rating_bucket"] for b in batch]),
+        )
+    return out
 
 
 def collate_eval(batch):
-    return {
+    out = {
         "uid": [b["uid"] for b in batch],
         "mid": torch.tensor([b["mid"] for b in batch], dtype=torch.long),
         "label": torch.tensor([b["label"] for b in batch], dtype=torch.float32),
@@ -407,6 +525,14 @@ def collate_eval(batch):
         "hist_ts": torch.tensor(np.stack([b["hist_ts"] for b in batch])),
         "hist_mask": torch.tensor(np.stack([b["hist_mask"] for b in batch])),
     }
+    if INTERLEAVE:
+        out["content_ids"] = torch.tensor(np.stack([b["content_ids"] for b in batch]))
+        out["action_ids"] = torch.tensor(np.stack([b["action_ids"] for b in batch]))
+        out["ts_2n"] = torch.tensor(np.stack([b["ts_2n"] for b in batch]))
+        out["mask_2n"] = torch.tensor(np.stack([b["mask_2n"] for b in batch]))
+        out["is_content"] = torch.tensor(np.stack([b["is_content"] for b in batch]))
+        out["target_ts"] = torch.tensor([b["target_ts"] for b in batch], dtype=torch.long)
+    return out
 
 
 # ─── Model ──────────────────────────────────────────────────────────
@@ -591,6 +717,19 @@ class HSTU(nn.Module):
         # standard for sequence recommenders and halves head params.
         # TODO: action-type embedding (binary engaged vs implicit) once we add easy negs to history
 
+        # INTERLEAVE=1: separate action_embed table for the action tokens
+        # interleaved between content tokens. Constructed ONLY when
+        # INTERLEAVE=1 so the OFF-state RNG state is preserved exactly
+        # (PyTorch consumes RNG draws on Embedding.__init__ for the default
+        # normal init; building this unconditionally would shift every
+        # subsequent random tensor — including any module built after it).
+        # Index 0 is PAD; rating buckets 0..NUM_RATING_BUCKETS-1 occupy
+        # indices 1..NUM_RATING_BUCKETS, parallel to the movieId +1 shift.
+        self.use_interleave = bool(INTERLEAVE)
+        if self.use_interleave:
+            self.action_embed = nn.Embedding(num_rating_buckets + 1, EMBED_DIM,
+                                             padding_idx=0)
+
         # Cold-start content metadata buffers and projections. Buffers are
         # registered (not parameters) — only the projections train.
         self.register_buffer("genome_table", genome, persistent=False)
@@ -668,6 +807,108 @@ class HSTU(nn.Module):
         for block in self.blocks:
             h = block(h, hist_mask, causal_bool, time_buckets)
         return h
+
+    def encode_interleaved(self, content_ids: torch.Tensor, action_ids: torch.Tensor,
+                           ts_2n: torch.Tensor, mask_2n: torch.Tensor,
+                           is_content: torch.Tensor) -> torch.Tensor:
+        """Run the causal stack on the interleaved 2N-token sequence.
+
+        Each event materializes as (c_i, a_i): c_i is the content token (item)
+        at even position 2i, a_i is the action token (rating bucket) at odd
+        position 2i+1. Per Meta 2024 §3, this lets the model produce a hidden
+        state at every CONTENT position whose causal context is exactly the
+        prior pairs — i.e. h_{2i} sees [c_0, a_0, ..., c_{i-1}, a_{i-1}, c_i]
+        and predicts a_i.
+
+        Args:
+          content_ids: (B, 2N) int64. Even slots: +1-shifted movieId. Odd slots: 0.
+          action_ids:  (B, 2N) int64. Even slots: 0. Odd slots: +1-shifted bucket.
+          ts_2n:       (B, 2N) int64 timestamps; c_i and a_i share event i's ts.
+          mask_2n:     (B, 2N) float, 1.0 at valid positions, 0.0 at PAD.
+                       Pairs (c_i, a_i) are valid/pad together.
+          is_content:  (B, 2N) bool, True at even positions, False at odd.
+
+        Returns:
+          h: (B, 2N, D) per-position hidden states.
+
+        Embedding selection: at every position emit exactly one type of
+        embedding via torch.where on the is_content mask. Both lookups
+        operate on the full (B, 2N) tensor (with PAD=0 at the
+        non-applicable positions, which the padding_idx=0 rows zero out)
+        but only one is selected per position. Cleaner and more vectorized
+        than scatter; the cost is one extra (B, 2N, D) tensor materialized
+        and discarded — negligible at our scale.
+
+        Metadata only applies to CONTENT tokens (item_full_embed): metadata
+        is per-movie, not per-rating-bucket. Action tokens get pure
+        action_embed (no metadata path).
+        """
+        B, L = content_ids.shape
+        # Content embedding (with metadata) at every position; selected at
+        # even positions only. PAD (id=0) → padding_idx zeros — no
+        # contribution at action positions where content_ids = 0.
+        content_emb = self.item_full_embed(content_ids)        # (B, 2N, D)
+        action_emb = self.action_embed(action_ids)             # (B, 2N, D)
+        # torch.where picks content_emb at even (is_content=True) positions
+        # and action_emb at odd (is_content=False) positions. Broadcast the
+        # mask over the embedding-dim axis.
+        x = torch.where(is_content.unsqueeze(-1), content_emb, action_emb)
+
+        # Causal triangular mask over 2N positions. h_{2i} (content c_i) sees
+        # positions 0..2i = [c_0, a_0, ..., c_{i-1}, a_{i-1}, c_i] but NOT
+        # a_i — exactly the paper-canonical setup. Standard `i >= j` lower
+        # triangle achieves this because position 2i is index 2i and a_i
+        # lives at 2i+1 > 2i, so it's always above the diagonal.
+        causal_bool = torch.tril(torch.ones(L, L, dtype=torch.bool, device=x.device))
+        time_buckets = time_delta_buckets(ts_2n, NUM_TIME_BUCKETS)
+        for block in self.blocks:
+            x = block(x, mask_2n, causal_bool, time_buckets)
+        return x
+
+    def encode_interleaved_with_candidate(self, content_ids: torch.Tensor,
+                                          action_ids: torch.Tensor,
+                                          ts_2n: torch.Tensor, mask_2n: torch.Tensor,
+                                          is_content: torch.Tensor,
+                                          candidate: torch.Tensor,
+                                          target_ts: torch.Tensor) -> torch.Tensor:
+        """Eval-time interleaved encode: append the candidate as a content token
+        at position 2N (the new last position, after all prior 2N events) and
+        return the hidden state h at that position.
+
+        The total sequence becomes 2N+1 tokens. The candidate is placed at
+        position 2N as a content token (no paired action) so the model
+        produces h_{2N} after attending over the user's full prior history —
+        analogous to evaluating "given the user's history of paired events,
+        what's the score for engaging with this candidate?"
+
+        Returns:
+          h_last: (B, D) — the hidden state at the appended candidate position.
+        """
+        B, L = content_ids.shape
+        L1 = L + 1
+        device = content_ids.device
+        # Extend each tensor by one position. The new slot is content (is_content=True),
+        # mask=1, content_id=candidate, action_id=0, ts=target_ts.
+        new_content = torch.cat([content_ids, candidate.unsqueeze(1)], dim=1)            # (B, 2N+1)
+        new_action = torch.cat([action_ids,
+                                torch.zeros(B, 1, dtype=action_ids.dtype, device=device)],
+                               dim=1)
+        new_ts = torch.cat([ts_2n, target_ts.unsqueeze(1)], dim=1)
+        new_mask = torch.cat([mask_2n,
+                              torch.ones(B, 1, dtype=mask_2n.dtype, device=device)], dim=1)
+        new_is_content = torch.cat([is_content,
+                                    torch.ones(B, 1, dtype=torch.bool, device=device)],
+                                   dim=1)
+
+        content_emb = self.item_full_embed(new_content)        # (B, 2N+1, D)
+        action_emb = self.action_embed(new_action)             # (B, 2N+1, D)
+        x = torch.where(new_is_content.unsqueeze(-1), content_emb, action_emb)
+
+        causal_bool = torch.tril(torch.ones(L1, L1, dtype=torch.bool, device=device))
+        time_buckets = time_delta_buckets(new_ts, NUM_TIME_BUCKETS)
+        for block in self.blocks:
+            x = block(x, new_mask, causal_bool, time_buckets)
+        return x[:, -1, :]                                    # (B, D)
 
     def _project_head(self, h: torch.Tensor) -> torch.Tensor:
         """Apply the MLP head to h, if enabled. OFF-state: pass-through.
@@ -797,6 +1038,13 @@ def train_one_epoch(model, loader, optimizer, scheduler=None):
     most steps are clipped). When GRAD_CLIP == 0.0, no clip call is made and
     grad-norm is not measured (preserving byte-equivalence with the prior
     baseline; avg_grad_norm returns as None in that case).
+
+    INTERLEAVE=1 path: per-position BCE at CONTENT positions only. At
+    position 2i, the model scores h_{2i} against item_full_embed(c_i) (the
+    same item; this is the paper-canonical "content token's hidden state
+    encodes the user's response to seeing this item"), and the target is
+    is_engaged(rating_bucket_i) computed from content_rating_bucket. Action
+    positions get loss_mask = 0.
     """
     model.train()
     total_loss = 0.0
@@ -805,29 +1053,57 @@ def train_one_epoch(model, loader, optimizer, scheduler=None):
     grad_norm_count = 0
     bce = nn.BCEWithLogitsLoss(reduction="none")
     for batch in loader:
-        hist_items = batch["hist_items"].to(DEVICE)         # (B, T)
-        hist_ratings = batch["hist_ratings"].to(DEVICE)     # (B, T)
-        hist_ts = batch["hist_ts"].to(DEVICE)               # (B, T)
-        hist_mask = batch["hist_mask"].to(DEVICE)           # (B, T)
+        if INTERLEAVE:
+            content_ids = batch["content_ids"].to(DEVICE)        # (B, 2N)
+            action_ids = batch["action_ids"].to(DEVICE)          # (B, 2N)
+            ts_2n = batch["ts_2n"].to(DEVICE)                    # (B, 2N)
+            mask_2n = batch["mask_2n"].to(DEVICE)                # (B, 2N)
+            is_content = batch["is_content"].to(DEVICE)          # (B, 2N) bool
+            content_rb = batch["content_rating_bucket"].to(DEVICE)  # (B, 2N)
 
-        h = model.encode(hist_items, hist_ratings, hist_ts, hist_mask)  # (B, T, D)
+            h = model.encode_interleaved(content_ids, action_ids,
+                                         ts_2n, mask_2n, is_content)  # (B, 2N, D)
 
-        # Per-position next-event prediction:
-        #   At position t (0..T-2), score h_t against item_embed(events[t+1])
-        #   target = engagement bucket of events[t+1] (rating >= 4 → 1)
-        # h, items, ratings, mask are all aligned over T positions.
-        h_in = h[:, :-1, :]                                 # (B, T-1, D)
-        next_items = hist_items[:, 1:]                      # (B, T-1)
-        next_ratings = hist_ratings[:, 1:]                  # (B, T-1)
-        # valid position = both current AND next event are real (not pad)
-        pair_mask = hist_mask[:, :-1] * hist_mask[:, 1:]    # (B, T-1)
+            # Per-content-position scoring:
+            #   At even position 2i (content c_i), score h_{2i} against
+            #   item_full_embed(c_i). Target = engaged(rating_bucket_i).
+            # The dot product is "the user's hidden state at the content
+            # slot agrees with this item's embedding when they engaged."
+            logits = model.score_per_position(h, content_ids)    # (B, 2N)
+            targets = (content_rb >= ENGAGED_BUCKET_THRESHOLD).float()
+            # Loss mask: only at valid CONTENT positions. Action positions
+            # contribute 0; pad pairs (mask_2n=0) contribute 0.
+            loss_mask = mask_2n * is_content.float()
+            loss_per = bce(logits, targets)                      # (B, 2N)
+            masked = loss_per * loss_mask
+            n_valid = loss_mask.sum().clamp(min=1.0)
+            loss = masked.sum() / n_valid
+            n_positions = int(loss_mask.sum().item())
+        else:
+            hist_items = batch["hist_items"].to(DEVICE)         # (B, T)
+            hist_ratings = batch["hist_ratings"].to(DEVICE)     # (B, T)
+            hist_ts = batch["hist_ts"].to(DEVICE)               # (B, T)
+            hist_mask = batch["hist_mask"].to(DEVICE)           # (B, T)
 
-        logits = model.score_per_position(h_in, next_items)  # (B, T-1)
-        targets = (next_ratings >= ENGAGED_BUCKET_THRESHOLD).float()
-        loss_per = bce(logits, targets)                     # (B, T-1)
-        masked = loss_per * pair_mask
-        n_valid = pair_mask.sum().clamp(min=1.0)
-        loss = masked.sum() / n_valid
+            h = model.encode(hist_items, hist_ratings, hist_ts, hist_mask)  # (B, T, D)
+
+            # Per-position next-event prediction:
+            #   At position t (0..T-2), score h_t against item_embed(events[t+1])
+            #   target = engagement bucket of events[t+1] (rating >= 4 → 1)
+            # h, items, ratings, mask are all aligned over T positions.
+            h_in = h[:, :-1, :]                                 # (B, T-1, D)
+            next_items = hist_items[:, 1:]                      # (B, T-1)
+            next_ratings = hist_ratings[:, 1:]                  # (B, T-1)
+            # valid position = both current AND next event are real (not pad)
+            pair_mask = hist_mask[:, :-1] * hist_mask[:, 1:]    # (B, T-1)
+
+            logits = model.score_per_position(h_in, next_items)  # (B, T-1)
+            targets = (next_ratings >= ENGAGED_BUCKET_THRESHOLD).float()
+            loss_per = bce(logits, targets)                     # (B, T-1)
+            masked = loss_per * pair_mask
+            n_valid = pair_mask.sum().clamp(min=1.0)
+            loss = masked.sum() / n_valid
+            n_positions = int(pair_mask.sum().item())
 
         optimizer.zero_grad()
         loss.backward()
@@ -841,7 +1117,7 @@ def train_one_epoch(model, loader, optimizer, scheduler=None):
             scheduler.step()
 
         total_loss += masked.sum().item()
-        total_positions += int(pair_mask.sum().item())
+        total_positions += n_positions
     avg_loss = total_loss / max(1, total_positions)
     avg_grad_norm = (grad_norm_sum / grad_norm_count) if grad_norm_count > 0 else None
     return avg_loss, avg_grad_norm
@@ -849,18 +1125,40 @@ def train_one_epoch(model, loader, optimizer, scheduler=None):
 
 @torch.no_grad()
 def evaluate_model(model, loader):
-    """Per-(user, candidate, ts) eval: dot(h_T, item_embed(candidate)) → sigmoid → AUC."""
+    """Per-(user, candidate, ts) eval: dot(h_T, item_embed(candidate)) → sigmoid → AUC.
+
+    INTERLEAVE=1 path: append the candidate as a content token at position 2N
+    (after all 2N prefix tokens), forward the model, and score
+    dot(h_{2N}, item_full_embed(candidate)) at the appended position. The
+    candidate's ts is the eval row's target_ts (so the time-delta bias
+    against the prefix is computed from the right cutoff).
+    """
     model.eval()
     all_scores, all_labels = [], []
     for batch in loader:
-        hist_items = batch["hist_items"].to(DEVICE)
-        hist_ratings = batch["hist_ratings"].to(DEVICE)
-        hist_ts = batch["hist_ts"].to(DEVICE)
-        hist_mask = batch["hist_mask"].to(DEVICE)
         cand = batch["mid"].to(DEVICE)
         label = batch["label"]
-        h = model.encode(hist_items, hist_ratings, hist_ts, hist_mask)
-        logit = model.score_eval(h, hist_mask, cand)
+        if INTERLEAVE:
+            content_ids = batch["content_ids"].to(DEVICE)
+            action_ids = batch["action_ids"].to(DEVICE)
+            ts_2n = batch["ts_2n"].to(DEVICE)
+            mask_2n = batch["mask_2n"].to(DEVICE)
+            is_content = batch["is_content"].to(DEVICE)
+            target_ts = batch["target_ts"].to(DEVICE)
+            last_h = model.encode_interleaved_with_candidate(
+                content_ids, action_ids, ts_2n, mask_2n, is_content,
+                cand, target_ts,
+            )                                                    # (B, D)
+            last_h = model._project_head(last_h)
+            cand_e = model.item_full_embed(cand)                 # (B, D)
+            logit = (last_h * cand_e).sum(dim=-1)                # (B,)
+        else:
+            hist_items = batch["hist_items"].to(DEVICE)
+            hist_ratings = batch["hist_ratings"].to(DEVICE)
+            hist_ts = batch["hist_ts"].to(DEVICE)
+            hist_mask = batch["hist_mask"].to(DEVICE)
+            h = model.encode(hist_items, hist_ratings, hist_ts, hist_mask)
+            logit = model.score_eval(h, hist_mask, cand)
         all_scores.append(torch.sigmoid(logit).detach().cpu().numpy())
         all_labels.append(label.numpy())
     scores = np.concatenate(all_scores)
@@ -911,7 +1209,7 @@ def main():
              f"(layers={NUM_LAYERS}, heads={NUM_HEADS}, dim={EMBED_DIM}, "
              f"time_buckets={NUM_TIME_BUCKETS}) "
              f"use_genome={model.use_genome} use_genre={model.use_genre} use_year={model.use_year} "
-             f"use_mlp_head={model.use_mlp_head}")
+             f"use_mlp_head={model.use_mlp_head} use_interleave={model.use_interleave}")
 
     optimizer = build_optimizer(model, LR, WEIGHT_DECAY, OPTIMIZER)
     # Total scheduler steps = batches/epoch * MAX_EPOCHS. LR_SCHEDULE="constant"
