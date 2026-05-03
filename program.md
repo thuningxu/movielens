@@ -14,6 +14,28 @@ Any HSTU cycle is measured against **val 0.8594 / test 0.8455** to be called a w
 
 ## Cycles
 
+### `apr30` L3_bf16 — **NUM_LAYERS=3 + bf16: val=0.8560, 27% faster than C2** at no AUC cost
+
+`NUM_LAYERS=3 USE_BF16=1` on C2 stack (LR=1e-3 GRAD_CLIP=1.0 PROJ_INIT_MODE=xavier USE_GENOME+GENRE+YEAR=1 MLP_HEAD=1 MAX_EPOCHS=20).
+
+**Result: val_auc=0.8560 at epoch 18** (peak), 0.8556 at ep 19. Essentially identical to C2's 0.8561 (4L fp32) within ±0.001 — well below seed-σ.
+
+| epoch | C2 (4L fp32) | L3_bf16 (3L bf16) | Δ |
+|---|---|---|---|
+| 4 | 0.8475 | 0.8463 | -0.0012 |
+| 8 | 0.8522 | 0.8519 | -0.0003 |
+| 13 | 0.8548 | 0.8551 | +0.0003 |
+| 19 | 0.8561 | 0.8556 | -0.0005 |
+
+**Speed**: 7284s vs C2's 9959s = **27% faster**.
+
+**Speedup decomposition** (epoch-0 wall-time):
+- Layer reduction (4L→3L): ~20% (attention scales linearly with layers)
+- bf16 alone: ~8% (modest — autocast overhead vs HSTU's tiny matmuls at 64-dim)
+- Combined: ~27%
+
+**Implication**: NUM_LAYERS=3 + bf16 is the new operational baseline at no measurable AUC cost. All subsequent cells in this sweep run at this faster regime.
+
 ### `apr30` C2 — **MLP head + LR=1e-3 → val=0.8561**, gap to simple_v2 just −0.0033
 
 `MLP_HEAD=1 MLP_HEAD_DROPOUT=0.1 LR=1e-3 GRAD_CLIP=1.0 PROJ_INIT_MODE=xavier USE_GENOME+GENRE+YEAR=1 MAX_EPOCHS=20` on M1 stack.
