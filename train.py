@@ -107,6 +107,26 @@ if PROJ_INIT_MODE not in {"zero", "xavier"}:
 MLP_HEAD = int(os.environ.get("MLP_HEAD", "0"))
 MLP_HEAD_DROPOUT = float(os.environ.get("MLP_HEAD_DROPOUT", "0.1"))
 
+# LR schedule + optimizer flags (apr30). Both default to OFF state matching
+# the prior baseline byte-for-byte: LR_SCHEDULE="constant" and OPTIMIZER="adam"
+# build the same plain `Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)`
+# call and skip scheduler.step() entirely (scheduler is None — no extra method
+# calls, no extra RNG draws).
+#
+# LR_SCHEDULE="cosine_warmup": linear warmup from LR/100 to LR over WARMUP_STEPS,
+# then cosine decay from LR to LR*0.05 over the remaining steps. Stepped once
+# per training batch.
+#
+# OPTIMIZER="adamw": switch to AdamW with decoupled weight decay applied ONLY
+# to nn.Linear weights (matrices). Embedding weights, biases, and LayerNorm
+# parameters get weight_decay=0 via param-group split — the standard "no decay
+# on embeddings or norms" recipe used in transformer training.
+LR_SCHEDULE = os.environ.get("LR_SCHEDULE", "constant")
+assert LR_SCHEDULE in {"constant", "cosine_warmup"}, f"unknown LR_SCHEDULE={LR_SCHEDULE}"
+WARMUP_STEPS = int(os.environ.get("WARMUP_STEPS", "500"))
+OPTIMIZER = os.environ.get("OPTIMIZER", "adam")
+assert OPTIMIZER in {"adam", "adamw"}, f"unknown OPTIMIZER={OPTIMIZER}"
+
 # Year embedding bucket scheme. ml-25m titles span 1874..2019; ml-100k spans
 # 1922..1998. Coverage 1850..2049 = 200 buckets handles all observed datasets
 # with safety margin and costs ~12 KB at D=64. year_id = clip(year - YEAR_MIN,
@@ -471,8 +491,8 @@ class HSTUBlock(nn.Module):
         # Per-head learnable bias indexed by log-bucketed pairwise Δt.
         # Init zeros so the block starts with no positional bias and learns
         # to differentiate buckets from data.
-        self.rel_bias = nn.Embedding(num_time_buckets, num_heads)
-        nn.init.zeros_(self.rel_bias.weight)
+        self.rel_bias_embed = nn.Embedding(num_time_buckets, num_heads)
+        nn.init.zeros_(self.rel_bias_embed.weight)
 
     def forward(self, x: torch.Tensor, valid_mask: torch.Tensor,
                 causal_bool: torch.Tensor, time_buckets: torch.Tensor) -> torch.Tensor:
@@ -501,7 +521,7 @@ class HSTUBlock(nn.Module):
 
         # Add relative-position bias. Embedding lookup gives (B, L, L, H);
         # permute to (B, H, L, L).
-        bias = self.rel_bias(time_buckets).permute(0, 3, 1, 2)
+        bias = self.rel_bias_embed(time_buckets).permute(0, 3, 1, 2)
         scores = scores + bias
 
         # Pointwise activation (NOT softmax — HSTU's signature).
@@ -686,7 +706,88 @@ class HSTU(nn.Module):
 
 
 # ─── Train + eval ───────────────────────────────────────────────────
-def train_one_epoch(model, loader, optimizer):
+def build_optimizer(model, lr, weight_decay, optimizer_name):
+    """Build the optimizer per OPTIMIZER flag.
+
+    OFF state ("adam"): plain `torch.optim.Adam(model.parameters(), ...)` with
+    the existing call signature — byte-identical to the prior baseline.
+
+    ON state ("adamw"): AdamW with param-group split. Weight decay applies
+    ONLY to weight matrices of nn.Linear (and similar 2-D+ tensors). Embedding
+    weights, biases, and LayerNorm parameters get weight_decay=0 via the
+    "no decay" group. Partition rule: a parameter goes to no_decay if any of
+        - p.ndim < 2 (covers bias vectors, LayerNorm gain/bias which are 1-D),
+        - "embed" in name.lower() (catches item_embed, rating_embed, year_embed,
+          rel_bias which is technically an Embedding too),
+        - "norm" in name.lower() (catches LayerNorm modules named norm_in/norm_out),
+        - name endswith ".bias".
+    Everything else (Linear weights, the projection matrices uvqk/proj/genome_proj/
+    genre_proj, and the head_mlp Linears) goes to the decay group.
+    """
+    if optimizer_name == "adam":
+        return torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    elif optimizer_name == "adamw":
+        decay_params = []
+        no_decay_params = []
+        decay_names = []
+        no_decay_names = []
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if (p.ndim < 2
+                    or "embed" in name.lower()
+                    or "norm" in name.lower()
+                    or name.endswith(".bias")):
+                no_decay_params.append(p)
+                no_decay_names.append(name)
+            else:
+                decay_params.append(p)
+                decay_names.append(name)
+        n_decay = len(decay_params)
+        n_no_decay = len(no_decay_params)
+        n_decay_params = sum(p.numel() for p in decay_params)
+        n_no_decay_params = sum(p.numel() for p in no_decay_params)
+        log.info(f"  AdamW param groups: decay={n_decay} ({n_decay_params:,} params), "
+                 f"no_decay={n_no_decay} ({n_no_decay_params:,} params)")
+        return torch.optim.AdamW([
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ], lr=lr)
+    else:
+        raise ValueError(f"unknown OPTIMIZER={optimizer_name}")
+
+
+def build_scheduler(optimizer, lr, schedule_name, warmup_steps, total_steps):
+    """Build the LR scheduler per LR_SCHEDULE flag.
+
+    OFF state ("constant"): returns None — no scheduler.step() calls in the
+    training loop, no extra method calls, byte-identical to the prior baseline.
+
+    ON state ("cosine_warmup"): SequentialLR composed of
+      - LinearLR warmup from LR*0.01 to LR over the first WARMUP_STEPS steps
+        (start_factor=0.01 maps to "LR/100" peak ratio per spec),
+      - CosineAnnealingLR decay from LR to LR*0.05 over the remaining steps
+        (eta_min=LR*0.05 — 5% floor, not 0, to keep some learning rate at the
+        tail rather than freezing the model at the very end).
+    """
+    if schedule_name == "constant":
+        return None
+    elif schedule_name == "cosine_warmup":
+        from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+        cosine_steps = max(1, total_steps - warmup_steps)
+        return SequentialLR(
+            optimizer,
+            schedulers=[
+                LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps),
+                CosineAnnealingLR(optimizer, T_max=cosine_steps, eta_min=lr * 0.05),
+            ],
+            milestones=[warmup_steps],
+        )
+    else:
+        raise ValueError(f"unknown LR_SCHEDULE={schedule_name}")
+
+
+def train_one_epoch(model, loader, optimizer, scheduler=None):
     """Sequence-level training: per-position causal BCE on next-event engagement.
 
     When GRAD_CLIP > 0, clip global grad norm between backward and step. The
@@ -736,6 +837,8 @@ def train_one_epoch(model, loader, optimizer):
             grad_norm_sum += float(pre_clip)
             grad_norm_count += 1
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
 
         total_loss += masked.sum().item()
         total_positions += int(pair_mask.sum().item())
@@ -810,16 +913,25 @@ def main():
              f"use_genome={model.use_genome} use_genre={model.use_genre} use_year={model.use_year} "
              f"use_mlp_head={model.use_mlp_head}")
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    optimizer = build_optimizer(model, LR, WEIGHT_DECAY, OPTIMIZER)
+    # Total scheduler steps = batches/epoch * MAX_EPOCHS. LR_SCHEDULE="constant"
+    # short-circuits to scheduler=None — no scheduler.step() calls below, off-state
+    # byte-equivalent to the prior plain-Adam baseline.
+    total_steps = len(train_loader) * MAX_EPOCHS
+    scheduler = build_scheduler(optimizer, LR, LR_SCHEDULE, WARMUP_STEPS, total_steps)
+    log.info(f"  optimizer={OPTIMIZER}  lr_schedule={LR_SCHEDULE}  "
+             f"warmup_steps={WARMUP_STEPS}  total_steps={total_steps}  "
+             f"start_lr={optimizer.param_groups[0]['lr']:.2e}")
 
     best_val_auc = 0.0
     for epoch in range(MAX_EPOCHS):
-        train_loss, avg_grad_norm = train_one_epoch(model, train_loader, optimizer)
+        train_loss, avg_grad_norm = train_one_epoch(model, train_loader, optimizer, scheduler)
         val_auc = evaluate_model(model, val_loader)
         # Only append grad_norm when GRAD_CLIP fired (avg_grad_norm not None);
         # OFF-state log line is unchanged from the prior baseline.
         gn_part = f" grad_norm={avg_grad_norm:.2f}" if avg_grad_norm is not None else ""
-        log.info(f"epoch {epoch}: train_loss={train_loss:.4f} val_auc={val_auc:.4f}{gn_part}")
+        cur_lr = optimizer.param_groups[0]["lr"]
+        log.info(f"epoch {epoch}: train_loss={train_loss:.4f} val_auc={val_auc:.4f}{gn_part} lr={cur_lr:.2e}")
         best_val_auc = max(best_val_auc, val_auc)
 
     total = time.time() - t0
