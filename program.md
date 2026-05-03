@@ -14,6 +14,31 @@ Any HSTU cycle is measured against **val 0.8594 / test 0.8455** to be called a w
 
 ## Cycles
 
+### `apr30` interleave_3L_bf16 — **paper-canonical interleaving on top of fast baseline: val=0.8567** (new best)
+
+`INTERLEAVE=1 SEQ_LEN=100 NUM_LAYERS=3 USE_BF16=1` on C2 stack.
+
+Sequences become `[c_0, a_0, c_1, a_1, …]` interleaved (paper-canonical). 100 events × 2 = 200 tokens, matched compute with C2's fused SEQ_LEN=200.
+
+**Result: val_auc=0.8567 at epoch 15** (peak), trajectory 0.8559-0.8567 in late epochs.
+
+| epoch | L3_bf16 (fused) | interleave_3L_bf16 | Δ |
+|---|---|---|---|
+| 4 | 0.8463 | 0.8469 | +0.0006 |
+| 8 | 0.8519 | 0.8530 | +0.0011 |
+| 13 | 0.8551 | 0.8558 | +0.0007 |
+| 19 | 0.8556 | 0.8564 | +0.0008 |
+
+**Lift over fused at 3L**: +0.0007 (sub-σ but consistent positive across all epochs). **Lift over C2**: +0.0006.
+
+**Speed**: 7930s vs C2's 9959s = **20% faster** despite doubling effective sequence length (interleaving adds ~8% overhead vs L3 fused).
+
+vs simple_v2 0.8594: gap **−0.0027** (was −0.0033 at C2).
+
+### `apr30` L2_bf16 — depth=2 marginal regression
+
+`NUM_LAYERS=2 USE_BF16=1`: val=0.8546 (peak ep 18). −0.001 vs L3_bf16. Faster (90 min vs 121 min) but the AUC cost isn't worth it. **NUM_LAYERS=3 confirmed as right depth.**
+
 ### `apr30` L3_bf16 — **NUM_LAYERS=3 + bf16: val=0.8560, 27% faster than C2** at no AUC cost
 
 `NUM_LAYERS=3 USE_BF16=1` on C2 stack (LR=1e-3 GRAD_CLIP=1.0 PROJ_INIT_MODE=xavier USE_GENOME+GENRE+YEAR=1 MLP_HEAD=1 MAX_EPOCHS=20).
