@@ -14,6 +14,25 @@ Any HSTU cycle is measured against **val 0.8594 / test 0.8455** to be called a w
 
 ## Cycles
 
+### `apr30` aux_interleave_3L_bf16 — AUX_RATING_WEIGHT=25 regresses (val=0.8556)
+
+`AUX_RATING_WEIGHT=25` on top of the interleave_3L_bf16 stack.
+
+**Result: val_auc=0.8556** (peak ~ep 18). vs interleave-only (0.8567): **−0.0011**. vs C2 (0.8561): −0.0005.
+
+| ep | interleave | aux+interleave |
+|---|---|---|
+| 8 | 0.8530 | 0.8522 |
+| 13 | 0.8558 | 0.8545 |
+| 15 | 0.8567 | 0.8554 |
+| 19 | 0.8564 | 0.8542 |
+
+Consistent -0.001 below interleave-only at every epoch. The aux loss is fighting BCE rather than helping.
+
+**Diagnosis**: simple_v2's apr28o gain from AUX=25 came from a linear head over a 1376-d concat that benefited from auxiliary supervision pulling embeddings toward rating geometry. HSTU's `rating_embed` (the action-position token in interleaved mode) ALREADY encodes rating info directly — adding aux MSE on top is redundant or counterproductive. Mechanism doesn't transfer.
+
+**Lesson**: simple_v2 mechanisms don't universally transfer to HSTU. Per-mechanism evaluation needed.
+
 ### `apr30` SEED=43 verify of interleave_3L_bf16 — reproduces (val=0.8558)
 
 | seed | val_auc | peak ep |
