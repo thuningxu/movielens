@@ -198,6 +198,17 @@ USE_BF16 = int(os.environ.get("USE_BF16", "1"))       # apr30 best: ON (27% fast
 YEAR_MIN = 1850
 NUM_YEAR_BUCKETS = 200
 
+# Per-row prediction dump flag (apr30, post-hoc strata analysis). Default OFF
+# so the off-state is byte-equivalent — when SAVE_PREDS=0 evaluate_model only
+# accumulates the `all_scores`/`all_labels` arrays it needs for AUC, no extra
+# tensors built and no CSV I/O. When SAVE_PREDS=1 the final eval call also
+# materializes per-row uid / mid / label / score / prefix_len arrays and
+# writes them to SAVE_PREDS_PATH at the END of training. The pred buffer
+# only persists for the final eval (cleared each call) so memory is bounded.
+# Stratum analysis is computed offline by scripts/eval_strata.py.
+SAVE_PREDS = int(os.environ.get("SAVE_PREDS", "0"))
+SAVE_PREDS_PATH = os.environ.get("SAVE_PREDS_PATH", "/tmp/eval_strata.csv")
+
 
 # ─── Movie metadata (cold-start content features) ───────────────────
 def load_movie_metadata(movies_df: pd.DataFrame, dataset: str, num_items: int):
@@ -1212,7 +1223,7 @@ def train_one_epoch(model, loader, optimizer, scheduler=None):
 
 
 @torch.no_grad()
-def evaluate_model(model, loader):
+def evaluate_model(model, loader, save_preds_path: str | None = None):
     """Per-(user, candidate, ts) eval: dot(h_T, item_embed(candidate)) → sigmoid → AUC.
 
     INTERLEAVE=1 path: append the candidate as a content token at position 2N
@@ -1220,9 +1231,15 @@ def evaluate_model(model, loader):
     dot(h_{2N}, item_full_embed(candidate)) at the appended position. The
     candidate's ts is the eval row's target_ts (so the time-delta bias
     against the prefix is computed from the right cutoff).
+
+    When `save_preds_path` is not None, also accumulate per-row uid / mid /
+    label / score / prefix_len and write a CSV at the given path before
+    returning. Off-state byte-equivalent to the prior baseline (no extra
+    tensors built or appended when save_preds_path is None).
     """
     model.eval()
     all_scores, all_labels = [], []
+    pred_rows = [] if save_preds_path else None
     autocast_ctx = (
         torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
         if (USE_BF16 and DEVICE == "cuda") else nullcontext()
@@ -1256,10 +1273,37 @@ def evaluate_model(model, loader):
         # Cast to fp32 for sigmoid + AUC accumulation. Outside autocast scope
         # bf16 tensors are returned as-is; .float() makes the numpy conversion
         # match the fp32 path bit-equivalent. (No-op when autocast is null.)
-        all_scores.append(torch.sigmoid(logit.float()).detach().cpu().numpy())
-        all_labels.append(label.numpy())
+        scores_np = torch.sigmoid(logit.float()).detach().cpu().numpy()
+        labels_np = label.numpy()
+        all_scores.append(scores_np)
+        all_labels.append(labels_np)
+        if pred_rows is not None:
+            # prefix_len = number of valid PRIOR EVENTS the model saw on this row.
+            # Fused path: hist_mask is (B, N) per-event, so .sum() over dim=1 == events.
+            # Interleaved path: mask_2n is (B, 2N) and pads/keeps content+action as a
+            # PAIR (both masked together by _build_interleaved), so events = mask/2.
+            if INTERLEAVE:
+                prefix_len = (mask_2n.sum(dim=1) // 2).long().detach().cpu().numpy()
+            else:
+                prefix_len = hist_mask.sum(dim=1).long().detach().cpu().numpy()
+            uids = np.asarray(batch["uid"], dtype=np.int64)
+            mids = cand.detach().cpu().numpy().astype(np.int64)
+            pred_rows.append(np.stack([uids, mids, labels_np.astype(np.float64),
+                                       scores_np.astype(np.float64),
+                                       prefix_len.astype(np.int64)], axis=1))
     scores = np.concatenate(all_scores)
     labels = np.concatenate(all_labels)
+    if pred_rows is not None:
+        arr = np.concatenate(pred_rows, axis=0)
+        df = pd.DataFrame({
+            "uid": arr[:, 0].astype(np.int64),
+            "mid": arr[:, 1].astype(np.int64),
+            "label": arr[:, 2].astype(np.float32),
+            "score": arr[:, 3].astype(np.float32),
+            "prefix_len": arr[:, 4].astype(np.int64),
+        })
+        df.to_csv(save_preds_path, index=False)
+        log.info(f"  saved {len(df)} eval predictions to {save_preds_path}")
     return evaluate(labels, scores)["auc"]
 
 
@@ -1326,7 +1370,16 @@ def main():
         train_loss, avg_grad_norm, avg_aux_loss = train_one_epoch(
             model, train_loader, optimizer, scheduler,
         )
-        val_auc = evaluate_model(model, val_loader)
+        # Only request the per-row prediction dump on the FINAL epoch's eval,
+        # both to keep prior epochs byte-equivalent to the off path AND to
+        # reflect the deployed model state. SAVE_PREDS=0 → save_path stays None
+        # for every call, so off-state is byte-equivalent.
+        save_path = (
+            SAVE_PREDS_PATH
+            if (SAVE_PREDS and epoch == MAX_EPOCHS - 1)
+            else None
+        )
+        val_auc = evaluate_model(model, val_loader, save_preds_path=save_path)
         # Only append grad_norm when GRAD_CLIP fired (avg_grad_norm not None);
         # only append aux_loss when AUX_RATING_WEIGHT > 0 (avg_aux_loss not None).
         # OFF-state log line is unchanged from the prior baseline.
