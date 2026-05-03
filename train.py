@@ -84,6 +84,22 @@ USE_GENOME = int(os.environ.get("USE_GENOME", "1"))   # apr30 best: ON
 USE_GENRE = int(os.environ.get("USE_GENRE", "1"))     # apr30 best: ON
 USE_YEAR = int(os.environ.get("USE_YEAR", "1"))       # apr30 best: ON
 
+# Popularity prior (apr30, cold_user intervention plan, option D). Default OFF
+# for byte-equivalence with commit 6886442. When USE_POP_PRIOR=1 a static
+# per-item normalized log-rating-count feature (computed ONCE at startup from
+# train_df only — never val/test, so train-derived counts are inherently
+# strictly-prior to all val/test rows by virtue of prepare.load_data's
+# time-based split) is projected by a learnable Linear(1, EMBED_DIM, bias=False)
+# and SUMMED into item_full_embed at every call site (sequence content tokens,
+# per-position training targets, eval candidate). The projection weight is
+# zero-init so step-0 ON state == OFF state byte-equivalent at the
+# candidate-scoring level — same pattern as the genome/genre/year zero-init
+# path. Module construction guarded so OFF-state RNG is preserved exactly.
+# Motivation: cold_user (80% of val) has no item-side history, so HSTU's
+# per-candidate scoring lacks a useful "popular items are more likely engaged"
+# prior; an explicit popularity scalar could fill that gap.
+USE_POP_PRIOR = int(os.environ.get("USE_POP_PRIOR", "0"))
+
 # Stabilization mechanisms (apr30, post-spike). Both default OFF (off-state
 # byte-equivalent to 200bc86). Motivation: with USE_GENOME/GENRE/YEAR=1
 # (M1), training spikes at epoch 5 — train_loss 0.515 → 7.21, val_auc drops
@@ -727,25 +743,29 @@ class HSTU(nn.Module):
     buckets.
 
     Cold-start content metadata (apr30, Idea 1, opt-in via USE_GENOME /
-    USE_GENRE / USE_YEAR flags). When enabled, each per-position item-side
-    embedding becomes
+    USE_GENRE / USE_YEAR / USE_POP_PRIOR flags). When enabled, each
+    per-position item-side embedding becomes
         item_full_embed(m) = item_embed(m)
-                           + (USE_GENOME ? genome_proj(genome[m]) : 0)
-                           + (USE_GENRE  ? genre_proj(genre[m])   : 0)
-                           + (USE_YEAR   ? year_embed(year_id[m]) : 0)
+                           + (USE_GENOME    ? genome_proj(genome[m])         : 0)
+                           + (USE_GENRE     ? genre_proj(genre[m])           : 0)
+                           + (USE_YEAR      ? year_embed(year_id[m])         : 0)
+                           + (USE_POP_PRIOR ? pop_proj(item_pop_feature[m])  : 0)
     and this *same* construction is used both at sequence input AND at
-    candidate scoring (symmetric path). Projection weights are zero-init,
-    so OFF→ON keeps step-0 logits identical to OFF and the metadata signal
-    grows monotonically as the projections train.
+    candidate scoring (symmetric path). Projection weights are zero-init
+    (xavier-init when PROJ_INIT_MODE=xavier for the genome/genre/year three;
+    pop_proj is always zero-init), so OFF→ON keeps step-0 logits identical
+    to OFF and the metadata signal grows monotonically as the projections train.
 
-    OFF-state byte-equivalence: when all three flags are 0, item_full_embed
+    OFF-state byte-equivalence: when all four flags are 0, item_full_embed
     skips every metadata branch and returns plain item_embed(m), matching
-    the prior baseline exactly. Metadata tensors are allocated regardless
-    (for codepath simplicity) but never accessed in the OFF path.
+    the prior baseline exactly. The genome/genre/year tensors are allocated
+    regardless (for codepath simplicity); the popularity buffer is registered
+    only when USE_POP_PRIOR=1 so OFF-state memory is unchanged.
     """
 
     def __init__(self, num_items: int, num_rating_buckets: int,
-                 genome: torch.Tensor, genre: torch.Tensor, year_id: torch.Tensor):
+                 genome: torch.Tensor, genre: torch.Tensor, year_id: torch.Tensor,
+                 item_pop: torch.Tensor):
         super().__init__()
         # Index 0 is PAD; real movies occupy 1..num_items. Callers
         # (build_user_sequences, EvalDataset) shift movieIds by +1 so the
@@ -830,6 +850,22 @@ class HSTU(nn.Module):
         if self.use_aux_rating:
             self.aux_head = nn.Linear(EMBED_DIM, 1)
 
+        # Popularity prior (USE_POP_PRIOR=1, apr30 cold_user intervention plan
+        # option D). Constructed AFTER all prior conditional modules so the
+        # OFF-state RNG state is byte-identical to commit 6886442 — when the
+        # flag is 0, neither the buffer nor the projection exists, no RNG is
+        # consumed for this feature, and item_full_embed never references it.
+        # Buffer is not persistent (rebuilt each run from train_df by main()).
+        # Zero-init projection mirrors the genome/genre/year zero-init pattern
+        # so step-0 ON state == OFF state byte-equivalent at the
+        # candidate-scoring level (the popularity contribution is exactly 0
+        # before the projection trains).
+        self.use_pop_prior = bool(USE_POP_PRIOR)
+        if self.use_pop_prior:
+            self.register_buffer("item_pop_feature", item_pop, persistent=False)
+            self.pop_proj = nn.Linear(1, EMBED_DIM, bias=False)
+            nn.init.zeros_(self.pop_proj.weight)
+
     def item_full_embed(self, item_ids: torch.Tensor) -> torch.Tensor:
         """Symmetric per-position item-side embedding used for both sequence
         input AND candidate scoring. Same construction in both spots is the
@@ -846,6 +882,12 @@ class HSTU(nn.Module):
             e = e + self.genre_proj(self.genre_table[item_ids])
         if self.use_year:
             e = e + self.year_embed(self.year_id_table[item_ids])
+        if self.use_pop_prior:
+            # item_pop_feature: (num_items+1,) ∈ [0,1]. Gather to (..., 1) and
+            # project to (..., EMBED_DIM). Symmetric: applies at sequence
+            # content tokens, training-time per-position scoring targets, and
+            # eval candidate — all three call sites pass through this method.
+            e = e + self.pop_proj(self.item_pop_feature[item_ids].unsqueeze(-1))
         return e
 
     def encode(self, hist_items: torch.Tensor, hist_ratings: torch.Tensor,
@@ -1326,6 +1368,29 @@ def main():
     genre_t = torch.from_numpy(genre_np).to(DEVICE)
     year_id_t = torch.from_numpy(year_id_np).to(DEVICE)
 
+    # Popularity prior table (USE_POP_PRIOR=1): per-item normalized log-rating-count
+    # built ONCE from train_df only (val/test rows never enter this aggregation,
+    # and prepare.load_data's time-based split guarantees train timestamps strictly
+    # precede val/test, so train counts are inherently strictly-prior to every
+    # val/test row). Sized (num_items + 1,) to match the +1-shifted movieId
+    # convention: row 0 is PAD (count=0 → log1p=0 → normalized 0). Allocated
+    # regardless of the flag so the constructor signature stays uniform; the
+    # buffer is registered (and pop_proj built) only when use_pop_prior is True.
+    train_real = train_df[train_df["rating"] > 0]
+    item_counts = (
+        train_real.groupby("movieId").size()
+        .reindex(range(stats["num_items"]), fill_value=0)
+        .values
+    )
+    item_log_count_real = np.log1p(item_counts.astype(np.float64)).astype(np.float32)
+    max_log = float(item_log_count_real.max())
+    item_pop_real = item_log_count_real / max(max_log, 1.0)            # (num_items,) ∈ [0, 1]
+    item_pop_np = np.zeros(stats["num_items"] + 1, dtype=np.float32)   # (num_items+1,)
+    item_pop_np[1:] = item_pop_real                                    # row 0 = PAD = 0
+    item_pop_t = torch.from_numpy(item_pop_np).to(DEVICE)
+    log.info(f"  pop prior: max_log_count={max_log:.3f}  "
+             f"items_with_train_ratings={int((item_counts > 0).sum())}/{stats['num_items']}")
+
     # Eval history uses train+val with per-sample strict-prior cutoff (mirrors
     # simple_v2's EVAL_DYNAMIC_HIST=1 — the +0.022 win at apr28ad came from val
     # rows seeing their OWN earlier val rows in history, while side="left"
@@ -1344,12 +1409,14 @@ def main():
                             collate_fn=collate_eval)
 
     model = HSTU(stats["num_items"], NUM_RATING_BUCKETS,
-                 genome=genome_t, genre=genre_t, year_id=year_id_t).to(DEVICE)
+                 genome=genome_t, genre=genre_t, year_id=year_id_t,
+                 item_pop=item_pop_t).to(DEVICE)
     n_params = sum(p.numel() for p in model.parameters())
     log.info(f"HSTU: {n_params/1e6:.2f}M params on {DEVICE}  "
              f"(layers={NUM_LAYERS}, heads={NUM_HEADS}, dim={EMBED_DIM}, "
              f"time_buckets={NUM_TIME_BUCKETS}) "
              f"use_genome={model.use_genome} use_genre={model.use_genre} use_year={model.use_year} "
+             f"use_pop_prior={model.use_pop_prior} "
              f"use_mlp_head={model.use_mlp_head} use_interleave={model.use_interleave} "
              f"use_aux_rating={model.use_aux_rating}"
              + (f" aux_w={AUX_RATING_WEIGHT}" if model.use_aux_rating else ""))
