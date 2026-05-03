@@ -22,8 +22,8 @@ HSTU is the cleanest first generative baseline that lets us measure against the 
 ## Layout
 
 - **`prepare.py`** — Shared with both prior attempts. Data download + time-based train/val/test splits + `evaluate()` AUC harness. **Do not modify.**
-- **`train.py`** — HSTU model + training loop. Currently a stub.
-- **`program.md`** — Experiment log for this attempt (starts empty).
+- **`train.py`** — HSTU model + sequence data pipeline + training loop. Content metadata, MLP head, bf16, interleaving, LR schedules, aux rating head — all flag-gated, default OFF.
+- **`program.md`** — Experiment log for this attempt (apr30 cycle complete).
 - **`legacy/`** — Frozen archive of the original DLRM project.
 - **`simple_v2/`** — Frozen archive of the apr28 linear-head restart. The locked baseline (`val 0.859384`, `test 0.845497`) lives there for comparison.
 - **`data/`** — Auto-downloaded MovieLens datasets; not in git.
@@ -128,16 +128,37 @@ Whatever metadata-fused embedding the sequence sees as observations is exactly w
 
 ## Status
 
-`apr30` branch implements the full pipeline:
-- **Step 1** (`5bf86c6`): sequence-level training with per-position causal loss (SASRec/HSTU framing).
-- **Step 2** (`e057e70`): real HSTU block — pointwise SiLU attention + gated linear unit + log-bucketed time-delta bias.
-- **Bugfix** (`12481fc`): cold/short-history users were getting the wrong hidden state at eval — left-padding makes `seq_len-1` always the last real event.
-- **Bug #1 fix** (`3ea5c1b`): movieId +1 shift to avoid PAD/movieId-0 collision in `nn.Embedding(..., padding_idx=0)`.
-- **LR=5e-3, MAX_EPOCHS=15** (`a046154`): val 0.8367 with 4L/64D, no metadata. **Already beats heavily-tuned simple_v2 static (0.828) and legacy DLRM (0.8284) by +0.008 with no movie content features at all** — pure user-item interaction modeling.
-- **Capacity sweep** (cells A/B): width-doubling at preserved depth gave zero lift; capacity along this axis is not the binding constraint.
-- **Content metadata** (`ab4bdda`): USE_GENOME / USE_GENRE / USE_YEAR opt-in flags added to test the structural-content-gap hypothesis. Default off (byte-equivalent baseline).
+`apr30` cycle complete. Cumulative progression on ml-25m at SEED=42:
 
-Current ml-25m sweep in flight: 3-cell metadata-1 (M0 control / M2 genome-only / M1 all metadata) at 4L/64D LR=5e-3 MAX_EPOCHS=15.
+| stage | val_auc | commit | mechanism |
+|---|---|---|---|
+| Pure HSTU 4L/64D LR=5e-3 | 0.8367 | `a046154` | sequence-level + Bug #1 fix |
+| Capacity sweep (A/B) | flat | `2bf0713` | width axis not binding |
+| Metadata (M1) | 0.8453 (peak) | `ab4bdda` | genome+genre+year, training spikes at LR=5e-3 |
+| Stabilization (S2) | 0.8467 | `a768f4d` | clip 1.0 + xavier init, cures spikes |
+| Cycle 2 LR=2e-3 | 0.8541 | `8368ebb` | LR halved, monotone climb |
+| C1 LR=1e-3 | 0.8547 | `a727e97` | LR step further (sub-σ) |
+| C2 MLP head | 0.8561 | `a95cbc9` | MLP on h_t (sub-σ) |
+| LR schedule + AdamW infra | (off-state) | `1edb678` | flag-gated; cosine + AdamW available |
+| L3_bf16 | 0.8560 | `7e8ae4d` | NUM_LAYERS=3 + bf16, **27% faster** |
+| **interleave_3L_bf16** | **0.8567** (s42) / **0.8558** (s43), 2-seed mean **0.8563** | `2bf0713` | paper-canonical interleaved tokens |
+| L2_bf16 | 0.8546 | (same sweep) | depth=2 too aggressive |
+| aux+interleave | 0.8556 | `db899f7` | AUX=25 mechanism doesn't transfer to HSTU |
+
+**Operational best**: `interleave_3L_bf16` config — `INTERLEAVE=1 SEQ_LEN=100 NUM_LAYERS=3 USE_BF16=1 LR=1e-3 GRAD_CLIP=1.0 PROJ_INIT_MODE=xavier USE_GENOME+GENRE+YEAR=1 MLP_HEAD=1 MLP_HEAD_DROPOUT=0.1`. ~120 min/cell on ml-25m.
+
+**Gap to simple_v2 0.8594**: −0.0027 single-seed / −0.0031 2-seed mean. Multi-seed +0.005 lift threshold not yet cleared, so test-set evaluation not yet authorized.
+
+**Key findings**:
+- Pure HSTU at 0.8367 already beats heavily-tuned simple_v2 static (0.828) and legacy DLRM (0.8284) with NO movie content features — pure user-item interaction modeling carries the signal.
+- Content metadata (genome/genre/year) lifts +0.008 — closes part of the gap to simple_v2.
+- Stabilization (clip + xavier + LR=1e-3) is necessary to preserve the lift over a stable training run.
+- MLP head on h_t adds +0.001 (sub-σ).
+- NUM_LAYERS=3 + bf16 is the right operational baseline (27% faster, no AUC cost).
+- Interleaving (paper-canonical Meta 2024 §3) lifts +0.0007 over fused-token (sub-σ but consistent positive).
+- AUX_RATING_WEIGHT=25 (simple_v2 mechanism) does NOT transfer to HSTU — the rating_embed already encodes rating info, making aux MSE redundant.
+
+The architecture diagram above shows fused-token mode (current `train.py` default with `INTERLEAVE=0`); the operational best uses `INTERLEAVE=1` for the paper-canonical [c_0, a_0, c_1, a_1, ...] sequence.
 
 ## What carries over from the prior attempts
 
