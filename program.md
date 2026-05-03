@@ -14,6 +14,17 @@ Any HSTU cycle is measured against **val 0.8594 / test 0.8455** to be called a w
 
 ## Cycles
 
+### `apr30` SEED=43 verify of interleave_3L_bf16 — reproduces (val=0.8558)
+
+| seed | val_auc | peak ep |
+|---|---|---|
+| 42 | 0.8567 | 15 |
+| 43 | 0.8558 | 19 |
+| **2-seed mean** | **0.8563** | |
+| inter-seed diff | 0.0009 | within seed-σ |
+
+Reproducibility confirmed. 2-seed mean is +0.0002 over C2 — sub-noise. Per team rule, multi-seed lift threshold (+0.005) not cleared, so no test-set evaluation yet. But interleave_3L_bf16 reproduces cleanly as the new operational baseline.
+
 ### `apr30` interleave_3L_bf16 — **paper-canonical interleaving on top of fast baseline: val=0.8567** (new best)
 
 `INTERLEAVE=1 SEQ_LEN=100 NUM_LAYERS=3 USE_BF16=1` on C2 stack.
