@@ -108,6 +108,22 @@ if PROJ_INIT_MODE not in {"zero", "xavier"}:
 MLP_HEAD = int(os.environ.get("MLP_HEAD", "0"))
 MLP_HEAD_DROPOUT = float(os.environ.get("MLP_HEAD_DROPOUT", "0.1"))
 
+# Auxiliary rating-regression head (apr30, simple_v2 port). Default OFF so the
+# off-state is byte-identical to commit 2bf0713 (the aux_head Linear is NOT
+# constructed when AUX_RATING_WEIGHT==0, preserving the RNG draw sequence
+# consumed by every subsequent module init). When AUX_RATING_WEIGHT > 0, a
+# parallel Linear(EMBED_DIM, 1) head predicts the per-position normalized
+# rating bucket (rating_bucket / 9.0 ∈ [0, 1]) from the same hidden state h_t
+# used for the main BCE scoring path. Combined loss in train_one_epoch is
+#     total_loss = bce_loss + AUX_RATING_WEIGHT * masked_mse
+# where the mask is the same as for BCE: only valid + content positions
+# (interleaved) or only valid (current, next) pairs (fused). Inputs to the aux
+# head are the raw encoder outputs h_t (NOT the MLP-projected variant), so the
+# auxiliary regression task is a parallel structural pull on the encoder, not
+# a diagnostic of the projected scoring head — this mirrors simple_v2 where
+# both the main and aux heads consumed the same raw concat.
+AUX_RATING_WEIGHT = float(os.environ.get("AUX_RATING_WEIGHT", "0.0"))
+
 # Interleaving flag (apr30, post-1edb678). When 0 (default) sequence is the
 # fused (item+rating) representation: each event = one position, x_t =
 # item_full_embed(m_t) + rating_embed(rating_bucket_t). Byte-identical to
@@ -789,6 +805,17 @@ class HSTU(nn.Module):
                 nn.Linear(2 * EMBED_DIM, EMBED_DIM),
             )
 
+        # Auxiliary rating-regression head. Constructed LAST so OFF-state RNG
+        # state is preserved across every prior module init (no extra RNG draws
+        # when AUX_RATING_WEIGHT==0). Default PyTorch init (Kaiming-uniform on
+        # the weight, zero bias) — the aux head is a parallel branch and does
+        # not feed back into the main scoring path, so non-zero init is fine
+        # (it converges to predict the rating from h_t without affecting the
+        # main BCE logit at step 0).
+        self.use_aux_rating = AUX_RATING_WEIGHT > 0
+        if self.use_aux_rating:
+            self.aux_head = nn.Linear(EMBED_DIM, 1)
+
     def item_full_embed(self, item_ids: torch.Tensor) -> torch.Tensor:
         """Symmetric per-position item-side embedding used for both sequence
         input AND candidate scoring. Same construction in both spots is the
@@ -1059,13 +1086,27 @@ def train_one_epoch(model, loader, optimizer, scheduler=None):
     encodes the user's response to seeing this item"), and the target is
     is_engaged(rating_bucket_i) computed from content_rating_bucket. Action
     positions get loss_mask = 0.
+
+    AUX_RATING_WEIGHT > 0: per-position MSE on (rating_bucket / 9.0) ∈ [0, 1]
+    from the same h_t feeding the main scoring path. Mask is identical to the
+    BCE mask (loss_mask interleaved / pair_mask fused), so each position that
+    contributes to BCE also contributes to the auxiliary regression target.
+    For interleaved, the aux head runs at every (B, 2N, D) position but the
+    mask isolates the content slots; for fused, it runs at h_in = h[:, :-1]
+    and predicts the NEXT event's rating bucket (parallel to the BCE target,
+    which is engagement of the next event). The aux Linear is constructed
+    only when AUX_RATING_WEIGHT > 0; OFF-state code path skips the aux
+    branch entirely and is byte-identical to the prior baseline.
     """
     model.train()
     total_loss = 0.0
     total_positions = 0
     grad_norm_sum = 0.0
     grad_norm_count = 0
+    aux_loss_sum = 0.0
+    aux_loss_count = 0
     bce = nn.BCEWithLogitsLoss(reduction="none")
+    use_aux = model.use_aux_rating
     autocast_ctx = (
         torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
         if (USE_BF16 and DEVICE == "cuda") else nullcontext()
@@ -1097,6 +1138,16 @@ def train_one_epoch(model, loader, optimizer, scheduler=None):
                 masked = loss_per * loss_mask
                 n_valid = loss_mask.sum().clamp(min=1.0)
                 loss = masked.sum() / n_valid
+                # Auxiliary rating-regression head: predict normalized rating
+                # bucket (content_rb / 9.0) from h_t (raw encoder output, NOT
+                # the MLP-projected variant). Same mask as BCE so only valid
+                # content positions contribute.
+                if use_aux:
+                    aux_pred = model.aux_head(h).squeeze(-1)         # (B, 2N)
+                    aux_target = content_rb.float() / 9.0            # (B, 2N) ∈ [0, 1]
+                    aux_sq = (aux_pred - aux_target) ** 2 * loss_mask
+                    aux_mse = aux_sq.sum() / n_valid
+                    loss = loss + AUX_RATING_WEIGHT * aux_mse
             n_positions = int(loss_mask.sum().item())
         else:
             hist_items = batch["hist_items"].to(DEVICE)         # (B, T)
@@ -1123,6 +1174,16 @@ def train_one_epoch(model, loader, optimizer, scheduler=None):
                 masked = loss_per * pair_mask
                 n_valid = pair_mask.sum().clamp(min=1.0)
                 loss = masked.sum() / n_valid
+                # Auxiliary rating-regression head: predict normalized rating
+                # bucket of the NEXT event (next_ratings / 9.0) from h_in. Same
+                # pair_mask as BCE. h_in (pre-MLP) feeds the aux head — parallel
+                # branch off the encoder, not the projected scoring head.
+                if use_aux:
+                    aux_pred = model.aux_head(h_in).squeeze(-1)      # (B, T-1)
+                    aux_target = next_ratings.float() / 9.0          # (B, T-1) ∈ [0, 1]
+                    aux_sq = (aux_pred - aux_target) ** 2 * pair_mask
+                    aux_mse = aux_sq.sum() / n_valid
+                    loss = loss + AUX_RATING_WEIGHT * aux_mse
             n_positions = int(pair_mask.sum().item())
 
         optimizer.zero_grad()
@@ -1138,9 +1199,13 @@ def train_one_epoch(model, loader, optimizer, scheduler=None):
 
         total_loss += masked.sum().item()
         total_positions += n_positions
+        if use_aux:
+            aux_loss_sum += float(aux_mse.detach())
+            aux_loss_count += 1
     avg_loss = total_loss / max(1, total_positions)
     avg_grad_norm = (grad_norm_sum / grad_norm_count) if grad_norm_count > 0 else None
-    return avg_loss, avg_grad_norm
+    avg_aux_loss = (aux_loss_sum / aux_loss_count) if aux_loss_count > 0 else None
+    return avg_loss, avg_grad_norm, avg_aux_loss
 
 
 @torch.no_grad()
@@ -1238,7 +1303,9 @@ def main():
              f"(layers={NUM_LAYERS}, heads={NUM_HEADS}, dim={EMBED_DIM}, "
              f"time_buckets={NUM_TIME_BUCKETS}) "
              f"use_genome={model.use_genome} use_genre={model.use_genre} use_year={model.use_year} "
-             f"use_mlp_head={model.use_mlp_head} use_interleave={model.use_interleave}")
+             f"use_mlp_head={model.use_mlp_head} use_interleave={model.use_interleave} "
+             f"use_aux_rating={model.use_aux_rating}"
+             + (f" aux_w={AUX_RATING_WEIGHT}" if model.use_aux_rating else ""))
 
     optimizer = build_optimizer(model, LR, WEIGHT_DECAY, OPTIMIZER)
     # Total scheduler steps = batches/epoch * MAX_EPOCHS. LR_SCHEDULE="constant"
@@ -1253,13 +1320,17 @@ def main():
 
     best_val_auc = 0.0
     for epoch in range(MAX_EPOCHS):
-        train_loss, avg_grad_norm = train_one_epoch(model, train_loader, optimizer, scheduler)
+        train_loss, avg_grad_norm, avg_aux_loss = train_one_epoch(
+            model, train_loader, optimizer, scheduler,
+        )
         val_auc = evaluate_model(model, val_loader)
         # Only append grad_norm when GRAD_CLIP fired (avg_grad_norm not None);
+        # only append aux_loss when AUX_RATING_WEIGHT > 0 (avg_aux_loss not None).
         # OFF-state log line is unchanged from the prior baseline.
         gn_part = f" grad_norm={avg_grad_norm:.2f}" if avg_grad_norm is not None else ""
+        aux_part = f" aux_loss={avg_aux_loss:.4f}" if avg_aux_loss is not None else ""
         cur_lr = optimizer.param_groups[0]["lr"]
-        log.info(f"epoch {epoch}: train_loss={train_loss:.4f} val_auc={val_auc:.4f}{gn_part} lr={cur_lr:.2e}")
+        log.info(f"epoch {epoch}: train_loss={train_loss:.4f} val_auc={val_auc:.4f}{aux_part}{gn_part} lr={cur_lr:.2e}")
         best_val_auc = max(best_val_auc, val_auc)
 
     total = time.time() - t0
