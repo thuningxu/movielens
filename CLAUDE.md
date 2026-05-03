@@ -23,16 +23,11 @@ uv sync
 # Smoke test (ml-100k, ~seconds — crash detection only, NOT for AUC comparison)
 DATASET=ml-100k uv run python train.py
 
-# Standard experiment (ml-25m on the current CUDA GPU, default config)
+# Standard experiment (ml-25m on the current CUDA GPU)
+# Defaults are now the apr30 best config (val 0.8567 SEED=42):
+# NUM_LAYERS=3, INTERLEAVE=1, USE_BF16=1, GRAD_CLIP=1.0, PROJ_INIT_MODE=xavier,
+# MLP_HEAD=1, USE_GENOME=USE_GENRE=USE_YEAR=1, SEQ_LEN=100, MAX_EPOCHS=20.
 DATASET=ml-25m uv run python train.py
-
-# Reproduce the apr30 best result (interleave_3L_bf16, val 0.8567 SEED=42)
-DATASET=ml-25m SEED=42 LR=1e-3 MAX_EPOCHS=20 \
-  USE_GENOME=1 USE_GENRE=1 USE_YEAR=1 \
-  GRAD_CLIP=1.0 PROJ_INIT_MODE=xavier \
-  MLP_HEAD=1 MLP_HEAD_DROPOUT=0.1 \
-  USE_BF16=1 NUM_LAYERS=3 INTERLEAVE=1 SEQ_LEN=100 \
-  uv run python train.py
 
 # Reproduce the simple_v2 locked baseline (for cross-attempt comparison)
 EVAL_DYNAMIC_HIST=1 FREQ_WD_LAMBDA=0 LR=1e-3 DATASET=ml-25m uv run python simple_v2/train.py

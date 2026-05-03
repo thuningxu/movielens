@@ -56,10 +56,13 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
 # HSTU hyperparameters (placeholders — tune once the real model lands)
+# apr30 defaults are the operational-best config (val 0.8567 single-seed,
+# 0.8563 2-seed mean on ml-25m at SEED=42). To reproduce earlier byte-equivalent
+# baselines, override the relevant flags to OFF — see program.md for cycle history.
 EMBED_DIM = int(os.environ.get("EMBED_DIM", "64"))
-NUM_LAYERS = int(os.environ.get("NUM_LAYERS", "4"))
+NUM_LAYERS = int(os.environ.get("NUM_LAYERS", "3"))     # apr30 best: 3L matches 4L AUC, 27% faster
 NUM_HEADS = int(os.environ.get("NUM_HEADS", "4"))
-SEQ_LEN = int(os.environ.get("SEQ_LEN", "200"))         # per-user context length
+SEQ_LEN = int(os.environ.get("SEQ_LEN", "100"))         # apr30 best: 100 events (×2 = 200 tokens with INTERLEAVE=1)
 DROPOUT = float(os.environ.get("DROPOUT", "0.1"))
 NUM_TIME_BUCKETS = int(os.environ.get("NUM_TIME_BUCKETS", "32"))  # log-spaced time-delta buckets
 NUM_RATING_BUCKETS = 10                                 # 0.5★ → bucket 0, 5★ → bucket 9
@@ -68,7 +71,7 @@ ENGAGED_BUCKET_THRESHOLD = 7                            # bucket >= 7 ⇔ rating
 LR = float(os.environ.get("LR", "1e-3"))
 WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "1e-5"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "256"))
-MAX_EPOCHS = int(os.environ.get("MAX_EPOCHS", "5"))
+MAX_EPOCHS = int(os.environ.get("MAX_EPOCHS", "20"))    # apr30 best — earlier cycles used 5 or 15
 
 # Cold-start content metadata flags (apr30, Idea 1). All default OFF for
 # byte-equivalence with the prior baseline. When enabled, each adds a
@@ -77,9 +80,9 @@ MAX_EPOCHS = int(os.environ.get("MAX_EPOCHS", "5"))
 # in BOTH the sequence and the dot product. Zero-init keeps the OFF→ON
 # transition smooth (initial logits unchanged at step 0; signal grows as
 # the projections train).
-USE_GENOME = int(os.environ.get("USE_GENOME", "0"))
-USE_GENRE = int(os.environ.get("USE_GENRE", "0"))
-USE_YEAR = int(os.environ.get("USE_YEAR", "0"))
+USE_GENOME = int(os.environ.get("USE_GENOME", "1"))   # apr30 best: ON
+USE_GENRE = int(os.environ.get("USE_GENRE", "1"))     # apr30 best: ON
+USE_YEAR = int(os.environ.get("USE_YEAR", "1"))       # apr30 best: ON
 
 # Stabilization mechanisms (apr30, post-spike). Both default OFF (off-state
 # byte-equivalent to 200bc86). Motivation: with USE_GENOME/GENRE/YEAR=1
@@ -88,8 +91,8 @@ USE_YEAR = int(os.environ.get("USE_YEAR", "0"))
 # stable. Hypothesis: zero-init projections + Adam moment cascade at the
 # activation transition; gradient clipping is a direct counter, and Xavier
 # init is an alternative path that avoids the cascade entirely.
-GRAD_CLIP = float(os.environ.get("GRAD_CLIP", "0.0"))   # >0 → clip_grad_norm_ each step
-PROJ_INIT_MODE = os.environ.get("PROJ_INIT_MODE", "zero")
+GRAD_CLIP = float(os.environ.get("GRAD_CLIP", "1.0"))   # apr30 best: 1.0 (catches mild spikes)
+PROJ_INIT_MODE = os.environ.get("PROJ_INIT_MODE", "xavier")  # apr30 best: xavier (slightly better than zero)
 if PROJ_INIT_MODE not in {"zero", "xavier"}:
     raise ValueError(f"PROJ_INIT_MODE must be 'zero' or 'xavier', got {PROJ_INIT_MODE!r}")
 
@@ -105,7 +108,7 @@ if PROJ_INIT_MODE not in {"zero", "xavier"}:
 # to 0.5 at step 0. With Kaiming init the MLP starts as a non-trivial
 # function of h_t — the model loses byte-equivalence on ON path but begins
 # learning immediately. Param cost at D=64: 2*D*D + 2D + D*2D + D = 16,576.
-MLP_HEAD = int(os.environ.get("MLP_HEAD", "0"))
+MLP_HEAD = int(os.environ.get("MLP_HEAD", "1"))       # apr30 best: ON
 MLP_HEAD_DROPOUT = float(os.environ.get("MLP_HEAD_DROPOUT", "0.1"))
 
 # Auxiliary rating-regression head (apr30, simple_v2 port). Default OFF so the
@@ -152,7 +155,7 @@ AUX_RATING_WEIGHT = float(os.environ.get("AUX_RATING_WEIGHT", "0.0"))
 # SEQ_LEN keeps EVENT semantics in both regimes. INTERLEAVE=1 internally
 # allocates 2*SEQ_LEN tokens per sequence so a sweep at SEQ_LEN=100
 # matches the compute footprint of the SEQ_LEN=200 fused baseline.
-INTERLEAVE = int(os.environ.get("INTERLEAVE", "0"))
+INTERLEAVE = int(os.environ.get("INTERLEAVE", "1"))   # apr30 best: ON (paper-canonical Meta 2024 §3)
 
 # LR schedule + optimizer flags (apr30). Both default to OFF state matching
 # the prior baseline byte-for-byte: LR_SCHEDULE="constant" and OPTIMIZER="adam"
@@ -185,7 +188,7 @@ assert OPTIMIZER in {"adam", "adamw"}, f"unknown OPTIMIZER={OPTIMIZER}"
 # the standard accuracy/throughput tradeoff and should not affect AUC at our
 # scale. Only meaningful on CUDA — on CPU/MPS the autocast is a no-op for the
 # bf16 dtype, so the flag silently degrades to fp32.
-USE_BF16 = int(os.environ.get("USE_BF16", "0"))
+USE_BF16 = int(os.environ.get("USE_BF16", "1"))       # apr30 best: ON (27% faster, no AUC cost on CUDA)
 
 # Year embedding bucket scheme. ml-25m titles span 1874..2019; ml-100k spans
 # 1922..1998. Coverage 1850..2049 = 200 buckets handles all observed datasets

@@ -42,56 +42,65 @@ DATASET=ml-25m uv run python train.py
 
 ## Architecture
 
+The diagram below shows the **default operational config** (apr30 best): `INTERLEAVE=1` (paper-canonical Meta 2024), `NUM_LAYERS=3`, `USE_GENOME=USE_GENRE=USE_YEAR=1`, `MLP_HEAD=1`, `USE_BF16=1`, `GRAD_CLIP=1.0`, `PROJ_INIT_MODE=xavier`, `SEQ_LEN=100` events × 2 = 200 tokens. Set `INTERLEAVE=0` to revert to the fused-token mode (each event = one position, `x_t = item_full_embed(m_t) + rating_embed(r_t)`).
+
 ```mermaid
 graph TD
-    subgraph "Per-user event sequence (left-padded, length L)"
-        EV["events[t] = (movieId_t, rating_bucket_t, timestamp_t)<br/>t = 0 .. L-1, real events at the right end"]
+    subgraph "Per-user event sequence — interleaved, 2N tokens, left-padded"
+        EV["events[i] = (movieId_i, rating_bucket_i, timestamp_i)<br/>SEQ_LEN events × 2 = 2N tokens<br/>positions: c_0, a_0, c_1, a_1, …, c_{N-1}, a_{N-1}"]
     end
 
-    subgraph "Static metadata tables (apr30, opt-in via USE_*)"
+    subgraph "Static metadata tables (loaded once, fixed)"
         GMT["genome_table: (num_items+1, 1128)<br/>nn.Buffer, fixed at load"]
         GRT["genre_table: (num_items+1, 20)<br/>multi-hot, nn.Buffer"]
         YRT["year_id_table: (num_items+1,)<br/>year - 1850 clipped to [0, 199]"]
     end
 
-    subgraph "item_full_embed(m) — symmetric helper"
-        EV -.->|"movieId_t"| IFE["item_embed[m]<br/>+ USE_GENOME · genome_proj(genome_table[m])<br/>+ USE_GENRE · genre_proj(genre_table[m])<br/>+ USE_YEAR · year_embed(year_id_table[m])"]
+    subgraph "Token-type embedding (separate tables)"
+        EV -.->|"movieId_i at content position 2i"| IFE["c_i = item_full_embed(m_i):<br/>item_embed[m_i]<br/>+ genome_proj(genome_table[m_i])<br/>+ genre_proj(genre_table[m_i])<br/>+ year_embed(year_id_table[m_i])"]
         GMT -.-> IFE
         GRT -.-> IFE
         YRT -.-> IFE
-        IFE --> IE["x = item_full_embed(m_t) + rating_embed[rating_bucket_t]<br/>→ (B, L, D)"]
-        EV --> IE
+        EV -.->|"rating_bucket_i at action position 2i+1"| AE["a_i = action_embed[rating_bucket_i+1]"]
+        IFE --> X["x = where(is_content, c_i, a_i)<br/>→ (B, 2N, D)"]
+        AE --> X
     end
 
     subgraph "Time-delta bias (precomputed once per batch)"
-        EV --> TD["pairwise Δt = |ts_i - ts_j|<br/>bucket = 0 if Δt=0, else 1+floor(log2(Δt))<br/>clamp to [0, 31] → (B, L, L) int"]
+        EV --> TD["pairwise Δt = |ts_i - ts_j|<br/>bucket = 0 if Δt=0, else 1+floor(log2(Δt))<br/>clamp to [0, 31] → (B, 2N, 2N) int"]
     end
 
-    subgraph "HSTU block × NUM_LAYERS (=4)"
-        IE --> LN1["LayerNorm"]
-        LN1 --> UVQK["Linear(D, 4D) → SiLU<br/>split → U, V, Q, K  each (B, L, D)"]
-        UVQK --> MH["reshape Q, K, V → (B, H=4, L, D/H=16)"]
-        TD --> RB["rel_bias = Embedding(32, H)[bucket]<br/>→ (B, H, L, L)"]
-        MH --> SCORE["scores = Q · Kᵀ / √(D/H) + rel_bias<br/>→ (B, H, L, L)"]
+    subgraph "HSTU block × NUM_LAYERS (=3)"
+        X --> LN1["LayerNorm"]
+        LN1 --> UVQK["Linear(D, 4D) → SiLU<br/>split → U, V, Q, K  each (B, 2N, D)"]
+        UVQK --> MH["reshape Q, K, V → (B, H=4, 2N, D/H=16)"]
+        TD --> RB["rel_bias = Embedding(32, H)[bucket]<br/>→ (B, H, 2N, 2N)"]
+        MH --> SCORE["scores = Q · Kᵀ / √(D/H) + rel_bias<br/>→ (B, H, 2N, 2N)"]
         RB --> SCORE
         SCORE --> POINT["SiLU(scores) ⊙ keep_mask<br/>(causal × pad-key) — POINTWISE, NO softmax"]
-        POINT --> AV["AV = scores · V → reshape (B, L, D)"]
+        POINT --> AV["AV = scores · V → reshape (B, 2N, D)"]
         AV --> GLU["LayerNorm(AV) ⊙ U<br/>(gated linear unit — no separate FFN)"]
         GLU --> WO["Linear(D, D)"]
         WO --> RES["x + out (residual)"]
     end
 
-    subgraph "Heads (use the SAME item_full_embed helper)"
-        RES --> TRH["Train: per-position<br/>dot(h_t, item_full_embed(events[t+1].movieId))<br/>→ BCE on engaged(events[t+1])"]
-        RES --> EVH["Eval: dot(h_{L-1}, item_full_embed(candidate))<br/>→ sigmoid → P(engage)"]
+    subgraph "MLP head (apr30, on h_t before scoring)"
+        RES --> MLP["h_t → Linear(D, 2D) → GELU → Dropout → Linear(2D, D)"]
+    end
+
+    subgraph "Heads (loss + scoring at content positions)"
+        MLP --> TRH["Train (BCE at every CONTENT position 2i):<br/>dot(MLP(h_{2i}), item_full_embed(c_i))<br/>→ BCE on engaged(events[i].rating_bucket)"]
+        MLP --> EVH["Eval: append candidate as content token at 2N,<br/>read MLP(h_{2N}) and dot with item_full_embed(candidate)<br/>→ sigmoid → P(engage)"]
         IFE -.->|"shared"| TRH
         IFE -.->|"shared"| EVH
     end
 
     style EV fill:#e1f5fe
     style IFE fill:#fff3e0
+    style AE fill:#ffe0b2
     style POINT fill:#fce4ec
     style GLU fill:#fff3e0
+    style MLP fill:#e8f5e9
     style EVH fill:#c8e6c9
     style GMT fill:#f3e5f5
     style GRT fill:#f3e5f5
@@ -158,7 +167,7 @@ Whatever metadata-fused embedding the sequence sees as observations is exactly w
 - Interleaving (paper-canonical Meta 2024 §3) lifts +0.0007 over fused-token (sub-σ but consistent positive).
 - AUX_RATING_WEIGHT=25 (simple_v2 mechanism) does NOT transfer to HSTU — the rating_embed already encodes rating info, making aux MSE redundant.
 
-The architecture diagram above shows fused-token mode (current `train.py` default with `INTERLEAVE=0`); the operational best uses `INTERLEAVE=1` for the paper-canonical [c_0, a_0, c_1, a_1, ...] sequence.
+**Default config = operational best.** `train.py` defaults are now set to the apr30 best configuration (INTERLEAVE=1, NUM_LAYERS=3, USE_BF16=1, metadata flags ON, GRAD_CLIP=1.0, PROJ_INIT_MODE=xavier, MLP_HEAD=1, MAX_EPOCHS=20). Plain `DATASET=ml-25m uv run python train.py` reproduces the val 0.8567 result. Override individual flags to OFF to reproduce earlier baselines (see program.md cycle history).
 
 ## What carries over from the prior attempts
 
