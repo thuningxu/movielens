@@ -14,6 +14,27 @@ Any HSTU cycle is measured against **val 0.8594 / test 0.8455** to be called a w
 
 ## Cycles
 
+### `may03-coldstart` item_stats (B) — REGRESSES, fails on cold_item
+
+`USE_ITEM_STATS=1` (alone, no pop prior) on operational best. 3 scalars per item from train_df only: `mean_rating/5`, `std/2.5`, `frac_engaged`. Zero-imputation for items with no train ratings.
+
+**Result: val_auc=0.8541, -0.0026 vs baseline 0.8567.** Below baseline at every epoch.
+
+Strata diff (item_stats - baseline):
+
+| Stratum | Δ |
+|---|---|
+| warm | -0.0021 |
+| cold_user | +0.0001 (target — zero lift) |
+| **cold_item** | **-0.0341** (massive regression) |
+| **cold_both** | **-0.0268** (massive regression) |
+| warm_dense | -0.0021 |
+| warm_tail | -0.0055 |
+
+**Mechanism failure**: zero-imputation is the bug. Stats are all 0 for items with no train ratings, but 0 is a *valid* low-quality value (e.g., a 0.5★-mean item). The model learns "zero stats = low quality" and unfairly penalizes cold_item / cold_both predictions. To fix: use a learnable "missing" indicator OR mean-of-means imputation.
+
+**Both cold_user interventions (D and B) failed**. Static item-side features can't port simple_v2's `i_hist_pool` mechanism faithfully — that mechanism uses `user_embed` which HSTU lacks. The structural gap is not easily closed without a user representation.
+
 ### `apr30` strata diagnostic — gap lives in cold_user (80% of val), warm matches simple_v2
 
 Strata analysis on operational best `interleave_3L_bf16` (val 0.8567 single-seed, ml-25m SEED=42):
