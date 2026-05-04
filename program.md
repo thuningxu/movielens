@@ -14,6 +14,36 @@ Any HSTU cycle is measured against **val 0.8594 / test 0.8455** to be called a w
 
 ## Cycles
 
+### `may03-coldstart` variant C (rater_pool) — KILLED on ml-1m smoke (Δ=−0.0036)
+
+User authorized variant C after extend-30. Team R2 converged on:
+- `nn.Embedding(num_users + 1, D)` (user_embed) + `anon_user_embed` for cold candidates
+- Per-item static rater pool from train_df; per-eval-row dynamic with `ts<sample.ts` cutoff
+- Cold-rater gating (drop raters with <3 train ratings)
+- Rating-centered weighted pool (pivot=0.6)
+- Head-side integration ONLY at last position via zero-init `rater_cross_proj`
+- ~440 LOC implementation; OFF-state byte-equivalent verified (fp32 0.605622 = 0.605622 on ml-100k); ON-state step-0 byte-equivalent (rater_cross output exactly 0.0 before first backward).
+
+**Pre-screen (per Critic): ml-1m MAX_EPOCHS=5 SEED=42, kill if Δ negative.**
+
+| Epoch | OFF (USE_RATER_POOL=0) | ON (USE_RATER_POOL=1) | Δ |
+|---|---|---|---|
+| 0 | 0.7057 | 0.7053 | −0.0004 (≈step-0 noise) |
+| 1 | 0.7471 | 0.7447 | −0.0024 |
+| 2 | 0.7590 | 0.7571 | −0.0019 |
+| 3 | 0.7648 | 0.7622 | −0.0026 |
+| 4 | **0.7678** | **0.7642** | **−0.0036** |
+
+**Δ = −0.0036, monotone widening with training.** 3.6× single-seed AUC noise (~0.001 at ml-1m). Below kill threshold (Δ negative). **Variant C killed before ml-25m commit.**
+
+**Diagnosis (matches Critic R1 priors)**: parallel `user_embed` table competes with HSTU's sequence-summary user representation. The rater_cross learns nonzero, adds noise the model has to overcome. Cold-rater gating is not the bottleneck — even warm-rater contributions appear redundant with what the encoder already extracts.
+
+**5th cold_user-targeted null** (after pop_prior, item_stats, rating_ts, CAWR). Reinforces structural-ceiling diagnosis: HSTU's cold_user gap to simple_v2 is not closeable by porting simple_v2's `i_hist_pool` mechanism into HSTU's MLP head — the architectures process user identity differently. simple_v2's mechanism succeeds in a linear head with no other user representation; HSTU has the sequence summary that subsumes the signal.
+
+**Apr28af precedent reaffirmed**: simple_v2's `EVAL_DYNAMIC_ITEM_HIST` (the same per-eval dynamic refresh) was a verified null at +0.001/0.0029-σ. The mechanism we ported has a known null-class signature in the reference codebase.
+
+Branch `may03-coldstart` commit `309d5bf`. Implementation kept on branch (not reverted) for archival. `USE_RATER_POOL=0` is byte-equivalent so the merge to main remains tractable if any salvage emerges. **Do NOT merge variant C unless an anon-only or different design is validated.**
+
 ### `may03-coldstart` extend-30 — first positive cold_user signal (+0.0012)
 
 `MAX_EPOCHS=30` on operational best (constant LR=1e-3, no other changes).
