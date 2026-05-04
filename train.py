@@ -100,6 +100,28 @@ USE_YEAR = int(os.environ.get("USE_YEAR", "1"))       # apr30 best: ON
 # prior; an explicit popularity scalar could fill that gap.
 USE_POP_PRIOR = int(os.environ.get("USE_POP_PRIOR", "0"))
 
+# Per-item rating statistics (apr30, cold_user intervention plan, variant B).
+# Default OFF for byte-equivalence with commit fd96d2a. When USE_ITEM_STATS=1
+# a static per-item 3-vector of normalized rating statistics (mean, std,
+# frac_engaged) is computed ONCE at startup from train_df only and projected by
+# a learnable Linear(3, EMBED_DIM, bias=False) into item_full_embed at every
+# call site. Same time-leak guarantee as USE_POP_PRIOR: stats are derived
+# entirely from train_df rows, and prepare.load_data's time-based split places
+# all train timestamps strictly before val/test, so the aggregation is
+# inherently strictly-prior to every val/test sample. The 3 scalars are
+#   - mean_rating / 5.0       (in [0.1, 1.0]; 0.0 imputed if no train ratings)
+#   - std_rating  / 2.5       (in [0, 1];   0.0 imputed if <2 train ratings)
+#   - frac_engaged            (in [0, 1];   0.0 imputed if no train ratings)
+# Count is intentionally EXCLUDED — USE_POP_PRIOR already projects log1p(count)
+# and stacking both would be redundant with the popularity signal. Motivation:
+# pop_prior alone gave +0.0001 overall / +0.0003 cold_user (sub-noise) because
+# item_embed already encodes count via co-occurrence; the missing signal is
+# the rating DISTRIBUTION (mean / std / frac_engaged), which simple_v2's
+# i_hist_rat_mean captured directly. Projection weight is zero-init so step-0
+# ON == OFF byte-equivalent at the candidate-scoring level; module guarded so
+# OFF-state RNG is preserved exactly.
+USE_ITEM_STATS = int(os.environ.get("USE_ITEM_STATS", "0"))
+
 # Stabilization mechanisms (apr30, post-spike). Both default OFF (off-state
 # byte-equivalent to 200bc86). Motivation: with USE_GENOME/GENRE/YEAR=1
 # (M1), training spikes at epoch 5 — train_loss 0.515 → 7.21, val_auc drops
@@ -743,29 +765,32 @@ class HSTU(nn.Module):
     buckets.
 
     Cold-start content metadata (apr30, Idea 1, opt-in via USE_GENOME /
-    USE_GENRE / USE_YEAR / USE_POP_PRIOR flags). When enabled, each
-    per-position item-side embedding becomes
+    USE_GENRE / USE_YEAR / USE_POP_PRIOR / USE_ITEM_STATS flags). When
+    enabled, each per-position item-side embedding becomes
         item_full_embed(m) = item_embed(m)
-                           + (USE_GENOME    ? genome_proj(genome[m])         : 0)
-                           + (USE_GENRE     ? genre_proj(genre[m])           : 0)
-                           + (USE_YEAR      ? year_embed(year_id[m])         : 0)
-                           + (USE_POP_PRIOR ? pop_proj(item_pop_feature[m])  : 0)
+                           + (USE_GENOME     ? genome_proj(genome[m])             : 0)
+                           + (USE_GENRE      ? genre_proj(genre[m])               : 0)
+                           + (USE_YEAR       ? year_embed(year_id[m])             : 0)
+                           + (USE_POP_PRIOR  ? pop_proj(item_pop_feature[m])      : 0)
+                           + (USE_ITEM_STATS ? item_stats_proj(item_stats[m])     : 0)
     and this *same* construction is used both at sequence input AND at
     candidate scoring (symmetric path). Projection weights are zero-init
     (xavier-init when PROJ_INIT_MODE=xavier for the genome/genre/year three;
-    pop_proj is always zero-init), so OFF→ON keeps step-0 logits identical
-    to OFF and the metadata signal grows monotonically as the projections train.
+    pop_proj and item_stats_proj are always zero-init), so OFF→ON keeps step-0
+    logits identical to OFF and the metadata signal grows monotonically as the
+    projections train.
 
-    OFF-state byte-equivalence: when all four flags are 0, item_full_embed
+    OFF-state byte-equivalence: when all five flags are 0, item_full_embed
     skips every metadata branch and returns plain item_embed(m), matching
     the prior baseline exactly. The genome/genre/year tensors are allocated
-    regardless (for codepath simplicity); the popularity buffer is registered
-    only when USE_POP_PRIOR=1 so OFF-state memory is unchanged.
+    regardless (for codepath simplicity); the popularity and item-stats
+    buffers are registered only when their respective flag is 1 so OFF-state
+    memory is unchanged.
     """
 
     def __init__(self, num_items: int, num_rating_buckets: int,
                  genome: torch.Tensor, genre: torch.Tensor, year_id: torch.Tensor,
-                 item_pop: torch.Tensor):
+                 item_pop: torch.Tensor, item_stats: torch.Tensor):
         super().__init__()
         # Index 0 is PAD; real movies occupy 1..num_items. Callers
         # (build_user_sequences, EvalDataset) shift movieIds by +1 so the
@@ -866,6 +891,23 @@ class HSTU(nn.Module):
             self.pop_proj = nn.Linear(1, EMBED_DIM, bias=False)
             nn.init.zeros_(self.pop_proj.weight)
 
+        # Per-item rating statistics (USE_ITEM_STATS=1, apr30 cold_user
+        # intervention plan variant B). Constructed AFTER pop_proj so the
+        # OFF-state RNG state is byte-identical to commit fd96d2a — when the
+        # flag is 0, neither the buffer nor the projection exists, no RNG is
+        # consumed for this feature, and item_full_embed never references it.
+        # Buffer is non-persistent (rebuilt each run from train_df by main()).
+        # Zero-init mirrors pop_proj: step-0 ON == OFF byte-equivalent at the
+        # candidate-scoring level. The 3 input dims are the (mean_norm,
+        # std_norm, frac_engaged) per-item stats computed in main() from
+        # train_df only — see USE_ITEM_STATS config-comment for the time-leak
+        # guarantee and normalization rationale.
+        self.use_item_stats = bool(USE_ITEM_STATS)
+        if self.use_item_stats:
+            self.register_buffer("item_stats_table", item_stats, persistent=False)
+            self.item_stats_proj = nn.Linear(3, EMBED_DIM, bias=False)
+            nn.init.zeros_(self.item_stats_proj.weight)
+
     def item_full_embed(self, item_ids: torch.Tensor) -> torch.Tensor:
         """Symmetric per-position item-side embedding used for both sequence
         input AND candidate scoring. Same construction in both spots is the
@@ -888,6 +930,12 @@ class HSTU(nn.Module):
             # content tokens, training-time per-position scoring targets, and
             # eval candidate — all three call sites pass through this method.
             e = e + self.pop_proj(self.item_pop_feature[item_ids].unsqueeze(-1))
+        if self.use_item_stats:
+            # item_stats_table: (num_items+1, 3) ∈ [0,1]. Gather to (..., 3)
+            # and project to (..., EMBED_DIM). Same symmetric pattern as
+            # pop_prior — applies at every call site that produces an
+            # item-side embedding.
+            e = e + self.item_stats_proj(self.item_stats_table[item_ids])
         return e
 
     def encode(self, hist_items: torch.Tensor, hist_ratings: torch.Tensor,
@@ -1391,6 +1439,43 @@ def main():
     log.info(f"  pop prior: max_log_count={max_log:.3f}  "
              f"items_with_train_ratings={int((item_counts > 0).sum())}/{stats['num_items']}")
 
+    # Per-item rating statistics table (USE_ITEM_STATS=1): 3 scalars per item
+    # — (mean_rating/5.0, std_rating/2.5, frac_engaged) — computed ONCE from
+    # train_df ONLY. Time-leak guarantee: the source frame is `train_real`
+    # from above (`train_df[train_df["rating"] > 0]`), which contains zero
+    # val/test rows by construction (prepare.load_data's split is purely
+    # time-based and disjoint by row index). So every aggregation here is
+    # strictly-prior to all val/test samples — the same guarantee that
+    # backs USE_POP_PRIOR. Allocated regardless of the flag so the
+    # constructor signature stays uniform; the buffer/projection are
+    # registered only when use_item_stats is True.
+    #
+    # NaN imputation:
+    #   - Items with ZERO train ratings: mean=NaN, std=NaN, frac=NaN → impute
+    #     0 for all three scalars. The signal is "we have no info", which
+    #     differs from "we know mean=0" since the smallest valid mean is
+    #     0.5/5.0 = 0.1 — so 0 is unambiguously a sentinel.
+    #   - Items with EXACTLY 1 train rating: mean and frac are well-defined,
+    #     but pandas .std() returns NaN (default ddof=1 needs n>=2). Impute
+    #     std=0 only — leave mean and frac at their real single-sample values.
+    item_groupby = train_real.groupby("movieId")
+    mean_rating = item_groupby["rating"].mean().reindex(range(stats["num_items"]))
+    std_rating = item_groupby["rating"].std().reindex(range(stats["num_items"]))
+    frac_engaged = (
+        item_groupby["rating"].apply(lambda r: (r >= 4).mean())
+        .reindex(range(stats["num_items"]))
+    )
+    mean_norm = (mean_rating / 5.0).fillna(0.0).to_numpy(dtype=np.float32)
+    std_norm = (std_rating / 2.5).fillna(0.0).to_numpy(dtype=np.float32)
+    frac_norm = frac_engaged.fillna(0.0).to_numpy(dtype=np.float32)
+    item_stats_real = np.stack([mean_norm, std_norm, frac_norm], axis=1)   # (num_items, 3)
+    item_stats_np = np.zeros((stats["num_items"] + 1, 3), dtype=np.float32)
+    item_stats_np[1:] = item_stats_real                                    # row 0 = PAD = zeros
+    item_stats_t = torch.from_numpy(item_stats_np).to(DEVICE)
+    log.info(f"  item stats: mean_norm avg={float(mean_norm.mean()):.3f}  "
+             f"std_norm avg={float(std_norm.mean()):.3f}  "
+             f"frac_engaged avg={float(frac_norm.mean()):.3f}")
+
     # Eval history uses train+val with per-sample strict-prior cutoff (mirrors
     # simple_v2's EVAL_DYNAMIC_HIST=1 — the +0.022 win at apr28ad came from val
     # rows seeing their OWN earlier val rows in history, while side="left"
@@ -1410,13 +1495,13 @@ def main():
 
     model = HSTU(stats["num_items"], NUM_RATING_BUCKETS,
                  genome=genome_t, genre=genre_t, year_id=year_id_t,
-                 item_pop=item_pop_t).to(DEVICE)
+                 item_pop=item_pop_t, item_stats=item_stats_t).to(DEVICE)
     n_params = sum(p.numel() for p in model.parameters())
     log.info(f"HSTU: {n_params/1e6:.2f}M params on {DEVICE}  "
              f"(layers={NUM_LAYERS}, heads={NUM_HEADS}, dim={EMBED_DIM}, "
              f"time_buckets={NUM_TIME_BUCKETS}) "
              f"use_genome={model.use_genome} use_genre={model.use_genre} use_year={model.use_year} "
-             f"use_pop_prior={model.use_pop_prior} "
+             f"use_pop_prior={model.use_pop_prior} use_item_stats={model.use_item_stats} "
              f"use_mlp_head={model.use_mlp_head} use_interleave={model.use_interleave} "
              f"use_aux_rating={model.use_aux_rating}"
              + (f" aux_w={AUX_RATING_WEIGHT}" if model.use_aux_rating else ""))
