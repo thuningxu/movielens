@@ -56,10 +56,10 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
 # HSTU hyperparameters (placeholders — tune once the real model lands)
-# apr30 defaults are the operational-best config (val 0.8567 single-seed,
-# 0.8563 2-seed mean on ml-25m at SEED=42). To reproduce earlier byte-equivalent
-# baselines, override the relevant flags to OFF — see program.md for cycle history.
-EMBED_DIM = int(os.environ.get("EMBED_DIM", "64"))
+# may04 defaults are the operational-best config (val 0.8594 single-seed
+# SEED=42 on ml-25m, ties simple_v2 locked baseline). To reproduce earlier
+# byte-equivalent baselines, override the relevant flags — see program.md.
+EMBED_DIM = int(os.environ.get("EMBED_DIM", "128"))      # may04 best: 128 lifts +0.0027 vs 64 (broad strata gains)
 NUM_LAYERS = int(os.environ.get("NUM_LAYERS", "3"))     # apr30 best: 3L matches 4L AUC, 27% faster
 NUM_HEADS = int(os.environ.get("NUM_HEADS", "4"))
 SEQ_LEN = int(os.environ.get("SEQ_LEN", "100"))         # apr30 best: 100 events (×2 = 200 tokens with INTERLEAVE=1)
@@ -83,6 +83,71 @@ MAX_EPOCHS = int(os.environ.get("MAX_EPOCHS", "20"))    # apr30 best — earlier
 USE_GENOME = int(os.environ.get("USE_GENOME", "1"))   # apr30 best: ON
 USE_GENRE = int(os.environ.get("USE_GENRE", "1"))     # apr30 best: ON
 USE_YEAR = int(os.environ.get("USE_YEAR", "1"))       # apr30 best: ON
+
+# Popularity prior (apr30, cold_user intervention plan, option D). Default OFF
+# for byte-equivalence with commit 6886442. When USE_POP_PRIOR=1 a static
+# per-item normalized log-rating-count feature (computed ONCE at startup from
+# train_df only — never val/test, so train-derived counts are inherently
+# strictly-prior to all val/test rows by virtue of prepare.load_data's
+# time-based split) is projected by a learnable Linear(1, EMBED_DIM, bias=False)
+# and SUMMED into item_full_embed at every call site (sequence content tokens,
+# per-position training targets, eval candidate). The projection weight is
+# zero-init so step-0 ON state == OFF state byte-equivalent at the
+# candidate-scoring level — same pattern as the genome/genre/year zero-init
+# path. Module construction guarded so OFF-state RNG is preserved exactly.
+# Motivation: cold_user (80% of val) has no item-side history, so HSTU's
+# per-candidate scoring lacks a useful "popular items are more likely engaged"
+# prior; an explicit popularity scalar could fill that gap.
+USE_POP_PRIOR = int(os.environ.get("USE_POP_PRIOR", "0"))
+
+# Bucketed absolute rating-timestamp embedding (variant A, may03 cold_user
+# follow-up). Default OFF for byte-equivalence with commit c109f3c. When
+# USE_RATING_TS=1, every CONTENT token (interleaved) or fused position gets a
+# learnable embedding indexed by the absolute rating timestamp bucketed into
+# NUM_TS_BUCKETS=32 monthly buckets over ml-25m's train timestamp range. The
+# bucket boundaries are computed ONCE at startup from train_df only (so val/test
+# are never used for binning, preserving the strict-prior guarantee). The
+# rating_ts_embed module is constructed only when USE_RATING_TS=1, so OFF-state
+# RNG state is byte-identical to commit c109f3c. Zero-init weight makes step-0
+# ON state == OFF state at the candidate-scoring level.
+#
+# Motivation: cold_user (80% of val) gap to simple_v2 (~0.003) is structural —
+# pop_prior was null and item_stats regressed. Adding absolute rating-ts to the
+# content token alongside year_embed lets the model learn ts × year interactions
+# (movie-age-at-rating, era-conditional taste, calendar-phase effects).
+#
+# Bucketing: clip((ts - TRAIN_TS_MIN) / SECONDS_PER_MONTH, 0, NUM_TS_BUCKETS-1).
+# PAD positions have ts=0 (epoch 1970), well before TRAIN_TS_MIN, so the clip
+# folds them onto bucket 0 (along with the earliest real-ts events). Pad
+# positions are masked out of attention regardless, so bucket-0 collision is
+# benign. Application is per-position (interleaved: content tokens only;
+# fused: every position) and SUMMED into the per-position input — same
+# additive pattern as rating_embed and year_embed.
+USE_RATING_TS = int(os.environ.get("USE_RATING_TS", "0"))
+NUM_TS_BUCKETS = 32
+SECONDS_PER_MONTH = 30.44 * 86400
+
+# Per-item rating statistics (apr30, cold_user intervention plan, variant B).
+# Default OFF for byte-equivalence with commit fd96d2a. When USE_ITEM_STATS=1
+# a static per-item 3-vector of normalized rating statistics (mean, std,
+# frac_engaged) is computed ONCE at startup from train_df only and projected by
+# a learnable Linear(3, EMBED_DIM, bias=False) into item_full_embed at every
+# call site. Same time-leak guarantee as USE_POP_PRIOR: stats are derived
+# entirely from train_df rows, and prepare.load_data's time-based split places
+# all train timestamps strictly before val/test, so the aggregation is
+# inherently strictly-prior to every val/test sample. The 3 scalars are
+#   - mean_rating / 5.0       (in [0.1, 1.0]; 0.0 imputed if no train ratings)
+#   - std_rating  / 2.5       (in [0, 1];   0.0 imputed if <2 train ratings)
+#   - frac_engaged            (in [0, 1];   0.0 imputed if no train ratings)
+# Count is intentionally EXCLUDED — USE_POP_PRIOR already projects log1p(count)
+# and stacking both would be redundant with the popularity signal. Motivation:
+# pop_prior alone gave +0.0001 overall / +0.0003 cold_user (sub-noise) because
+# item_embed already encodes count via co-occurrence; the missing signal is
+# the rating DISTRIBUTION (mean / std / frac_engaged), which simple_v2's
+# i_hist_rat_mean captured directly. Projection weight is zero-init so step-0
+# ON == OFF byte-equivalent at the candidate-scoring level; module guarded so
+# OFF-state RNG is preserved exactly.
+USE_ITEM_STATS = int(os.environ.get("USE_ITEM_STATS", "0"))
 
 # Stabilization mechanisms (apr30, post-spike). Both default OFF (off-state
 # byte-equivalent to 200bc86). Motivation: with USE_GENOME/GENRE/YEAR=1
@@ -172,8 +237,15 @@ INTERLEAVE = int(os.environ.get("INTERLEAVE", "1"))   # apr30 best: ON (paper-ca
 # parameters get weight_decay=0 via param-group split — the standard "no decay
 # on embeddings or norms" recipe used in transformer training.
 LR_SCHEDULE = os.environ.get("LR_SCHEDULE", "constant")
-assert LR_SCHEDULE in {"constant", "cosine_warmup"}, f"unknown LR_SCHEDULE={LR_SCHEDULE}"
+assert LR_SCHEDULE in {"constant", "cosine_warmup", "cawr"}, f"unknown LR_SCHEDULE={LR_SCHEDULE}"
 WARMUP_STEPS = int(os.environ.get("WARMUP_STEPS", "500"))
+# CAWR (cosine annealing with warm restarts) HPs (may03). Only consulted when
+# LR_SCHEDULE="cawr"; defaults give 5 equal cycles over 20 epochs with a 20%
+# trough (eta_min = 0.2 * LR). With LR=1e-3 the trough is 2e-4 — well above
+# the failure point of cosine_warmup-alone's deep decay tail.
+CAWR_T_0_EPOCHS = int(os.environ.get("CAWR_T_0_EPOCHS", "4"))
+CAWR_T_MULT = int(os.environ.get("CAWR_T_MULT", "1"))
+CAWR_ETA_MIN_FRAC = float(os.environ.get("CAWR_ETA_MIN_FRAC", "0.2"))
 OPTIMIZER = os.environ.get("OPTIMIZER", "adam")
 assert OPTIMIZER in {"adam", "adamw"}, f"unknown OPTIMIZER={OPTIMIZER}"
 
@@ -190,6 +262,43 @@ assert OPTIMIZER in {"adam", "adamw"}, f"unknown OPTIMIZER={OPTIMIZER}"
 # bf16 dtype, so the flag silently degrades to fp32.
 USE_BF16 = int(os.environ.get("USE_BF16", "1"))       # apr30 best: ON (27% faster, no AUC cost on CUDA)
 
+# Dynamic rater-pool head-side cross (variant C, may03 cold_user follow-up).
+# Default OFF so the off-state is byte-equivalent to commit 9167fb6 — when
+# USE_RATER_POOL=0 no rater-pool buffers, no user_embed table, no
+# anon_user_embed parameter, and no rater_cross_proj are constructed; the
+# encode/score paths skip the cross entirely. When USE_RATER_POOL=1, the
+# model builds:
+#   - a learnable user_embed table (num_users+1, EMBED_DIM) with padding_idx
+#     at the last slot (== num_users) so PAD/cold raters contribute zero,
+#   - a shared anon_user_embed (EMBED_DIM,) zero-init Parameter as the cold
+#     candidate fallback,
+#   - rater_cross_proj = Linear(EMBED_DIM, EMBED_DIM, bias=False) ZERO-init so
+#     the OFF→ON transition is byte-equivalent at step 0 (the proj output is
+#     exactly 0 before training), and
+#   - per-item static rater-pool buffers (item_hist_uid, item_hist_rat) of
+#     shape (num_items+1, RATER_POOL_LEN) built ONCE from train_df,
+#   - per-eval-row dynamic rater-pool buffers (eval_rater_uids, eval_rater_rats)
+#     of shape (n_eval, RATER_POOL_LEN) built ONCE in main() before training,
+#     mirroring simple_v2's EVAL_DYNAMIC_ITEM_HIST searchsorted pattern.
+#   - is_warm_rater_table (num_users+1,) boolean: True iff the user has
+#     >= RATER_POOL_MIN_COUNT real ratings in train_df. Cold raters are masked
+#     out of the pool weighting (treated as if PAD).
+#   - is_train_user_known (num_users+1,) boolean: True iff the user appears
+#     in train_df. Used to choose between user_embed(uid) (warm) and
+#     anon_user_embed (cold) for the candidate side of the cross.
+# Application: ONLY at the head side (last position), NOT per-position. The
+# rater_cross = rater_cross_proj(pool * u_e) is added to the LAST projected
+# hidden state's contribution before the dot product with the candidate's
+# item_full_embed. At training, the cross is applied at the LAST CONTENT
+# position (interleaved) or LAST PAIR position (fused) using the static
+# train pool (raters of c_{N-1} from train_df only — strictly-prior to all
+# val/test rows by virtue of prepare.load_data's time-based split). At eval,
+# the cross uses the per-row dynamic pool of raters with ts < target_ts.
+USE_RATER_POOL = int(os.environ.get("USE_RATER_POOL", "0"))
+RATER_POOL_LEN = int(os.environ.get("RATER_POOL_LEN", "30"))
+RATER_POOL_PIVOT = float(os.environ.get("RATER_POOL_PIVOT", "0.6"))
+RATER_POOL_MIN_COUNT = int(os.environ.get("RATER_POOL_MIN_COUNT", "3"))
+
 # Year embedding bucket scheme. ml-25m titles span 1874..2019; ml-100k spans
 # 1922..1998. Coverage 1850..2049 = 200 buckets handles all observed datasets
 # with safety margin and costs ~12 KB at D=64. year_id = clip(year - YEAR_MIN,
@@ -197,6 +306,17 @@ USE_BF16 = int(os.environ.get("USE_BF16", "1"))       # apr30 best: ON (27% fast
 # outside any real movie's release year).
 YEAR_MIN = 1850
 NUM_YEAR_BUCKETS = 200
+
+# Per-row prediction dump flag (apr30, post-hoc strata analysis). Default OFF
+# so the off-state is byte-equivalent — when SAVE_PREDS=0 evaluate_model only
+# accumulates the `all_scores`/`all_labels` arrays it needs for AUC, no extra
+# tensors built and no CSV I/O. When SAVE_PREDS=1 the final eval call also
+# materializes per-row uid / mid / label / score / prefix_len arrays and
+# writes them to SAVE_PREDS_PATH at the END of training. The pred buffer
+# only persists for the final eval (cleared each call) so memory is bounded.
+# Stratum analysis is computed offline by scripts/eval_strata.py.
+SAVE_PREDS = int(os.environ.get("SAVE_PREDS", "0"))
+SAVE_PREDS_PATH = os.environ.get("SAVE_PREDS_PATH", "/tmp/eval_strata.csv")
 
 
 # ─── Movie metadata (cold-start content features) ───────────────────
@@ -426,6 +546,140 @@ def _build_interleaved(items: np.ndarray, ratings: np.ndarray, timestamps: np.nd
     return content_ids, action_ids, ts_2n, mask_2n, is_content, content_rating_bucket
 
 
+def _build_item_rater_pool(train_df: pd.DataFrame, num_items: int, num_users: int,
+                           pool_len: int) -> tuple[np.ndarray, np.ndarray]:
+    """Per-item static rater pool from train_df only.
+
+    Returns:
+        item_hist_uid: (num_items + 1, pool_len) int64. Last K raters of each
+            item by ascending timestamp. Empty/short slots filled with
+            USER_PAD_IDX = num_users (the embedding's padding_idx). Row 0
+            (the +1-shifted PAD slot) is all PAD; rows 1..num_items hold the
+            real items' rater pools.
+        item_hist_rat: (num_items + 1, pool_len) float32. Companion per-rater
+            rating in [0.1, 1.0] (rating / 5.0); 0.0 at PAD slots.
+
+    Time-leak guarantee: source frame is `train_df` real ratings only, and
+    `prepare.load_data`'s time-based split places all train timestamps strictly
+    before val/test, so this pool is inherently strictly-prior to every
+    val/test sample (safe to use as eval-time fallback when the dynamic pool
+    falls back, though we don't currently use it that way — the dynamic
+    builder always constructs a per-row pool from train+val with its own
+    strict-prior cutoff). Mirrors simple_v2's _build_history (item axis) at
+    simple_v2/train.py:441-458.
+
+    Sorting: lexsort by (movieId, timestamp) ascending; for each item slice the
+    LAST `pool_len` rows so we keep the most-recent raters. This matches
+    simple_v2's HISTORY_LEN convention (recency-truncated tail).
+    """
+    USER_PAD_IDX = num_users
+    real = train_df[train_df["rating"] > 0]
+    uids = real["userId"].values.astype(np.int64)
+    mids = real["movieId"].values.astype(np.int64)
+    rats = (real["rating"].values.astype(np.float32) / 5.0)
+    ts = real["timestamp"].values.astype(np.int64)
+
+    # Sort by (movieId, timestamp) ascending. lexsort takes keys in REVERSE
+    # priority order so (ts, mids) sorts primarily by mids then by ts.
+    sort_idx = np.lexsort((ts, mids))
+    s_uids = uids[sort_idx]
+    s_mids = mids[sort_idx]
+    s_rats = rats[sort_idx]
+
+    item_hist_uid = np.full((num_items + 1, pool_len), USER_PAD_IDX, dtype=np.int64)
+    item_hist_rat = np.zeros((num_items + 1, pool_len), dtype=np.float32)
+    if len(s_mids) == 0:
+        return item_hist_uid, item_hist_rat
+    # Group boundaries within the sorted array.
+    boundaries = np.where(np.diff(s_mids) != 0)[0] + 1
+    starts = np.concatenate([[0], boundaries])
+    ends = np.concatenate([boundaries, [len(s_mids)]])
+    for s, e in zip(starts, ends):
+        mid = int(s_mids[s])
+        if not (0 <= mid < num_items):
+            continue
+        # Take the LAST `pool_len` raters (recency-tail).
+        length = min(e - s, pool_len)
+        # +1 shift to align with item_full_embed's PAD=0 convention.
+        item_hist_uid[mid + 1, -length:] = s_uids[e - length:e]
+        item_hist_rat[mid + 1, -length:] = s_rats[e - length:e]
+    return item_hist_uid, item_hist_rat
+
+
+def _build_eval_rater_pool(eval_df: pd.DataFrame, train_df: pd.DataFrame,
+                           val_df: pd.DataFrame, num_items: int, num_users: int,
+                           pool_len: int) -> tuple[np.ndarray, np.ndarray]:
+    """Per-eval-row dynamic rater pool from train+val with strict-prior cutoff.
+
+    For each (uid, mid, ts_row) in eval_df, find the last `pool_len` raters of
+    `mid` from `train_df + val_df` whose own ts < ts_row. Mirrors simple_v2's
+    EVAL_DYNAMIC_ITEM_HIST at simple_v2/train.py:824-874.
+
+    The strict-prior cutoff uses np.searchsorted(side="left") on each item's
+    sorted-by-ts rater array — `side="left"` excludes ties, preserving the
+    "raters strictly before the eval ts" contract. Side="left" matters
+    especially for self-eval: a row's own (uid, mid, ts) is filtered out
+    because that row only appears in val_df after the cutoff (or, if
+    train_df, has the same ts, which side="left" excludes).
+
+    Returns:
+        eval_rater_uids: (n_eval, pool_len) int64. Last K raters per row;
+            USER_PAD_IDX = num_users in unfilled slots.
+        eval_rater_rats: (n_eval, pool_len) float32. Companion ratings in
+            [0.1, 1.0]; 0.0 at PAD slots.
+    """
+    USER_PAD_IDX = num_users
+    n_eval = len(eval_df)
+    # Concatenate train + val real ratings, sorted by (movieId, timestamp).
+    combined = pd.concat([
+        train_df[train_df["rating"] > 0][["userId", "movieId", "rating", "timestamp"]],
+        val_df[val_df["rating"] > 0][["userId", "movieId", "rating", "timestamp"]],
+    ], ignore_index=True)
+    combined = combined.sort_values(["movieId", "timestamp"]).reset_index(drop=True)
+    all_mid = combined["movieId"].values.astype(np.int64)
+    all_uid = combined["userId"].values.astype(np.int64)
+    all_rat = (combined["rating"].values.astype(np.float32) / 5.0)
+    all_ts = combined["timestamp"].values.astype(np.int64)
+
+    # Per-mid range in the flat sorted array.
+    mid_starts = np.searchsorted(all_mid, np.arange(num_items), side="left")
+    mid_ends = np.searchsorted(all_mid, np.arange(num_items), side="right")
+
+    eval_mids = eval_df["movieId"].values.astype(np.int64)
+    eval_ts = eval_df["timestamp"].values.astype(np.int64)
+    # Order eval rows by mid so we can group-process them.
+    eval_order = np.argsort(eval_mids, kind="stable")
+    eval_mids_sorted = eval_mids[eval_order]
+    eval_mid_starts = np.searchsorted(eval_mids_sorted, np.arange(num_items), side="left")
+    eval_mid_ends = np.searchsorted(eval_mids_sorted, np.arange(num_items), side="right")
+
+    eval_rater_uids = np.full((n_eval, pool_len), USER_PAD_IDX, dtype=np.int64)
+    eval_rater_rats = np.zeros((n_eval, pool_len), dtype=np.float32)
+    for mid in range(num_items):
+        es, ee = int(eval_mid_starts[mid]), int(eval_mid_ends[mid])
+        if es == ee:
+            continue
+        us, ue = int(mid_starts[mid]), int(mid_ends[mid])
+        if us == ue:
+            # No raters of this mid in train+val; eval rows for this mid stay PAD.
+            continue
+        item_ts = all_ts[us:ue]
+        item_uid = all_uid[us:ue]
+        item_rat = all_rat[us:ue]
+        rows_for_mid = eval_order[es:ee]
+        row_ts = eval_ts[rows_for_mid]
+        # side="left" excludes the eval row's own ts (and any ties), preserving
+        # the strict-prior contract.
+        cuts = np.searchsorted(item_ts, row_ts, side="left")
+        for row_idx, cut in zip(rows_for_mid, cuts):
+            if cut == 0:
+                continue
+            length = min(int(cut), pool_len)
+            eval_rater_uids[row_idx, -length:] = item_uid[cut - length:cut]
+            eval_rater_rats[row_idx, -length:] = item_rat[cut - length:cut]
+    return eval_rater_uids, eval_rater_rats
+
+
 class SequenceTrainDataset(Dataset):
     """One sample = one user's full event sequence (truncated to last SEQ_LEN
     if longer). Per-position causal training: at every valid position t, the
@@ -507,6 +761,12 @@ class EvalDataset(Dataset):
             "uid": uid,
             "mid": int(self.mid[idx]),
             "label": float(self.lbl[idx]),
+            # eval_idx is the row index into the original eval_df; used by the
+            # model to look up the per-row dynamic rater-pool buffer when
+            # USE_RATER_POOL=1. Always emitted (cheap int) so the OFF-state
+            # collate signature is unchanged at the consumer side; the model
+            # just ignores it when use_rater_pool is False.
+            "eval_idx": idx,
             "hist_items": items,
             "hist_ratings": ratings,
             "hist_ts": timestamps,
@@ -553,6 +813,7 @@ def collate_eval(batch):
         "uid": [b["uid"] for b in batch],
         "mid": torch.tensor([b["mid"] for b in batch], dtype=torch.long),
         "label": torch.tensor([b["label"] for b in batch], dtype=torch.float32),
+        "eval_idx": torch.tensor([b["eval_idx"] for b in batch], dtype=torch.long),
         "hist_items": torch.tensor(np.stack([b["hist_items"] for b in batch])),
         "hist_ratings": torch.tensor(np.stack([b["hist_ratings"] for b in batch])),
         "hist_ts": torch.tensor(np.stack([b["hist_ts"] for b in batch])),
@@ -716,26 +977,62 @@ class HSTU(nn.Module):
     buckets.
 
     Cold-start content metadata (apr30, Idea 1, opt-in via USE_GENOME /
-    USE_GENRE / USE_YEAR flags). When enabled, each per-position item-side
-    embedding becomes
+    USE_GENRE / USE_YEAR / USE_POP_PRIOR / USE_ITEM_STATS flags). When
+    enabled, each per-position item-side embedding becomes
         item_full_embed(m) = item_embed(m)
-                           + (USE_GENOME ? genome_proj(genome[m]) : 0)
-                           + (USE_GENRE  ? genre_proj(genre[m])   : 0)
-                           + (USE_YEAR   ? year_embed(year_id[m]) : 0)
+                           + (USE_GENOME     ? genome_proj(genome[m])             : 0)
+                           + (USE_GENRE      ? genre_proj(genre[m])               : 0)
+                           + (USE_YEAR       ? year_embed(year_id[m])             : 0)
+                           + (USE_POP_PRIOR  ? pop_proj(item_pop_feature[m])      : 0)
+                           + (USE_ITEM_STATS ? item_stats_proj(item_stats[m])     : 0)
     and this *same* construction is used both at sequence input AND at
-    candidate scoring (symmetric path). Projection weights are zero-init,
-    so OFF→ON keeps step-0 logits identical to OFF and the metadata signal
-    grows monotonically as the projections train.
+    candidate scoring (symmetric path). Projection weights are zero-init
+    (xavier-init when PROJ_INIT_MODE=xavier for the genome/genre/year three;
+    pop_proj and item_stats_proj are always zero-init), so OFF→ON keeps step-0
+    logits identical to OFF and the metadata signal grows monotonically as the
+    projections train.
 
-    OFF-state byte-equivalence: when all three flags are 0, item_full_embed
-    skips every metadata branch and returns plain item_embed(m), matching
-    the prior baseline exactly. Metadata tensors are allocated regardless
-    (for codepath simplicity) but never accessed in the OFF path.
+    Bucketed absolute rating-timestamp (may03, variant A, opt-in via
+    USE_RATING_TS=1). When enabled, an additional rating_ts_embed(ts_bucket)
+    is summed into the per-position input — at content tokens only in
+    INTERLEAVE=1, at every position in INTERLEAVE=0. Application happens in
+    encode / encode_interleaved / encode_interleaved_with_candidate, NOT in
+    item_full_embed: ts is per-event, not per-item, so the colocation has to
+    be at the sequence-construction level. Zero-init weight makes step-0 ON
+    state == OFF state at the candidate-scoring level.
+
+    Dynamic rater pool (may03, variant C, opt-in via USE_RATER_POOL=1). When
+    enabled, the model gets a learnable user_embed table (num_users+1 rows
+    with padding_idx at the last slot), a shared anon_user_embed Parameter
+    for cold candidates, and a zero-init rater_cross_proj Linear(D, D) that
+    projects (pool * u_e) into a head-side cross added to the LAST projected
+    hidden state before the dot product. Per-item static rater pools (built
+    from train_df) and per-eval-row dynamic pools (built from train+val with
+    strict-prior cutoff) are registered as buffers. Cold raters
+    (count < RATER_POOL_MIN_COUNT) are masked out of the pool weighting.
+    All rater-pool modules are constructed inside `if self.use_rater_pool:`
+    so OFF-state RNG state is byte-identical to commit 9167fb6.
+
+    OFF-state byte-equivalence: when all seven flags are 0, item_full_embed
+    and the encode paths skip every conditional branch and behave identically
+    to the prior baseline. The genome/genre/year tensors are allocated
+    regardless (for codepath simplicity); the popularity, item-stats,
+    rating-ts, and rater-pool modules are constructed only when their
+    respective flag is 1 so OFF-state memory and RNG draws are unchanged.
     """
 
-    def __init__(self, num_items: int, num_rating_buckets: int,
-                 genome: torch.Tensor, genre: torch.Tensor, year_id: torch.Tensor):
+    def __init__(self, num_items: int, num_rating_buckets: int, num_users: int,
+                 genome: torch.Tensor, genre: torch.Tensor, year_id: torch.Tensor,
+                 item_pop: torch.Tensor, item_stats: torch.Tensor,
+                 train_ts_min: int,
+                 item_hist_uid: torch.Tensor | None = None,
+                 item_hist_rat: torch.Tensor | None = None,
+                 is_warm_rater: torch.Tensor | None = None,
+                 is_train_user_known: torch.Tensor | None = None,
+                 eval_rater_uids: torch.Tensor | None = None,
+                 eval_rater_rats: torch.Tensor | None = None):
         super().__init__()
+        self.num_users = int(num_users)
         # Index 0 is PAD; real movies occupy 1..num_items. Callers
         # (build_user_sequences, EvalDataset) shift movieIds by +1 so the
         # left-pad slot (also 0) and real movieId-0 do not collide.
@@ -819,6 +1116,143 @@ class HSTU(nn.Module):
         if self.use_aux_rating:
             self.aux_head = nn.Linear(EMBED_DIM, 1)
 
+        # Popularity prior (USE_POP_PRIOR=1, apr30 cold_user intervention plan
+        # option D). Constructed AFTER all prior conditional modules so the
+        # OFF-state RNG state is byte-identical to commit 6886442 — when the
+        # flag is 0, neither the buffer nor the projection exists, no RNG is
+        # consumed for this feature, and item_full_embed never references it.
+        # Buffer is not persistent (rebuilt each run from train_df by main()).
+        # Zero-init projection mirrors the genome/genre/year zero-init pattern
+        # so step-0 ON state == OFF state byte-equivalent at the
+        # candidate-scoring level (the popularity contribution is exactly 0
+        # before the projection trains).
+        self.use_pop_prior = bool(USE_POP_PRIOR)
+        if self.use_pop_prior:
+            self.register_buffer("item_pop_feature", item_pop, persistent=False)
+            self.pop_proj = nn.Linear(1, EMBED_DIM, bias=False)
+            nn.init.zeros_(self.pop_proj.weight)
+
+        # Per-item rating statistics (USE_ITEM_STATS=1, apr30 cold_user
+        # intervention plan variant B). Constructed AFTER pop_proj so the
+        # OFF-state RNG state is byte-identical to commit fd96d2a — when the
+        # flag is 0, neither the buffer nor the projection exists, no RNG is
+        # consumed for this feature, and item_full_embed never references it.
+        # Buffer is non-persistent (rebuilt each run from train_df by main()).
+        # Zero-init mirrors pop_proj: step-0 ON == OFF byte-equivalent at the
+        # candidate-scoring level. The 3 input dims are the (mean_norm,
+        # std_norm, frac_engaged) per-item stats computed in main() from
+        # train_df only — see USE_ITEM_STATS config-comment for the time-leak
+        # guarantee and normalization rationale.
+        self.use_item_stats = bool(USE_ITEM_STATS)
+        if self.use_item_stats:
+            self.register_buffer("item_stats_table", item_stats, persistent=False)
+            self.item_stats_proj = nn.Linear(3, EMBED_DIM, bias=False)
+            nn.init.zeros_(self.item_stats_proj.weight)
+
+        # Bucketed absolute rating-timestamp embedding (USE_RATING_TS=1, may03
+        # cold_user variant A). Constructed AFTER item_stats so OFF-state RNG
+        # state is byte-identical to commit c109f3c — when the flag is 0,
+        # neither the embedding nor the bucketing constants exist as module
+        # state, no RNG is consumed for this feature, and the encode paths
+        # never branch into the rating-ts code. Zero-init weight makes step-0
+        # ON state == OFF state at the candidate-scoring level (the rating-ts
+        # contribution is exactly 0 before the embedding trains). The
+        # train_ts_min / seconds_per_month buffers are registered (not parameters)
+        # so they ride along to the model device on .to(DEVICE) and don't get
+        # wd-decayed by AdamW. Applies to CONTENT tokens only in INTERLEAVE=1
+        # (action tokens get pure action_embed) and to every position in
+        # INTERLEAVE=0 (fused mode, where each position is one event).
+        self.use_rating_ts = bool(USE_RATING_TS)
+        if self.use_rating_ts:
+            self.rating_ts_embed = nn.Embedding(NUM_TS_BUCKETS, EMBED_DIM)
+            nn.init.zeros_(self.rating_ts_embed.weight)
+            self.register_buffer(
+                "train_ts_min",
+                torch.tensor(int(train_ts_min), dtype=torch.long),
+                persistent=False,
+            )
+            self.register_buffer(
+                "seconds_per_month",
+                torch.tensor(float(SECONDS_PER_MONTH), dtype=torch.float32),
+                persistent=False,
+            )
+
+        # Dynamic rater-pool head-side cross (USE_RATER_POOL=1, may03 variant C).
+        # Constructed AFTER rating_ts so OFF-state RNG state is byte-identical
+        # to commit 9167fb6 — when the flag is 0, no user_embed table, no
+        # anon_user_embed Parameter, no rater_cross_proj, no rater-pool buffers
+        # exist; no RNG is consumed for this feature, and the score paths skip
+        # the cross entirely. Zero-init weight on rater_cross_proj makes step-0
+        # ON state == OFF state at the candidate-scoring level (the cross
+        # contribution is exactly 0 before the proj trains).
+        #
+        # Pool semantics: at the candidate side, pool = mean(rater_e * rating_w)
+        # over the candidate item's last K raters (filtered to warm raters,
+        # excluding ones with < MIN_COUNT train ratings as noise floor). The
+        # pool * u_e cross encodes "did similar users (raters of this item)
+        # match this user's taste?" Zero-init proj keeps the model's logit at
+        # step 0 unchanged from OFF; gradient flows during training and the
+        # cross signal grows monotonically.
+        #
+        # Rater pool buffers (registered, non-persistent — rebuilt each run
+        # in main()):
+        #   item_hist_uid: (num_items+1, K) int64. PAD = num_users.
+        #   item_hist_rat: (num_items+1, K) float32. ratings/5.0; 0 at PAD.
+        #   eval_rater_uids: (n_eval, K) int64. Per-row dynamic pool from
+        #       train+val with strict-prior cutoff (built in main()).
+        #   eval_rater_rats: (n_eval, K) float32.
+        #   is_warm_rater_table: (num_users+1,) bool. True iff user has
+        #       >= RATER_POOL_MIN_COUNT real ratings in train_df.
+        #   is_train_user_known: (num_users+1,) bool. True iff user appears in
+        #       train_df. Drives the cold-candidate fallback to anon_user_embed.
+        self.use_rater_pool = bool(USE_RATER_POOL)
+        if self.use_rater_pool:
+            assert item_hist_uid is not None and item_hist_rat is not None
+            assert is_warm_rater is not None and is_train_user_known is not None
+            assert eval_rater_uids is not None and eval_rater_rats is not None
+            # USER_PAD_IDX = num_users → padding_idx slot at the last row.
+            # padding_idx zeroes gradients for that slot AND zero-init's its
+            # row, so PAD raters contribute exactly zero to the pool sum even
+            # before the valid mask is applied. We still apply a valid-mask
+            # multiplier for clarity and to keep the abs() denominator robust.
+            self.user_embed = nn.Embedding(self.num_users + 1, EMBED_DIM,
+                                           padding_idx=self.num_users)
+            # Shared cold-user fallback for the candidate side. Zero-init so
+            # cold-candidate cross == 0 at step 0 (matches the warm path,
+            # which is also exactly 0 at step 0 due to zero-init rater_cross_proj).
+            self.anon_user_embed = nn.Parameter(torch.zeros(EMBED_DIM))
+            # Head-side cross projection. ZERO-INIT is what makes OFF→ON
+            # byte-equivalent at step 0 (the rater contribution is exactly 0
+            # before this proj trains, regardless of pool values or u_e).
+            self.rater_cross_proj = nn.Linear(EMBED_DIM, EMBED_DIM, bias=False)
+            nn.init.zeros_(self.rater_cross_proj.weight)
+            self.register_buffer("item_hist_uid", item_hist_uid, persistent=False)
+            self.register_buffer("item_hist_rat", item_hist_rat, persistent=False)
+            self.register_buffer("is_warm_rater_table", is_warm_rater, persistent=False)
+            self.register_buffer("is_train_user_known", is_train_user_known,
+                                 persistent=False)
+            self.register_buffer("eval_rater_uids", eval_rater_uids, persistent=False)
+            self.register_buffer("eval_rater_rats", eval_rater_rats, persistent=False)
+            self.rater_pool_pivot = float(RATER_POOL_PIVOT)
+
+    def _ts_bucket(self, ts: torch.Tensor) -> torch.Tensor:
+        """Bucket absolute Unix-second timestamps into NUM_TS_BUCKETS monthly
+        buckets over ml-25m's train range.
+
+        Args:
+            ts: (..., ) int64 Unix-second timestamps. PAD positions have ts=0
+                (epoch 1970), well before TRAIN_TS_MIN, so they clip to bucket 0.
+
+        Returns:
+            (..., ) int64 bucket indices in [0, NUM_TS_BUCKETS-1].
+        """
+        # Subtract train_ts_min in int64, then divide by seconds_per_month in
+        # fp32 (range fits well within fp32 precision: ~24 years ≈ 7.6e8 s,
+        # / SECONDS_PER_MONTH ≈ 290 — far from fp32 mantissa limits).
+        delta = (ts - self.train_ts_min).float()
+        bucket = (delta / self.seconds_per_month).long()
+        return bucket.clamp(0, NUM_TS_BUCKETS - 1)
+
     def item_full_embed(self, item_ids: torch.Tensor) -> torch.Tensor:
         """Symmetric per-position item-side embedding used for both sequence
         input AND candidate scoring. Same construction in both spots is the
@@ -835,6 +1269,18 @@ class HSTU(nn.Module):
             e = e + self.genre_proj(self.genre_table[item_ids])
         if self.use_year:
             e = e + self.year_embed(self.year_id_table[item_ids])
+        if self.use_pop_prior:
+            # item_pop_feature: (num_items+1,) ∈ [0,1]. Gather to (..., 1) and
+            # project to (..., EMBED_DIM). Symmetric: applies at sequence
+            # content tokens, training-time per-position scoring targets, and
+            # eval candidate — all three call sites pass through this method.
+            e = e + self.pop_proj(self.item_pop_feature[item_ids].unsqueeze(-1))
+        if self.use_item_stats:
+            # item_stats_table: (num_items+1, 3) ∈ [0,1]. Gather to (..., 3)
+            # and project to (..., EMBED_DIM). Same symmetric pattern as
+            # pop_prior — applies at every call site that produces an
+            # item-side embedding.
+            e = e + self.item_stats_proj(self.item_stats_table[item_ids])
         return e
 
     def encode(self, hist_items: torch.Tensor, hist_ratings: torch.Tensor,
@@ -842,6 +1288,13 @@ class HSTU(nn.Module):
         """Run the causal stack and return per-position hidden states (B, T, D)."""
         B, T = hist_items.shape
         h = self.item_full_embed(hist_items) + self.rating_embed(hist_ratings)
+        if self.use_rating_ts:
+            # Fused mode: each position is one event with item+rating+ts. Add
+            # the bucketed-ts embedding to every position (parallel to rating_embed
+            # — same additive role at the per-event level). PAD positions have
+            # ts=0 → clipped to bucket 0; pad-position contribution is masked
+            # out of attention regardless via hist_mask.
+            h = h + self.rating_ts_embed(self._ts_bucket(hist_ts))
         # Causal mask as a bool over (T, T): True where i >= j (allowed).
         causal_bool = torch.tril(torch.ones(T, T, dtype=torch.bool, device=h.device))
         # Pairwise log-bucketed time deltas, computed once and reused across blocks.
@@ -892,6 +1345,16 @@ class HSTU(nn.Module):
         # even positions only. PAD (id=0) → padding_idx zeros — no
         # contribution at action positions where content_ids = 0.
         content_emb = self.item_full_embed(content_ids)        # (B, 2N, D)
+        if self.use_rating_ts:
+            # Interleaved mode: rating-ts embedding lives in the CONTENT token
+            # (colocated with year_embed via item_full_embed), so the model
+            # can learn ts × year interactions. Action tokens stay pure
+            # action_embed — adding to content_emb pre-where ensures no
+            # contribution leaks into action positions. ts_2n shares the same
+            # value at c_i and a_i (per _build_interleaved); we use ts_2n
+            # directly because the where-select picks content_emb only at
+            # even positions where this contribution is wanted.
+            content_emb = content_emb + self.rating_ts_embed(self._ts_bucket(ts_2n))
         action_emb = self.action_embed(action_ids)             # (B, 2N, D)
         # torch.where picks content_emb at even (is_content=True) positions
         # and action_emb at odd (is_content=False) positions. Broadcast the
@@ -945,6 +1408,15 @@ class HSTU(nn.Module):
                                    dim=1)
 
         content_emb = self.item_full_embed(new_content)        # (B, 2N+1, D)
+        if self.use_rating_ts:
+            # Eval-time symmetric application: the appended candidate at
+            # position 2N is a CONTENT token whose ts is the eval row's
+            # target_ts (already concatenated into new_ts above). Bucketing
+            # uses the same train-derived constants as training, so the
+            # candidate sees the same ts vocabulary. The candidate's
+            # rating_ts_embed contribution lands in content_emb[:, -1, :]
+            # before torch.where selects it (is_content=True at -1).
+            content_emb = content_emb + self.rating_ts_embed(self._ts_bucket(new_ts))
         action_emb = self.action_embed(new_action)             # (B, 2N+1, D)
         x = torch.where(new_is_content.unsqueeze(-1), content_emb, action_emb)
 
@@ -968,6 +1440,64 @@ class HSTU(nn.Module):
             return self.head_mlp(h)
         return h
 
+    def _rater_pool_cross(self, uids: torch.Tensor, candidate_mids: torch.Tensor,
+                          eval_idx: torch.Tensor | None = None) -> torch.Tensor:
+        """Compute the head-side rater-pool cross.
+
+        Returns a (B, D) cross to ADD to last_h before the dot product with
+        the candidate embedding. Output is exactly zero at step 0 because
+        rater_cross_proj is zero-init.
+
+        Args:
+            uids: (B,) int64. The candidate-side user IDs (the user we're
+                scoring for). Drives the warm/cold candidate fallback via
+                is_train_user_known.
+            candidate_mids: (B,) int64. The +1-shifted candidate movieIds. Used
+                only when `eval_idx is None` to look up the static train-only
+                rater pool from item_hist_uid/rat. The +1 shift means PAD=0,
+                real items at 1..num_items+1; the buffers are sized accordingly.
+            eval_idx: (B,) int64 or None. Per-row index into the precomputed
+                eval_rater_uids/rats buffers. When provided (eval-time), uses
+                the per-row dynamic pool (raters with ts < target_ts from
+                train+val). When None (training-time), uses the static train
+                pool. Both paths apply the same warm-rater filter and centered
+                pool weighting.
+
+        Pool computation (rating-centered, mirrors simple_v2's
+        _pool_history mode='rating_centered'):
+            valid       = (rater_uids != USER_PAD_IDX).float()
+            is_warm     = is_warm_rater_table[rater_uids].float()
+            w           = (rater_rats - pool_pivot) * valid * is_warm
+            denom       = w.abs().sum(dim=1, keepdim=True).clamp(min=1e-6)
+            pool        = sum(rater_e * w) / denom                          # (B, D)
+            u_e         = user_embed(uids) for warm cands, anon_user_embed for cold
+            cross       = rater_cross_proj(pool * u_e)                       # (B, D)
+        """
+        if eval_idx is not None:
+            rater_uids = self.eval_rater_uids[eval_idx]    # (B, K)
+            rater_rats = self.eval_rater_rats[eval_idx]    # (B, K)
+        else:
+            rater_uids = self.item_hist_uid[candidate_mids]    # (B, K)
+            rater_rats = self.item_hist_rat[candidate_mids]    # (B, K)
+        # Validity mask: PAD slots (rater_uid == num_users) zero out.
+        valid = (rater_uids != self.num_users).to(rater_rats.dtype)            # (B, K)
+        # Warm-rater mask: cold raters (count < MIN_COUNT) treated as PAD-like.
+        # is_warm_rater_table indexes safely on PAD too because PAD is at
+        # row num_users where the table is False.
+        is_warm = self.is_warm_rater_table[rater_uids].to(rater_rats.dtype)    # (B, K)
+        rater_e = self.user_embed(rater_uids)                                  # (B, K, D)
+        # Centered pool: rating in [0.1, 1.0], pivot=0.6 → engaged raters
+        # contribute positive weight, disengaged raters contribute negative,
+        # neutral (rating ~3) contribute near-zero.
+        w = (rater_rats - self.rater_pool_pivot) * valid * is_warm             # (B, K)
+        denom = w.abs().sum(dim=1, keepdim=True).clamp(min=1e-6)               # (B, 1)
+        pool = (rater_e * w.unsqueeze(-1)).sum(dim=1) / denom                  # (B, D)
+        # Cold-candidate fallback: use anon_user_embed for users not in train.
+        is_cold_cand = (~self.is_train_user_known[uids]).to(pool.dtype).unsqueeze(-1)  # (B, 1)
+        warm_e = self.user_embed(uids)                                         # (B, D)
+        u_e = warm_e * (1.0 - is_cold_cand) + self.anon_user_embed.unsqueeze(0) * is_cold_cand
+        return self.rater_cross_proj(pool * u_e)                               # (B, D)
+
     def score_per_position(self, h: torch.Tensor, target_items: torch.Tensor) -> torch.Tensor:
         """Dot-product scoring at every position. h:(B,T,D), target_items:(B,T)."""
         h = self._project_head(h)                             # (B, T, D)
@@ -975,7 +1505,9 @@ class HSTU(nn.Module):
         return (h * target_e).sum(dim=-1)                     # (B, T)
 
     def score_eval(self, h: torch.Tensor, hist_mask: torch.Tensor,
-                   candidate: torch.Tensor) -> torch.Tensor:
+                   candidate: torch.Tensor,
+                   uids: torch.Tensor | None = None,
+                   eval_idx: torch.Tensor | None = None) -> torch.Tensor:
         """Score the LAST valid position's hidden state against a candidate.
 
         With LEFT-padding, real events always occupy the rightmost positions
@@ -983,9 +1515,15 @@ class HSTU(nn.Module):
         any warm user. Empty-history rows are also indexed at seq_len-1 — the
         hidden state there is computed from all-PAD inputs and the dot product
         with the candidate embedding gives the model's cold-user prior.
+
+        When use_rater_pool=True and uids/eval_idx are provided, adds the
+        zero-init rater-pool cross to last_h after _project_head. uids/eval_idx
+        default to None so OFF-state callers keep the prior signature.
         """
         last_h = h[:, -1, :]                                  # (B, D)
         last_h = self._project_head(last_h)                   # (B, D)
+        if self.use_rater_pool and uids is not None:
+            last_h = last_h + self._rater_pool_cross(uids, candidate, eval_idx=eval_idx)
         cand_e = self.item_full_embed(candidate)              # (B, D)
         return (last_h * cand_e).sum(dim=-1)                  # (B,)
 
@@ -1068,6 +1606,13 @@ def build_scheduler(optimizer, lr, schedule_name, warmup_steps, total_steps):
             ],
             milestones=[warmup_steps],
         )
+    elif schedule_name == "cawr":
+        from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+        steps_per_epoch = total_steps // MAX_EPOCHS
+        T_0 = CAWR_T_0_EPOCHS * steps_per_epoch
+        T_mult = CAWR_T_MULT
+        eta_min = lr * CAWR_ETA_MIN_FRAC
+        return CosineAnnealingWarmRestarts(optimizer, T_0=T_0, T_mult=T_mult, eta_min=eta_min)
     else:
         raise ValueError(f"unknown LR_SCHEDULE={schedule_name}")
 
@@ -1133,6 +1678,23 @@ def train_one_epoch(model, loader, optimizer, scheduler=None):
                 # The dot product is "the user's hidden state at the content
                 # slot agrees with this item's embedding when they engaged."
                 logits = model.score_per_position(h, content_ids)    # (B, 2N)
+                # Rater-pool head-side cross at the LAST CONTENT position
+                # (interleaved: index 2N-2). Static train pool of c_{N-1} as
+                # the candidate. Adds (rater_cross * item_full_embed(cand)).sum
+                # to the existing logit at that position; zero-init proj keeps
+                # this contribution at exactly 0 at step 0 → byte-equivalent
+                # OFF→ON. Pad-position rows (mask=0) get a non-zero increment
+                # but are masked out of the loss anyway.
+                if model.use_rater_pool:
+                    last_idx = logits.size(1) - 2     # 2N-2 (last content slot)
+                    uids = torch.tensor(batch["uid"], dtype=torch.long, device=DEVICE)  # (B,)
+                    last_cand = content_ids[:, last_idx]                  # (B,)
+                    rater_cross = model._rater_pool_cross(uids, last_cand, eval_idx=None)  # (B, D)
+                    last_cand_e = model.item_full_embed(last_cand)        # (B, D)
+                    delta = (rater_cross * last_cand_e).sum(dim=-1)       # (B,)
+                    # In-place style update: clone to avoid mutating in autograd.
+                    logits = logits.clone()
+                    logits[:, last_idx] = logits[:, last_idx] + delta
                 targets = (content_rb >= ENGAGED_BUCKET_THRESHOLD).float()
                 # Loss mask: only at valid CONTENT positions. Action positions
                 # contribute 0; pad pairs (mask_2n=0) contribute 0.
@@ -1172,6 +1734,19 @@ def train_one_epoch(model, loader, optimizer, scheduler=None):
                 pair_mask = hist_mask[:, :-1] * hist_mask[:, 1:]    # (B, T-1)
 
                 logits = model.score_per_position(h_in, next_items)  # (B, T-1)
+                # Rater-pool head-side cross at the LAST training position
+                # (fused: index T-2 of h_in, predicting next_items[T-2] which
+                # is hist_items[T-1]). Static train pool of the predicted item
+                # as candidate. Same byte-equivalence pattern as INTERLEAVE.
+                if model.use_rater_pool:
+                    last_idx = logits.size(1) - 1     # T-2 (last predicting position)
+                    uids = torch.tensor(batch["uid"], dtype=torch.long, device=DEVICE)
+                    last_cand = next_items[:, last_idx]                   # (B,)
+                    rater_cross = model._rater_pool_cross(uids, last_cand, eval_idx=None)
+                    last_cand_e = model.item_full_embed(last_cand)
+                    delta = (rater_cross * last_cand_e).sum(dim=-1)
+                    logits = logits.clone()
+                    logits[:, last_idx] = logits[:, last_idx] + delta
                 targets = (next_ratings >= ENGAGED_BUCKET_THRESHOLD).float()
                 loss_per = bce(logits, targets)                     # (B, T-1)
                 masked = loss_per * pair_mask
@@ -1212,7 +1787,7 @@ def train_one_epoch(model, loader, optimizer, scheduler=None):
 
 
 @torch.no_grad()
-def evaluate_model(model, loader):
+def evaluate_model(model, loader, save_preds_path: str | None = None):
     """Per-(user, candidate, ts) eval: dot(h_T, item_embed(candidate)) → sigmoid → AUC.
 
     INTERLEAVE=1 path: append the candidate as a content token at position 2N
@@ -1220,9 +1795,15 @@ def evaluate_model(model, loader):
     dot(h_{2N}, item_full_embed(candidate)) at the appended position. The
     candidate's ts is the eval row's target_ts (so the time-delta bias
     against the prefix is computed from the right cutoff).
+
+    When `save_preds_path` is not None, also accumulate per-row uid / mid /
+    label / score / prefix_len and write a CSV at the given path before
+    returning. Off-state byte-equivalent to the prior baseline (no extra
+    tensors built or appended when save_preds_path is None).
     """
     model.eval()
     all_scores, all_labels = [], []
+    pred_rows = [] if save_preds_path else None
     autocast_ctx = (
         torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
         if (USE_BF16 and DEVICE == "cuda") else nullcontext()
@@ -1230,6 +1811,11 @@ def evaluate_model(model, loader):
     for batch in loader:
         cand = batch["mid"].to(DEVICE)
         label = batch["label"]
+        # uids / eval_idx tensors are computed once per batch; only consumed
+        # by the model when use_rater_pool is True. OFF-state is byte-equivalent
+        # because the cross is gated by `if model.use_rater_pool`.
+        uids_t = torch.tensor(batch["uid"], dtype=torch.long, device=DEVICE)
+        eval_idx_t = batch["eval_idx"].to(DEVICE)
         if INTERLEAVE:
             content_ids = batch["content_ids"].to(DEVICE)
             action_ids = batch["action_ids"].to(DEVICE)
@@ -1243,6 +1829,12 @@ def evaluate_model(model, loader):
                     cand, target_ts,
                 )                                                    # (B, D)
                 last_h = model._project_head(last_h)
+                # Eval-time rater-pool head-side cross at the appended-candidate
+                # position. Per-row dynamic pool (raters with ts < target_ts
+                # from train+val) via eval_idx. Zero-init proj keeps step-0
+                # contribution = 0 → byte-equivalent OFF→ON.
+                if model.use_rater_pool:
+                    last_h = last_h + model._rater_pool_cross(uids_t, cand, eval_idx=eval_idx_t)
                 cand_e = model.item_full_embed(cand)                 # (B, D)
                 logit = (last_h * cand_e).sum(dim=-1)                # (B,)
         else:
@@ -1252,14 +1844,42 @@ def evaluate_model(model, loader):
             hist_mask = batch["hist_mask"].to(DEVICE)
             with autocast_ctx:
                 h = model.encode(hist_items, hist_ratings, hist_ts, hist_mask)
-                logit = model.score_eval(h, hist_mask, cand)
+                logit = model.score_eval(h, hist_mask, cand,
+                                         uids=uids_t, eval_idx=eval_idx_t)
         # Cast to fp32 for sigmoid + AUC accumulation. Outside autocast scope
         # bf16 tensors are returned as-is; .float() makes the numpy conversion
         # match the fp32 path bit-equivalent. (No-op when autocast is null.)
-        all_scores.append(torch.sigmoid(logit.float()).detach().cpu().numpy())
-        all_labels.append(label.numpy())
+        scores_np = torch.sigmoid(logit.float()).detach().cpu().numpy()
+        labels_np = label.numpy()
+        all_scores.append(scores_np)
+        all_labels.append(labels_np)
+        if pred_rows is not None:
+            # prefix_len = number of valid PRIOR EVENTS the model saw on this row.
+            # Fused path: hist_mask is (B, N) per-event, so .sum() over dim=1 == events.
+            # Interleaved path: mask_2n is (B, 2N) and pads/keeps content+action as a
+            # PAIR (both masked together by _build_interleaved), so events = mask/2.
+            if INTERLEAVE:
+                prefix_len = (mask_2n.sum(dim=1) // 2).long().detach().cpu().numpy()
+            else:
+                prefix_len = hist_mask.sum(dim=1).long().detach().cpu().numpy()
+            uids = np.asarray(batch["uid"], dtype=np.int64)
+            mids = cand.detach().cpu().numpy().astype(np.int64)
+            pred_rows.append(np.stack([uids, mids, labels_np.astype(np.float64),
+                                       scores_np.astype(np.float64),
+                                       prefix_len.astype(np.int64)], axis=1))
     scores = np.concatenate(all_scores)
     labels = np.concatenate(all_labels)
+    if pred_rows is not None:
+        arr = np.concatenate(pred_rows, axis=0)
+        df = pd.DataFrame({
+            "uid": arr[:, 0].astype(np.int64),
+            "mid": arr[:, 1].astype(np.int64),
+            "label": arr[:, 2].astype(np.float32),
+            "score": arr[:, 3].astype(np.float32),
+            "prefix_len": arr[:, 4].astype(np.int64),
+        })
+        df.to_csv(save_preds_path, index=False)
+        log.info(f"  saved {len(df)} eval predictions to {save_preds_path}")
     return evaluate(labels, scores)["auc"]
 
 
@@ -1282,6 +1902,84 @@ def main():
     genre_t = torch.from_numpy(genre_np).to(DEVICE)
     year_id_t = torch.from_numpy(year_id_np).to(DEVICE)
 
+    # Popularity prior table (USE_POP_PRIOR=1): per-item normalized log-rating-count
+    # built ONCE from train_df only (val/test rows never enter this aggregation,
+    # and prepare.load_data's time-based split guarantees train timestamps strictly
+    # precede val/test, so train counts are inherently strictly-prior to every
+    # val/test row). Sized (num_items + 1,) to match the +1-shifted movieId
+    # convention: row 0 is PAD (count=0 → log1p=0 → normalized 0). Allocated
+    # regardless of the flag so the constructor signature stays uniform; the
+    # buffer is registered (and pop_proj built) only when use_pop_prior is True.
+    train_real = train_df[train_df["rating"] > 0]
+    item_counts = (
+        train_real.groupby("movieId").size()
+        .reindex(range(stats["num_items"]), fill_value=0)
+        .values
+    )
+    item_log_count_real = np.log1p(item_counts.astype(np.float64)).astype(np.float32)
+    max_log = float(item_log_count_real.max())
+    item_pop_real = item_log_count_real / max(max_log, 1.0)            # (num_items,) ∈ [0, 1]
+    item_pop_np = np.zeros(stats["num_items"] + 1, dtype=np.float32)   # (num_items+1,)
+    item_pop_np[1:] = item_pop_real                                    # row 0 = PAD = 0
+    item_pop_t = torch.from_numpy(item_pop_np).to(DEVICE)
+    log.info(f"  pop prior: max_log_count={max_log:.3f}  "
+             f"items_with_train_ratings={int((item_counts > 0).sum())}/{stats['num_items']}")
+
+    # Per-item rating statistics table (USE_ITEM_STATS=1): 3 scalars per item
+    # — (mean_rating/5.0, std_rating/2.5, frac_engaged) — computed ONCE from
+    # train_df ONLY. Time-leak guarantee: the source frame is `train_real`
+    # from above (`train_df[train_df["rating"] > 0]`), which contains zero
+    # val/test rows by construction (prepare.load_data's split is purely
+    # time-based and disjoint by row index). So every aggregation here is
+    # strictly-prior to all val/test samples — the same guarantee that
+    # backs USE_POP_PRIOR. Allocated regardless of the flag so the
+    # constructor signature stays uniform; the buffer/projection are
+    # registered only when use_item_stats is True.
+    #
+    # NaN imputation:
+    #   - Items with ZERO train ratings: mean=NaN, std=NaN, frac=NaN → impute
+    #     0 for all three scalars. The signal is "we have no info", which
+    #     differs from "we know mean=0" since the smallest valid mean is
+    #     0.5/5.0 = 0.1 — so 0 is unambiguously a sentinel.
+    #   - Items with EXACTLY 1 train rating: mean and frac are well-defined,
+    #     but pandas .std() returns NaN (default ddof=1 needs n>=2). Impute
+    #     std=0 only — leave mean and frac at their real single-sample values.
+    item_groupby = train_real.groupby("movieId")
+    mean_rating = item_groupby["rating"].mean().reindex(range(stats["num_items"]))
+    std_rating = item_groupby["rating"].std().reindex(range(stats["num_items"]))
+    frac_engaged = (
+        item_groupby["rating"].apply(lambda r: (r >= 4).mean())
+        .reindex(range(stats["num_items"]))
+    )
+    mean_norm = (mean_rating / 5.0).fillna(0.0).to_numpy(dtype=np.float32)
+    std_norm = (std_rating / 2.5).fillna(0.0).to_numpy(dtype=np.float32)
+    frac_norm = frac_engaged.fillna(0.0).to_numpy(dtype=np.float32)
+    item_stats_real = np.stack([mean_norm, std_norm, frac_norm], axis=1)   # (num_items, 3)
+    item_stats_np = np.zeros((stats["num_items"] + 1, 3), dtype=np.float32)
+    item_stats_np[1:] = item_stats_real                                    # row 0 = PAD = zeros
+    item_stats_t = torch.from_numpy(item_stats_np).to(DEVICE)
+    log.info(f"  item stats: mean_norm avg={float(mean_norm.mean()):.3f}  "
+             f"std_norm avg={float(std_norm.mean()):.3f}  "
+             f"frac_engaged avg={float(frac_norm.mean()):.3f}")
+
+    # Bucketed absolute rating-timestamp constants (USE_RATING_TS=1, may03
+    # variant A). TRAIN_TS_MIN is the minimum timestamp in train_df only — val
+    # and test never enter this aggregation (per prepare.load_data's time-based
+    # split, train timestamps strictly precede val/test, so this is a safe
+    # train-only statistic). The HSTU constructor receives train_ts_min and
+    # registers it as a buffer along with SECONDS_PER_MONTH; bucketing happens
+    # in HSTU._ts_bucket on the fly during forward. Computed regardless of the
+    # flag so the constructor signature stays uniform; the embedding is built
+    # only when USE_RATING_TS=1.
+    train_ts_min = int(train_df["timestamp"].min())
+    train_ts_max = int(train_df["timestamp"].max())
+    span_seconds = train_ts_max - train_ts_min
+    span_months = span_seconds / SECONDS_PER_MONTH
+    log.info(f"  rating-ts bucketing: train_ts_min={train_ts_min}  "
+             f"train_ts_max={train_ts_max}  span={span_months:.1f} months  "
+             f"num_buckets={NUM_TS_BUCKETS}  "
+             f"~{span_months / NUM_TS_BUCKETS:.1f} months/bucket")
+
     # Eval history uses train+val with per-sample strict-prior cutoff (mirrors
     # simple_v2's EVAL_DYNAMIC_HIST=1 — the +0.022 win at apr28ad came from val
     # rows seeing their OWN earlier val rows in history, while side="left"
@@ -1299,13 +1997,81 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
                             collate_fn=collate_eval)
 
-    model = HSTU(stats["num_items"], NUM_RATING_BUCKETS,
-                 genome=genome_t, genre=genre_t, year_id=year_id_t).to(DEVICE)
+    # Dynamic rater pool buffers (USE_RATER_POOL=1, may03 variant C). Computed
+    # ONLY when the flag is on so OFF-state startup is unchanged. All four
+    # tensors are derived from train_df (with val_df mixed in only for the
+    # eval-row dynamic pool, which uses strict-prior ts cutoff so no leak):
+    #   item_hist_uid/rat: (num_items+1, RATER_POOL_LEN). Static train pool
+    #       used at training-time and as the model's static fallback.
+    #   eval_rater_uids/rats: (n_eval, RATER_POOL_LEN). Per-row dynamic pool
+    #       from train+val with strict-prior cutoff (ts_rater < ts_row).
+    #   is_warm_rater: (num_users+1,) bool. True iff a user has >=
+    #       RATER_POOL_MIN_COUNT real ratings in train_df. Cold raters are
+    #       masked out of the pool weighting (treated as PAD).
+    #   is_train_user_known: (num_users+1,) bool. True iff a user appears in
+    #       train_df. Cold candidates fall back to anon_user_embed.
+    if USE_RATER_POOL:
+        log.info(f"Building rater-pool buffers (USE_RATER_POOL=1, "
+                 f"K={RATER_POOL_LEN}, pivot={RATER_POOL_PIVOT}, "
+                 f"min_count={RATER_POOL_MIN_COUNT})")
+        item_hist_uid_np, item_hist_rat_np = _build_item_rater_pool(
+            train_df, stats["num_items"], stats["num_users"], RATER_POOL_LEN,
+        )
+        eval_rater_uids_np, eval_rater_rats_np = _build_eval_rater_pool(
+            val_df, train_df, val_df, stats["num_items"], stats["num_users"], RATER_POOL_LEN,
+        )
+        # Per-user train-rating count → warm/cold rater mask.
+        train_real = train_df[train_df["rating"] > 0]
+        user_count = (
+            train_real.groupby("userId").size()
+            .reindex(range(stats["num_users"]), fill_value=0)
+            .values
+        )
+        is_warm_np = np.zeros(stats["num_users"] + 1, dtype=bool)
+        is_warm_np[:stats["num_users"]] = user_count >= RATER_POOL_MIN_COUNT
+        # Last slot (== num_users) is the PAD slot, stays False.
+        # is_train_user_known (warm-candidate gate): True iff user appears in
+        # train_df (any positive rating).
+        is_known_np = np.zeros(stats["num_users"] + 1, dtype=bool)
+        is_known_np[:stats["num_users"]] = user_count > 0
+        n_warm = int(is_warm_np.sum())
+        n_known = int(is_known_np.sum())
+        # PAD-slot rows in eval pools should not occur for warm raters (PAD
+        # filled at unfilled slots only); spot-check that pool returns reasonable
+        # rater counts.
+        n_eval_with_raters = int((eval_rater_uids_np != stats["num_users"]).any(axis=1).sum())
+        log.info(f"  rater pool: warm raters={n_warm}/{stats['num_users']}  "
+                 f"known users={n_known}/{stats['num_users']}  "
+                 f"eval rows with >=1 dynamic rater={n_eval_with_raters}/{len(val_df)}")
+        item_hist_uid_t = torch.from_numpy(item_hist_uid_np).to(DEVICE)
+        item_hist_rat_t = torch.from_numpy(item_hist_rat_np).to(DEVICE)
+        eval_rater_uids_t = torch.from_numpy(eval_rater_uids_np).to(DEVICE)
+        eval_rater_rats_t = torch.from_numpy(eval_rater_rats_np).to(DEVICE)
+        is_warm_t = torch.from_numpy(is_warm_np).to(DEVICE)
+        is_known_t = torch.from_numpy(is_known_np).to(DEVICE)
+    else:
+        item_hist_uid_t = None
+        item_hist_rat_t = None
+        eval_rater_uids_t = None
+        eval_rater_rats_t = None
+        is_warm_t = None
+        is_known_t = None
+
+    model = HSTU(stats["num_items"], NUM_RATING_BUCKETS, stats["num_users"],
+                 genome=genome_t, genre=genre_t, year_id=year_id_t,
+                 item_pop=item_pop_t, item_stats=item_stats_t,
+                 train_ts_min=train_ts_min,
+                 item_hist_uid=item_hist_uid_t, item_hist_rat=item_hist_rat_t,
+                 is_warm_rater=is_warm_t, is_train_user_known=is_known_t,
+                 eval_rater_uids=eval_rater_uids_t,
+                 eval_rater_rats=eval_rater_rats_t).to(DEVICE)
     n_params = sum(p.numel() for p in model.parameters())
     log.info(f"HSTU: {n_params/1e6:.2f}M params on {DEVICE}  "
              f"(layers={NUM_LAYERS}, heads={NUM_HEADS}, dim={EMBED_DIM}, "
              f"time_buckets={NUM_TIME_BUCKETS}) "
              f"use_genome={model.use_genome} use_genre={model.use_genre} use_year={model.use_year} "
+             f"use_pop_prior={model.use_pop_prior} use_item_stats={model.use_item_stats} "
+             f"use_rating_ts={model.use_rating_ts} use_rater_pool={model.use_rater_pool} "
              f"use_mlp_head={model.use_mlp_head} use_interleave={model.use_interleave} "
              f"use_aux_rating={model.use_aux_rating}"
              + (f" aux_w={AUX_RATING_WEIGHT}" if model.use_aux_rating else ""))
@@ -1320,13 +2086,28 @@ def main():
              f"warmup_steps={WARMUP_STEPS}  total_steps={total_steps}  "
              f"start_lr={optimizer.param_groups[0]['lr']:.2e}  "
              f"use_bf16={bool(USE_BF16)}")
+    if LR_SCHEDULE == "cawr":
+        steps_per_epoch = total_steps // MAX_EPOCHS
+        cawr_T_0 = CAWR_T_0_EPOCHS * steps_per_epoch
+        log.info(f"  cawr: T_0={cawr_T_0} steps ({CAWR_T_0_EPOCHS} epochs)  "
+                 f"T_mult={CAWR_T_MULT}  eta_min={LR * CAWR_ETA_MIN_FRAC:.2e} "
+                 f"(eta_min_frac={CAWR_ETA_MIN_FRAC})")
 
     best_val_auc = 0.0
     for epoch in range(MAX_EPOCHS):
         train_loss, avg_grad_norm, avg_aux_loss = train_one_epoch(
             model, train_loader, optimizer, scheduler,
         )
-        val_auc = evaluate_model(model, val_loader)
+        # Only request the per-row prediction dump on the FINAL epoch's eval,
+        # both to keep prior epochs byte-equivalent to the off path AND to
+        # reflect the deployed model state. SAVE_PREDS=0 → save_path stays None
+        # for every call, so off-state is byte-equivalent.
+        save_path = (
+            SAVE_PREDS_PATH
+            if (SAVE_PREDS and epoch == MAX_EPOCHS - 1)
+            else None
+        )
+        val_auc = evaluate_model(model, val_loader, save_preds_path=save_path)
         # Only append grad_norm when GRAD_CLIP fired (avg_grad_norm not None);
         # only append aux_loss when AUX_RATING_WEIGHT > 0 (avg_aux_loss not None).
         # OFF-state log line is unchanged from the prior baseline.

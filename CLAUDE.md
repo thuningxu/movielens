@@ -12,7 +12,7 @@ The two prior attempts are archived as subdirectories:
 
 This attempt drops the engineered-feature framing entirely. HSTU treats the user as a sequence of (item, action, time) tokens and uses pointwise causal attention to predict next-event engagement. No hand-specified pools, no concat features, no cross fields.
 
-**Status**: apr30 cycle complete. Best result `interleave_3L_bf16` = **val 0.8567 single-seed (SEED=42)** / **0.8563 2-seed mean** (SEED=43=0.8558). Gap to simple_v2's locked 0.8594: **−0.0027 to −0.0031**. Multi-seed +0.005 lift threshold not cleared, test-set evaluation not yet authorized.
+**Status**: may04 capacity cycle. Best result `D=128` = **val 0.8594 single-seed (SEED=42)** — ties simple_v2's locked val. +0.0027 over D=64 baseline (broad strata lift: warm +0.0031, cold_user +0.0028, cold_item +0.0020, cold_both +0.0009). Multi-seed verification pending. Test-set evaluation gated on multi-seed val ≥ 0.8590 with 5/5 positive.
 
 ## Commands
 
@@ -24,9 +24,10 @@ uv sync
 DATASET=ml-100k uv run python train.py
 
 # Standard experiment (ml-25m on the current CUDA GPU)
-# Defaults are now the apr30 best config (val 0.8567 SEED=42):
-# NUM_LAYERS=3, INTERLEAVE=1, USE_BF16=1, GRAD_CLIP=1.0, PROJ_INIT_MODE=xavier,
-# MLP_HEAD=1, USE_GENOME=USE_GENRE=USE_YEAR=1, SEQ_LEN=100, MAX_EPOCHS=20.
+# Defaults are now the may04 best config (val 0.8594 SEED=42):
+# EMBED_DIM=128, NUM_LAYERS=3, INTERLEAVE=1, USE_BF16=1, GRAD_CLIP=1.0,
+# PROJ_INIT_MODE=xavier, MLP_HEAD=1, USE_GENOME=USE_GENRE=USE_YEAR=1,
+# SEQ_LEN=100, MAX_EPOCHS=20, LR=1e-3 constant.
 DATASET=ml-25m uv run python train.py
 
 # Reproduce the simple_v2 locked baseline (for cross-attempt comparison)

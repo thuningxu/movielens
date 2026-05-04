@@ -14,6 +14,182 @@ Any HSTU cycle is measured against **val 0.8594 / test 0.8455** to be called a w
 
 ## Cycles
 
+### `may03-coldstart` D=128 capacity — TIES simple_v2 on val (single-seed, +0.0027)
+
+After variant C kill, team R2 (sequential plan): D=128 first (Critic-approved as the only HSTU-internal axis with prior > 15%), FREQ_WD deferred. The Critic's evidence: simple_v2 apr28ag dropped FREQ_WD from 1e-4 to 0 and got +0.0015; combining D=128 + FREQ_WD risked re-introducing what simple_v2 found actively harmful in the rich-eval regime.
+
+**Pre-screen (ml-1m MAX_EPOCHS=5)**: D=64 0.7678, D=128 0.7693, Δ=+0.0015 monotone. Smoke clean.
+
+**Headline (ml-25m MAX_EPOCHS=20 SEED=42)**: val_auc 0.859378 (peak ep 16: 0.8594, final ep 19: 0.8591). 8.05M params (vs 3.18M at D=64). 140 min/run.
+
+Strata vs D=64 baseline (0.8567):
+
+| Stratum | D=64 | D=128 | Δ |
+|---|---|---|---|
+| **Overall** | **0.8567** | **0.8594** | **+0.0027** |
+| warm | 0.8596 | 0.8627 | +0.0031 |
+| cold_user | 0.8550 | 0.8578 | **+0.0028** (1st real cold_user lift) |
+| cold_item | 0.8402 | 0.8422 | +0.0020 |
+| cold_both | 0.8235 | 0.8244 | +0.0009 |
+| warm_popular | 0.8568 | 0.8603 | +0.0035 |
+| warm_tail | 0.8566 | 0.8592 | +0.0027 |
+
+**Significance**: First clean broad-spectrum lift in 6 cycles. Every stratum positive, no regression anywhere. Cold_user finally moved (+0.0028) after 5 nulls of cold_user-targeted features (pop_prior, item_stats, rating_ts, CAWR, variant C).
+
+**Diagnostic flip**: the apparent "structural cold_user ceiling" of HSTU was actually a **capacity ceiling** masquerading as architectural. EMBED_DIM=64 was an early-cycle decision (apr28b? apr29 stability work) never revisited. The variant C "parallel user_embed competes with sequence summary" diagnosis remains correct as a *separate* mechanism failure, but the cold_user gap was primarily encoder-capacity-bound, not user-representation-bound.
+
+**vs simple_v2 0.8594**: gap **0.0000 single-seed** (TIE). Multi-seed verification pending (5-seed mean ≥ 0.8590 with 5/5 positive required to declare a sustained tie; multi-seed mean ≥ 0.8590 + test gate would unlock test-set evaluation).
+
+**Trajectory**: ep 16-19 plateaus in [0.8590, 0.8594] — at the new capacity ceiling, not still climbing. Suggests limited gain from MAX_EPOCHS extension at D=128, but a follow-up could verify.
+
+**Defaults flipped**: `EMBED_DIM` default changed from 64 to 128 in train.py. Plain `DATASET=ml-25m uv run python train.py` reproduces the 0.8594 result. Override `EMBED_DIM=64` to reproduce the prior baseline.
+
+**Open questions for follow-up cycles**:
+- LR/scheduler retuning at D=128 capacity (LR=1e-3 was tuned for D=64; may not be optimal at 2× width)
+- D=128 + extend-30 (cold_user lifted +0.0012 at D=64; may stack with D=128's +0.0028)
+- D=192 or D=256 (does the capacity axis keep paying?)
+- Multi-seed verification (mandatory for any keep claim; 5 seeds × 140 min ≈ 11.7 hr)
+
+### `may03-coldstart` variant C (rater_pool) — KILLED on ml-1m smoke (Δ=−0.0036)
+
+User authorized variant C after extend-30. Team R2 converged on:
+- `nn.Embedding(num_users + 1, D)` (user_embed) + `anon_user_embed` for cold candidates
+- Per-item static rater pool from train_df; per-eval-row dynamic with `ts<sample.ts` cutoff
+- Cold-rater gating (drop raters with <3 train ratings)
+- Rating-centered weighted pool (pivot=0.6)
+- Head-side integration ONLY at last position via zero-init `rater_cross_proj`
+- ~440 LOC implementation; OFF-state byte-equivalent verified (fp32 0.605622 = 0.605622 on ml-100k); ON-state step-0 byte-equivalent (rater_cross output exactly 0.0 before first backward).
+
+**Pre-screen (per Critic): ml-1m MAX_EPOCHS=5 SEED=42, kill if Δ negative.**
+
+| Epoch | OFF (USE_RATER_POOL=0) | ON (USE_RATER_POOL=1) | Δ |
+|---|---|---|---|
+| 0 | 0.7057 | 0.7053 | −0.0004 (≈step-0 noise) |
+| 1 | 0.7471 | 0.7447 | −0.0024 |
+| 2 | 0.7590 | 0.7571 | −0.0019 |
+| 3 | 0.7648 | 0.7622 | −0.0026 |
+| 4 | **0.7678** | **0.7642** | **−0.0036** |
+
+**Δ = −0.0036, monotone widening with training.** 3.6× single-seed AUC noise (~0.001 at ml-1m). Below kill threshold (Δ negative). **Variant C killed before ml-25m commit.**
+
+**Diagnosis (matches Critic R1 priors)**: parallel `user_embed` table competes with HSTU's sequence-summary user representation. The rater_cross learns nonzero, adds noise the model has to overcome. Cold-rater gating is not the bottleneck — even warm-rater contributions appear redundant with what the encoder already extracts.
+
+**5th cold_user-targeted null** (after pop_prior, item_stats, rating_ts, CAWR). Reinforces structural-ceiling diagnosis: HSTU's cold_user gap to simple_v2 is not closeable by porting simple_v2's `i_hist_pool` mechanism into HSTU's MLP head — the architectures process user identity differently. simple_v2's mechanism succeeds in a linear head with no other user representation; HSTU has the sequence summary that subsumes the signal.
+
+**Apr28af precedent reaffirmed**: simple_v2's `EVAL_DYNAMIC_ITEM_HIST` (the same per-eval dynamic refresh) was a verified null at +0.001/0.0029-σ. The mechanism we ported has a known null-class signature in the reference codebase.
+
+Branch `may03-coldstart` commit `309d5bf`. Implementation kept on branch (not reverted) for archival. `USE_RATER_POOL=0` is byte-equivalent so the merge to main remains tractable if any salvage emerges. **Do NOT merge variant C unless an anon-only or different design is validated.**
+
+### `may03-coldstart` extend-30 — first positive cold_user signal (+0.0012)
+
+`MAX_EPOCHS=30` on operational best (constant LR=1e-3, no other changes).
+
+**Result: val_auc=0.8575 (peak ep 21) vs baseline 0.8567 = +0.0008**.
+
+Strata diff (e30 - baseline):
+
+| Stratum | Δ |
+|---|---|
+| warm | +0.0001 |
+| **cold_user** | **+0.0012** (first positive cold_user result!) |
+| cold_item | -0.0107 (overfit on tiny pop) |
+| cold_both | -0.0077 (overfit) |
+| warm_popular | +0.0020 |
+| warm_tail | -0.0015 |
+
+**Pattern**: extra training helps dominant strata (cold_user 80%, warm_popular) where there's data but overfits tiny populations (cold_item 2%, cold_both 3%). Cold_user lift +0.0012 is the first positive after 4 cold_user-targeted nulls (pop_prior, item_stats, rating_ts, CAWR).
+
+**Below multi-seed bar** (+0.005 single-seed). Sub-noise but directional. May be marginal real lift OR seed noise.
+
+**vs simple_v2 0.8594**: gap −0.0019 (was −0.0027 at baseline).
+
+### `may03-coldstart` CAWR — sub-noise null (val=0.8563)
+
+User asked about LR schedules that "go up and down." Tested CosineAnnealingWarmRestarts with T_0=4 epochs, T_mult=1, eta_min=20% × peak. 5 equal cycles over 20 epochs.
+
+**Result: val_auc=0.8563 vs baseline 0.8567 = -0.0004**.
+
+Visible restart pattern: each restart at epochs 3, 7, 11, 15 caused a visible 1-epoch dip in val_auc (e.g., ep 11→ep 12: 0.8541→0.8524). The model recovers within 1-2 epochs but never catches up to constant-LR baseline.
+
+**Diagnosis confirmed (Critic R1)**: constant-LR baseline was monotone-climbing, not stuck in a local minimum. Warm restarts solve a problem we don't have. The cycles just consume progress without unlocking new capacity.
+
+Three consecutive cold_user-targeted nulls (D pop_prior, B item_stats, A rating_ts) plus this CAWR null. The cold_user gap to simple_v2 is likely structural (architecture-level) rather than feature- or schedule-related.
+
+### `may03-coldstart` rating-ts (A) — sub-noise overall, lifts cold_item (+0.0050) but not cold_user
+
+`USE_RATING_TS=1` on operational best. 32 monthly buckets over train ts range (~8 mo/bucket on ml-25m). Bucketed ts embedded into content tokens at all 3 call sites.
+
+**Result: val_auc=0.8571 (+0.0004 vs baseline 0.8567)**. Sub-noise overall.
+
+Strata diff (A vs baseline):
+
+| Stratum | Δ |
+|---|---|
+| warm | +0.0015 |
+| cold_user | +0.0004 (target stratum, sub-noise) |
+| **cold_item** | **+0.0050** (biggest lift) |
+| cold_both | +0.0031 |
+| warm_dense | +0.0015 |
+| warm_tail | +0.0026 |
+
+**Diagnosis**: temporal interaction (year × ts) is real signal for ITEMS — cold_item lifts +0.0050 because the age-at-rating signal compensates for missing item embedding training. But cold_user (the target stratum, 80% of val) sees only +0.0004. The cold_user gap isn't temporal — it's structural (no user_embed analog for HSTU's `i_hist_pool`).
+
+**Lesson**: rating-ts in content token is a small but real win for cold-item handling. Worth keeping as a feature even though it doesn't close the cold_user gap. The architectural ceiling for cold_user without a user-side rater pool mechanism appears to be ~0.855.
+
+### `may03-coldstart` item_stats (B) — REGRESSES, fails on cold_item
+
+`USE_ITEM_STATS=1` (alone, no pop prior) on operational best. 3 scalars per item from train_df only: `mean_rating/5`, `std/2.5`, `frac_engaged`. Zero-imputation for items with no train ratings.
+
+**Result: val_auc=0.8541, -0.0026 vs baseline 0.8567.** Below baseline at every epoch.
+
+Strata diff (item_stats - baseline):
+
+| Stratum | Δ |
+|---|---|
+| warm | -0.0021 |
+| cold_user | +0.0001 (target — zero lift) |
+| **cold_item** | **-0.0341** (massive regression) |
+| **cold_both** | **-0.0268** (massive regression) |
+| warm_dense | -0.0021 |
+| warm_tail | -0.0055 |
+
+**Mechanism failure**: zero-imputation is the bug. Stats are all 0 for items with no train ratings, but 0 is a *valid* low-quality value (e.g., a 0.5★-mean item). The model learns "zero stats = low quality" and unfairly penalizes cold_item / cold_both predictions. To fix: use a learnable "missing" indicator OR mean-of-means imputation.
+
+**Both cold_user interventions (D and B) failed**. Static item-side features can't port simple_v2's `i_hist_pool` mechanism faithfully — that mechanism uses `user_embed` which HSTU lacks. The structural gap is not easily closed without a user representation.
+
+### `apr30` strata diagnostic — gap lives in cold_user (80% of val), warm matches simple_v2
+
+Strata analysis on operational best `interleave_3L_bf16` (val 0.8567 single-seed, ml-25m SEED=42):
+
+| Stratum | n | mean_label | AUC |
+|---|---|---|---|
+| warm | 373.9K (15%) | 0.396 | **0.8596** ← matches simple_v2 overall 0.8594 |
+| cold_user | 2.01M (80%) | 0.514 | **0.8550** ← gap to simple_v2 lives here |
+| cold_item | 53.9K (2%) | 0.390 | 0.8402 |
+| cold_both | 65.2K (3%) | 0.479 | 0.8235 |
+| warm_dense (≥20 prior events) | 372.3K | 0.395 | 0.8594 |
+| warm_popular (top-2000 items) | 188.6K | 0.450 | 0.8568 |
+| warm_tail (rest) | 185.2K | 0.341 | 0.8566 |
+
+**Key**: HSTU exceeds simple_v2's overall AUC on warm (0.8596 vs 0.8594). Item-popularity within warm has near-zero effect (popular vs tail differ by 0.0002). The gap to simple_v2 is concentrated in cold_user where HSTU lacks item-side rater context.
+
+### `apr30` pop_prior — log1p(item_train_count) feature, +0.0001 overall
+
+`USE_POP_PRIOR=1` on operational best (val=0.8568, +0.0001 over baseline 0.8567).
+
+Strata diff (pop_prior - baseline):
+
+| Stratum | Δ |
+|---|---|
+| warm | +0.0007 |
+| **warm_tail** | **+0.0016** (best lift, but small population) |
+| warm_dense | +0.0008 |
+| cold_user | +0.0003 (target stratum, sub-noise) |
+| cold_item | +0.0005 |
+| cold_both | +0.0004 |
+
+**Pop prior is wrong intervention for cold_user.** Item_embed already encodes popularity implicitly via co-occurrence frequency. The signal that matters for cold_user is rating *distribution* (mean, std) — what variant B targets. Pop prior is more useful for warm_tail differentiation.
+
 ### `apr30` aux_interleave_3L_bf16 — AUX_RATING_WEIGHT=25 regresses (val=0.8556)
 
 `AUX_RATING_WEIGHT=25` on top of the interleave_3L_bf16 stack.
