@@ -56,10 +56,10 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
 # HSTU hyperparameters (placeholders — tune once the real model lands)
-# apr30 defaults are the operational-best config (val 0.8567 single-seed,
-# 0.8563 2-seed mean on ml-25m at SEED=42). To reproduce earlier byte-equivalent
-# baselines, override the relevant flags to OFF — see program.md for cycle history.
-EMBED_DIM = int(os.environ.get("EMBED_DIM", "64"))
+# may04 defaults are the operational-best config (val 0.8594 single-seed
+# SEED=42 on ml-25m, ties simple_v2 locked baseline). To reproduce earlier
+# byte-equivalent baselines, override the relevant flags — see program.md.
+EMBED_DIM = int(os.environ.get("EMBED_DIM", "128"))      # may04 best: 128 lifts +0.0027 vs 64 (broad strata gains)
 NUM_LAYERS = int(os.environ.get("NUM_LAYERS", "3"))     # apr30 best: 3L matches 4L AUC, 27% faster
 NUM_HEADS = int(os.environ.get("NUM_HEADS", "4"))
 SEQ_LEN = int(os.environ.get("SEQ_LEN", "100"))         # apr30 best: 100 events (×2 = 200 tokens with INTERLEAVE=1)

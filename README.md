@@ -23,7 +23,7 @@ HSTU is the cleanest first generative baseline that lets us measure against the 
 
 - **`prepare.py`** — Shared with both prior attempts. Data download + time-based train/val/test splits + `evaluate()` AUC harness. **Do not modify.**
 - **`train.py`** — HSTU model + sequence data pipeline + training loop. Content metadata, MLP head, bf16, interleaving, LR schedules, aux rating head — all flag-gated, default OFF.
-- **`program.md`** — Experiment log for this attempt (apr30 cycle complete).
+- **`program.md`** — Experiment log for this attempt (may04 capacity cycle: D=128 ties simple_v2 val).
 - **`legacy/`** — Frozen archive of the original DLRM project.
 - **`simple_v2/`** — Frozen archive of the apr28 linear-head restart. The locked baseline (`val 0.859384`, `test 0.845497`) lives there for comparison.
 - **`data/`** — Auto-downloaded MovieLens datasets; not in git.
@@ -42,7 +42,7 @@ DATASET=ml-25m uv run python train.py
 
 ## Architecture
 
-The diagram below shows the **default operational config** (apr30 best): `INTERLEAVE=1` (paper-canonical Meta 2024), `NUM_LAYERS=3`, `USE_GENOME=USE_GENRE=USE_YEAR=1`, `MLP_HEAD=1`, `USE_BF16=1`, `GRAD_CLIP=1.0`, `PROJ_INIT_MODE=xavier`, `SEQ_LEN=100` events × 2 = 200 tokens. Set `INTERLEAVE=0` to revert to the fused-token mode (each event = one position, `x_t = item_full_embed(m_t) + rating_embed(r_t)`).
+The diagram below shows the **default operational config** (may04 best, val 0.8594 single-seed, ties simple_v2): `EMBED_DIM=128`, `INTERLEAVE=1` (paper-canonical Meta 2024), `NUM_LAYERS=3`, `USE_GENOME=USE_GENRE=USE_YEAR=1`, `MLP_HEAD=1`, `USE_BF16=1`, `GRAD_CLIP=1.0`, `PROJ_INIT_MODE=xavier`, `SEQ_LEN=100` events × 2 = 200 tokens. Set `INTERLEAVE=0` to revert to the fused-token mode (each event = one position, `x_t = item_full_embed(m_t) + rating_embed(r_t)`).
 
 ```mermaid
 graph TD
@@ -137,26 +137,28 @@ Whatever metadata-fused embedding the sequence sees as observations is exactly w
 
 ## Status
 
-`apr30` cycle complete. Cumulative progression on ml-25m at SEED=42:
+`may04` capacity cycle: HSTU at D=128 ties simple_v2 on val (single-seed). Cumulative progression on ml-25m at SEED=42:
 
 | stage | val_auc | commit | mechanism |
 |---|---|---|---|
 | Pure HSTU 4L/64D LR=5e-3 | 0.8367 | `a046154` | sequence-level + Bug #1 fix |
-| Capacity sweep (A/B) | flat | `2bf0713` | width axis not binding |
+| Capacity sweep (A/B) | flat | `2bf0713` | width axis not binding (at the 4L/LR=5e-3 stack) |
 | Metadata (M1) | 0.8453 (peak) | `ab4bdda` | genome+genre+year, training spikes at LR=5e-3 |
 | Stabilization (S2) | 0.8467 | `a768f4d` | clip 1.0 + xavier init, cures spikes |
 | Cycle 2 LR=2e-3 | 0.8541 | `8368ebb` | LR halved, monotone climb |
 | C1 LR=1e-3 | 0.8547 | `a727e97` | LR step further (sub-σ) |
 | C2 MLP head | 0.8561 | `a95cbc9` | MLP on h_t (sub-σ) |
-| LR schedule + AdamW infra | (off-state) | `1edb678` | flag-gated; cosine + AdamW available |
 | L3_bf16 | 0.8560 | `7e8ae4d` | NUM_LAYERS=3 + bf16, **27% faster** |
-| **interleave_3L_bf16** | **0.8567** (s42) / **0.8558** (s43), 2-seed mean **0.8563** | `2bf0713` | paper-canonical interleaved tokens |
-| L2_bf16 | 0.8546 | (same sweep) | depth=2 too aggressive |
-| aux+interleave | 0.8556 | `db899f7` | AUX=25 mechanism doesn't transfer to HSTU |
+| interleave_3L_bf16 | **0.8567** (s42) / 0.8558 (s43), 2-seed mean 0.8563 | `2bf0713` | paper-canonical interleaved tokens |
+| extend-30 | 0.8575 (s42, unverified) | `9167fb6` | MAX_EPOCHS=30 — first cold_user lift but cold_item overfit |
+| Variant C (rater pool) | killed | `309d5bf` | full simple_v2-style i_hist_pool port — −0.0036 on ml-1m smoke |
+| **D=128** | **0.8594** (s42, unverified) | `<this commit>` | **EMBED_DIM 64→128 — broad strata lift, ties simple_v2** |
 
-**Operational best**: `interleave_3L_bf16` config — `INTERLEAVE=1 SEQ_LEN=100 NUM_LAYERS=3 USE_BF16=1 LR=1e-3 GRAD_CLIP=1.0 PROJ_INIT_MODE=xavier USE_GENOME+GENRE+YEAR=1 MLP_HEAD=1 MLP_HEAD_DROPOUT=0.1`. ~120 min/cell on ml-25m.
+**Operational best**: D=128 config — `EMBED_DIM=128 INTERLEAVE=1 SEQ_LEN=100 NUM_LAYERS=3 USE_BF16=1 LR=1e-3 GRAD_CLIP=1.0 PROJ_INIT_MODE=xavier USE_GENOME+GENRE+YEAR=1 MLP_HEAD=1 MLP_HEAD_DROPOUT=0.1`. ~140 min/cell on ml-25m (8.05M params).
 
-**Gap to simple_v2 0.8594**: −0.0027 single-seed / −0.0031 2-seed mean. Multi-seed +0.005 lift threshold not yet cleared, so test-set evaluation not yet authorized.
+**Stratum lifts (D=128 vs D=64 baseline)**: warm +0.0031, cold_user +0.0028, cold_item +0.0020, cold_both +0.0009 — first clean broad lift after 5 cold_user-targeted nulls. Capacity was the unprobed axis; the apparent "structural cold_user ceiling" was a capacity ceiling.
+
+**Gap to simple_v2 0.8594**: 0.0000 single-seed (TIE). Multi-seed verification pending. Test-set evaluation gated on multi-seed val ≥ 0.8590 with 5/5 positive.
 
 **Key findings**:
 - Pure HSTU at 0.8367 already beats heavily-tuned simple_v2 static (0.828) and legacy DLRM (0.8284) with NO movie content features — pure user-item interaction modeling carries the signal.
@@ -167,7 +169,7 @@ Whatever metadata-fused embedding the sequence sees as observations is exactly w
 - Interleaving (paper-canonical Meta 2024 §3) lifts +0.0007 over fused-token (sub-σ but consistent positive).
 - AUX_RATING_WEIGHT=25 (simple_v2 mechanism) does NOT transfer to HSTU — the rating_embed already encodes rating info, making aux MSE redundant.
 
-**Default config = operational best.** `train.py` defaults are now set to the apr30 best configuration (INTERLEAVE=1, NUM_LAYERS=3, USE_BF16=1, metadata flags ON, GRAD_CLIP=1.0, PROJ_INIT_MODE=xavier, MLP_HEAD=1, MAX_EPOCHS=20). Plain `DATASET=ml-25m uv run python train.py` reproduces the val 0.8567 result. Override individual flags to OFF to reproduce earlier baselines (see program.md cycle history).
+**Default config = operational best.** `train.py` defaults are now set to the may04 best configuration (EMBED_DIM=128, INTERLEAVE=1, NUM_LAYERS=3, USE_BF16=1, metadata flags ON, GRAD_CLIP=1.0, PROJ_INIT_MODE=xavier, MLP_HEAD=1, MAX_EPOCHS=20). Plain `DATASET=ml-25m uv run python train.py` reproduces the val 0.8594 result. Override individual flags to revert (e.g. `EMBED_DIM=64`) to reproduce earlier baselines (see program.md cycle history).
 
 ## What carries over from the prior attempts
 

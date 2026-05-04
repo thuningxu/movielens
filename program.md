@@ -14,6 +14,42 @@ Any HSTU cycle is measured against **val 0.8594 / test 0.8455** to be called a w
 
 ## Cycles
 
+### `may03-coldstart` D=128 capacity — TIES simple_v2 on val (single-seed, +0.0027)
+
+After variant C kill, team R2 (sequential plan): D=128 first (Critic-approved as the only HSTU-internal axis with prior > 15%), FREQ_WD deferred. The Critic's evidence: simple_v2 apr28ag dropped FREQ_WD from 1e-4 to 0 and got +0.0015; combining D=128 + FREQ_WD risked re-introducing what simple_v2 found actively harmful in the rich-eval regime.
+
+**Pre-screen (ml-1m MAX_EPOCHS=5)**: D=64 0.7678, D=128 0.7693, Δ=+0.0015 monotone. Smoke clean.
+
+**Headline (ml-25m MAX_EPOCHS=20 SEED=42)**: val_auc 0.859378 (peak ep 16: 0.8594, final ep 19: 0.8591). 8.05M params (vs 3.18M at D=64). 140 min/run.
+
+Strata vs D=64 baseline (0.8567):
+
+| Stratum | D=64 | D=128 | Δ |
+|---|---|---|---|
+| **Overall** | **0.8567** | **0.8594** | **+0.0027** |
+| warm | 0.8596 | 0.8627 | +0.0031 |
+| cold_user | 0.8550 | 0.8578 | **+0.0028** (1st real cold_user lift) |
+| cold_item | 0.8402 | 0.8422 | +0.0020 |
+| cold_both | 0.8235 | 0.8244 | +0.0009 |
+| warm_popular | 0.8568 | 0.8603 | +0.0035 |
+| warm_tail | 0.8566 | 0.8592 | +0.0027 |
+
+**Significance**: First clean broad-spectrum lift in 6 cycles. Every stratum positive, no regression anywhere. Cold_user finally moved (+0.0028) after 5 nulls of cold_user-targeted features (pop_prior, item_stats, rating_ts, CAWR, variant C).
+
+**Diagnostic flip**: the apparent "structural cold_user ceiling" of HSTU was actually a **capacity ceiling** masquerading as architectural. EMBED_DIM=64 was an early-cycle decision (apr28b? apr29 stability work) never revisited. The variant C "parallel user_embed competes with sequence summary" diagnosis remains correct as a *separate* mechanism failure, but the cold_user gap was primarily encoder-capacity-bound, not user-representation-bound.
+
+**vs simple_v2 0.8594**: gap **0.0000 single-seed** (TIE). Multi-seed verification pending (5-seed mean ≥ 0.8590 with 5/5 positive required to declare a sustained tie; multi-seed mean ≥ 0.8590 + test gate would unlock test-set evaluation).
+
+**Trajectory**: ep 16-19 plateaus in [0.8590, 0.8594] — at the new capacity ceiling, not still climbing. Suggests limited gain from MAX_EPOCHS extension at D=128, but a follow-up could verify.
+
+**Defaults flipped**: `EMBED_DIM` default changed from 64 to 128 in train.py. Plain `DATASET=ml-25m uv run python train.py` reproduces the 0.8594 result. Override `EMBED_DIM=64` to reproduce the prior baseline.
+
+**Open questions for follow-up cycles**:
+- LR/scheduler retuning at D=128 capacity (LR=1e-3 was tuned for D=64; may not be optimal at 2× width)
+- D=128 + extend-30 (cold_user lifted +0.0012 at D=64; may stack with D=128's +0.0028)
+- D=192 or D=256 (does the capacity axis keep paying?)
+- Multi-seed verification (mandatory for any keep claim; 5 seeds × 140 min ≈ 11.7 hr)
+
 ### `may03-coldstart` variant C (rater_pool) — KILLED on ml-1m smoke (Δ=−0.0036)
 
 User authorized variant C after extend-30. Team R2 converged on:
