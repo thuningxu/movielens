@@ -14,6 +14,27 @@ Any HSTU cycle is measured against **val 0.8594 / test 0.8455** to be called a w
 
 ## Cycles
 
+### `may03-coldstart` rating-ts (A) — sub-noise overall, lifts cold_item (+0.0050) but not cold_user
+
+`USE_RATING_TS=1` on operational best. 32 monthly buckets over train ts range (~8 mo/bucket on ml-25m). Bucketed ts embedded into content tokens at all 3 call sites.
+
+**Result: val_auc=0.8571 (+0.0004 vs baseline 0.8567)**. Sub-noise overall.
+
+Strata diff (A vs baseline):
+
+| Stratum | Δ |
+|---|---|
+| warm | +0.0015 |
+| cold_user | +0.0004 (target stratum, sub-noise) |
+| **cold_item** | **+0.0050** (biggest lift) |
+| cold_both | +0.0031 |
+| warm_dense | +0.0015 |
+| warm_tail | +0.0026 |
+
+**Diagnosis**: temporal interaction (year × ts) is real signal for ITEMS — cold_item lifts +0.0050 because the age-at-rating signal compensates for missing item embedding training. But cold_user (the target stratum, 80% of val) sees only +0.0004. The cold_user gap isn't temporal — it's structural (no user_embed analog for HSTU's `i_hist_pool`).
+
+**Lesson**: rating-ts in content token is a small but real win for cold-item handling. Worth keeping as a feature even though it doesn't close the cold_user gap. The architectural ceiling for cold_user without a user-side rater pool mechanism appears to be ~0.855.
+
 ### `may03-coldstart` item_stats (B) — REGRESSES, fails on cold_item
 
 `USE_ITEM_STATS=1` (alone, no pop prior) on operational best. 3 scalars per item from train_df only: `mean_rating/5`, `std/2.5`, `frac_engaged`. Zero-imputation for items with no train ratings.
