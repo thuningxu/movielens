@@ -237,8 +237,15 @@ INTERLEAVE = int(os.environ.get("INTERLEAVE", "1"))   # apr30 best: ON (paper-ca
 # parameters get weight_decay=0 via param-group split — the standard "no decay
 # on embeddings or norms" recipe used in transformer training.
 LR_SCHEDULE = os.environ.get("LR_SCHEDULE", "constant")
-assert LR_SCHEDULE in {"constant", "cosine_warmup"}, f"unknown LR_SCHEDULE={LR_SCHEDULE}"
+assert LR_SCHEDULE in {"constant", "cosine_warmup", "cawr"}, f"unknown LR_SCHEDULE={LR_SCHEDULE}"
 WARMUP_STEPS = int(os.environ.get("WARMUP_STEPS", "500"))
+# CAWR (cosine annealing with warm restarts) HPs (may03). Only consulted when
+# LR_SCHEDULE="cawr"; defaults give 5 equal cycles over 20 epochs with a 20%
+# trough (eta_min = 0.2 * LR). With LR=1e-3 the trough is 2e-4 — well above
+# the failure point of cosine_warmup-alone's deep decay tail.
+CAWR_T_0_EPOCHS = int(os.environ.get("CAWR_T_0_EPOCHS", "4"))
+CAWR_T_MULT = int(os.environ.get("CAWR_T_MULT", "1"))
+CAWR_ETA_MIN_FRAC = float(os.environ.get("CAWR_ETA_MIN_FRAC", "0.2"))
 OPTIMIZER = os.environ.get("OPTIMIZER", "adam")
 assert OPTIMIZER in {"adam", "adamw"}, f"unknown OPTIMIZER={OPTIMIZER}"
 
@@ -1278,6 +1285,13 @@ def build_scheduler(optimizer, lr, schedule_name, warmup_steps, total_steps):
             ],
             milestones=[warmup_steps],
         )
+    elif schedule_name == "cawr":
+        from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+        steps_per_epoch = total_steps // MAX_EPOCHS
+        T_0 = CAWR_T_0_EPOCHS * steps_per_epoch
+        T_mult = CAWR_T_MULT
+        eta_min = lr * CAWR_ETA_MIN_FRAC
+        return CosineAnnealingWarmRestarts(optimizer, T_0=T_0, T_mult=T_mult, eta_min=eta_min)
     else:
         raise ValueError(f"unknown LR_SCHEDULE={schedule_name}")
 
@@ -1645,6 +1659,12 @@ def main():
              f"warmup_steps={WARMUP_STEPS}  total_steps={total_steps}  "
              f"start_lr={optimizer.param_groups[0]['lr']:.2e}  "
              f"use_bf16={bool(USE_BF16)}")
+    if LR_SCHEDULE == "cawr":
+        steps_per_epoch = total_steps // MAX_EPOCHS
+        cawr_T_0 = CAWR_T_0_EPOCHS * steps_per_epoch
+        log.info(f"  cawr: T_0={cawr_T_0} steps ({CAWR_T_0_EPOCHS} epochs)  "
+                 f"T_mult={CAWR_T_MULT}  eta_min={LR * CAWR_ETA_MIN_FRAC:.2e} "
+                 f"(eta_min_frac={CAWR_ETA_MIN_FRAC})")
 
     best_val_auc = 0.0
     for epoch in range(MAX_EPOCHS):
