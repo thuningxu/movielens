@@ -14,6 +14,39 @@ Any HSTU cycle is measured against **val 0.8594 / test 0.8455** to be called a w
 
 ## Cycles
 
+### `apr30` strata diagnostic — gap lives in cold_user (80% of val), warm matches simple_v2
+
+Strata analysis on operational best `interleave_3L_bf16` (val 0.8567 single-seed, ml-25m SEED=42):
+
+| Stratum | n | mean_label | AUC |
+|---|---|---|---|
+| warm | 373.9K (15%) | 0.396 | **0.8596** ← matches simple_v2 overall 0.8594 |
+| cold_user | 2.01M (80%) | 0.514 | **0.8550** ← gap to simple_v2 lives here |
+| cold_item | 53.9K (2%) | 0.390 | 0.8402 |
+| cold_both | 65.2K (3%) | 0.479 | 0.8235 |
+| warm_dense (≥20 prior events) | 372.3K | 0.395 | 0.8594 |
+| warm_popular (top-2000 items) | 188.6K | 0.450 | 0.8568 |
+| warm_tail (rest) | 185.2K | 0.341 | 0.8566 |
+
+**Key**: HSTU exceeds simple_v2's overall AUC on warm (0.8596 vs 0.8594). Item-popularity within warm has near-zero effect (popular vs tail differ by 0.0002). The gap to simple_v2 is concentrated in cold_user where HSTU lacks item-side rater context.
+
+### `apr30` pop_prior — log1p(item_train_count) feature, +0.0001 overall
+
+`USE_POP_PRIOR=1` on operational best (val=0.8568, +0.0001 over baseline 0.8567).
+
+Strata diff (pop_prior - baseline):
+
+| Stratum | Δ |
+|---|---|
+| warm | +0.0007 |
+| **warm_tail** | **+0.0016** (best lift, but small population) |
+| warm_dense | +0.0008 |
+| cold_user | +0.0003 (target stratum, sub-noise) |
+| cold_item | +0.0005 |
+| cold_both | +0.0004 |
+
+**Pop prior is wrong intervention for cold_user.** Item_embed already encodes popularity implicitly via co-occurrence frequency. The signal that matters for cold_user is rating *distribution* (mean, std) — what variant B targets. Pop prior is more useful for warm_tail differentiation.
+
 ### `apr30` aux_interleave_3L_bf16 — AUX_RATING_WEIGHT=25 regresses (val=0.8556)
 
 `AUX_RATING_WEIGHT=25` on top of the interleave_3L_bf16 stack.
