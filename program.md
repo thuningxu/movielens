@@ -14,6 +14,18 @@ Any HSTU cycle is measured against **val 0.8594 / test 0.8455** to be called a w
 
 ## Cycles
 
+### `may03-coldstart` CAWR — sub-noise null (val=0.8563)
+
+User asked about LR schedules that "go up and down." Tested CosineAnnealingWarmRestarts with T_0=4 epochs, T_mult=1, eta_min=20% × peak. 5 equal cycles over 20 epochs.
+
+**Result: val_auc=0.8563 vs baseline 0.8567 = -0.0004**.
+
+Visible restart pattern: each restart at epochs 3, 7, 11, 15 caused a visible 1-epoch dip in val_auc (e.g., ep 11→ep 12: 0.8541→0.8524). The model recovers within 1-2 epochs but never catches up to constant-LR baseline.
+
+**Diagnosis confirmed (Critic R1)**: constant-LR baseline was monotone-climbing, not stuck in a local minimum. Warm restarts solve a problem we don't have. The cycles just consume progress without unlocking new capacity.
+
+Three consecutive cold_user-targeted nulls (D pop_prior, B item_stats, A rating_ts) plus this CAWR null. The cold_user gap to simple_v2 is likely structural (architecture-level) rather than feature- or schedule-related.
+
 ### `may03-coldstart` rating-ts (A) — sub-noise overall, lifts cold_item (+0.0050) but not cold_user
 
 `USE_RATING_TS=1` on operational best. 32 monthly buckets over train ts range (~8 mo/bucket on ml-25m). Bucketed ts embedded into content tokens at all 3 call sites.
