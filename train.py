@@ -100,6 +100,33 @@ USE_YEAR = int(os.environ.get("USE_YEAR", "1"))       # apr30 best: ON
 # prior; an explicit popularity scalar could fill that gap.
 USE_POP_PRIOR = int(os.environ.get("USE_POP_PRIOR", "0"))
 
+# Bucketed absolute rating-timestamp embedding (variant A, may03 cold_user
+# follow-up). Default OFF for byte-equivalence with commit c109f3c. When
+# USE_RATING_TS=1, every CONTENT token (interleaved) or fused position gets a
+# learnable embedding indexed by the absolute rating timestamp bucketed into
+# NUM_TS_BUCKETS=32 monthly buckets over ml-25m's train timestamp range. The
+# bucket boundaries are computed ONCE at startup from train_df only (so val/test
+# are never used for binning, preserving the strict-prior guarantee). The
+# rating_ts_embed module is constructed only when USE_RATING_TS=1, so OFF-state
+# RNG state is byte-identical to commit c109f3c. Zero-init weight makes step-0
+# ON state == OFF state at the candidate-scoring level.
+#
+# Motivation: cold_user (80% of val) gap to simple_v2 (~0.003) is structural —
+# pop_prior was null and item_stats regressed. Adding absolute rating-ts to the
+# content token alongside year_embed lets the model learn ts × year interactions
+# (movie-age-at-rating, era-conditional taste, calendar-phase effects).
+#
+# Bucketing: clip((ts - TRAIN_TS_MIN) / SECONDS_PER_MONTH, 0, NUM_TS_BUCKETS-1).
+# PAD positions have ts=0 (epoch 1970), well before TRAIN_TS_MIN, so the clip
+# folds them onto bucket 0 (along with the earliest real-ts events). Pad
+# positions are masked out of attention regardless, so bucket-0 collision is
+# benign. Application is per-position (interleaved: content tokens only;
+# fused: every position) and SUMMED into the per-position input — same
+# additive pattern as rating_embed and year_embed.
+USE_RATING_TS = int(os.environ.get("USE_RATING_TS", "0"))
+NUM_TS_BUCKETS = 32
+SECONDS_PER_MONTH = 30.44 * 86400
+
 # Per-item rating statistics (apr30, cold_user intervention plan, variant B).
 # Default OFF for byte-equivalence with commit fd96d2a. When USE_ITEM_STATS=1
 # a static per-item 3-vector of normalized rating statistics (mean, std,
@@ -780,17 +807,27 @@ class HSTU(nn.Module):
     logits identical to OFF and the metadata signal grows monotonically as the
     projections train.
 
-    OFF-state byte-equivalence: when all five flags are 0, item_full_embed
-    skips every metadata branch and returns plain item_embed(m), matching
-    the prior baseline exactly. The genome/genre/year tensors are allocated
-    regardless (for codepath simplicity); the popularity and item-stats
-    buffers are registered only when their respective flag is 1 so OFF-state
-    memory is unchanged.
+    Bucketed absolute rating-timestamp (may03, variant A, opt-in via
+    USE_RATING_TS=1). When enabled, an additional rating_ts_embed(ts_bucket)
+    is summed into the per-position input — at content tokens only in
+    INTERLEAVE=1, at every position in INTERLEAVE=0. Application happens in
+    encode / encode_interleaved / encode_interleaved_with_candidate, NOT in
+    item_full_embed: ts is per-event, not per-item, so the colocation has to
+    be at the sequence-construction level. Zero-init weight makes step-0 ON
+    state == OFF state at the candidate-scoring level.
+
+    OFF-state byte-equivalence: when all six flags are 0, item_full_embed and
+    the encode paths skip every conditional branch and behave identically to
+    the prior baseline. The genome/genre/year tensors are allocated regardless
+    (for codepath simplicity); the popularity, item-stats, and rating-ts
+    modules are constructed only when their respective flag is 1 so OFF-state
+    memory and RNG draws are unchanged.
     """
 
     def __init__(self, num_items: int, num_rating_buckets: int,
                  genome: torch.Tensor, genre: torch.Tensor, year_id: torch.Tensor,
-                 item_pop: torch.Tensor, item_stats: torch.Tensor):
+                 item_pop: torch.Tensor, item_stats: torch.Tensor,
+                 train_ts_min: int):
         super().__init__()
         # Index 0 is PAD; real movies occupy 1..num_items. Callers
         # (build_user_sequences, EvalDataset) shift movieIds by +1 so the
@@ -908,6 +945,52 @@ class HSTU(nn.Module):
             self.item_stats_proj = nn.Linear(3, EMBED_DIM, bias=False)
             nn.init.zeros_(self.item_stats_proj.weight)
 
+        # Bucketed absolute rating-timestamp embedding (USE_RATING_TS=1, may03
+        # cold_user variant A). Constructed AFTER item_stats so OFF-state RNG
+        # state is byte-identical to commit c109f3c — when the flag is 0,
+        # neither the embedding nor the bucketing constants exist as module
+        # state, no RNG is consumed for this feature, and the encode paths
+        # never branch into the rating-ts code. Zero-init weight makes step-0
+        # ON state == OFF state at the candidate-scoring level (the rating-ts
+        # contribution is exactly 0 before the embedding trains). The
+        # train_ts_min / seconds_per_month buffers are registered (not parameters)
+        # so they ride along to the model device on .to(DEVICE) and don't get
+        # wd-decayed by AdamW. Applies to CONTENT tokens only in INTERLEAVE=1
+        # (action tokens get pure action_embed) and to every position in
+        # INTERLEAVE=0 (fused mode, where each position is one event).
+        self.use_rating_ts = bool(USE_RATING_TS)
+        if self.use_rating_ts:
+            self.rating_ts_embed = nn.Embedding(NUM_TS_BUCKETS, EMBED_DIM)
+            nn.init.zeros_(self.rating_ts_embed.weight)
+            self.register_buffer(
+                "train_ts_min",
+                torch.tensor(int(train_ts_min), dtype=torch.long),
+                persistent=False,
+            )
+            self.register_buffer(
+                "seconds_per_month",
+                torch.tensor(float(SECONDS_PER_MONTH), dtype=torch.float32),
+                persistent=False,
+            )
+
+    def _ts_bucket(self, ts: torch.Tensor) -> torch.Tensor:
+        """Bucket absolute Unix-second timestamps into NUM_TS_BUCKETS monthly
+        buckets over ml-25m's train range.
+
+        Args:
+            ts: (..., ) int64 Unix-second timestamps. PAD positions have ts=0
+                (epoch 1970), well before TRAIN_TS_MIN, so they clip to bucket 0.
+
+        Returns:
+            (..., ) int64 bucket indices in [0, NUM_TS_BUCKETS-1].
+        """
+        # Subtract train_ts_min in int64, then divide by seconds_per_month in
+        # fp32 (range fits well within fp32 precision: ~24 years ≈ 7.6e8 s,
+        # / SECONDS_PER_MONTH ≈ 290 — far from fp32 mantissa limits).
+        delta = (ts - self.train_ts_min).float()
+        bucket = (delta / self.seconds_per_month).long()
+        return bucket.clamp(0, NUM_TS_BUCKETS - 1)
+
     def item_full_embed(self, item_ids: torch.Tensor) -> torch.Tensor:
         """Symmetric per-position item-side embedding used for both sequence
         input AND candidate scoring. Same construction in both spots is the
@@ -943,6 +1026,13 @@ class HSTU(nn.Module):
         """Run the causal stack and return per-position hidden states (B, T, D)."""
         B, T = hist_items.shape
         h = self.item_full_embed(hist_items) + self.rating_embed(hist_ratings)
+        if self.use_rating_ts:
+            # Fused mode: each position is one event with item+rating+ts. Add
+            # the bucketed-ts embedding to every position (parallel to rating_embed
+            # — same additive role at the per-event level). PAD positions have
+            # ts=0 → clipped to bucket 0; pad-position contribution is masked
+            # out of attention regardless via hist_mask.
+            h = h + self.rating_ts_embed(self._ts_bucket(hist_ts))
         # Causal mask as a bool over (T, T): True where i >= j (allowed).
         causal_bool = torch.tril(torch.ones(T, T, dtype=torch.bool, device=h.device))
         # Pairwise log-bucketed time deltas, computed once and reused across blocks.
@@ -993,6 +1083,16 @@ class HSTU(nn.Module):
         # even positions only. PAD (id=0) → padding_idx zeros — no
         # contribution at action positions where content_ids = 0.
         content_emb = self.item_full_embed(content_ids)        # (B, 2N, D)
+        if self.use_rating_ts:
+            # Interleaved mode: rating-ts embedding lives in the CONTENT token
+            # (colocated with year_embed via item_full_embed), so the model
+            # can learn ts × year interactions. Action tokens stay pure
+            # action_embed — adding to content_emb pre-where ensures no
+            # contribution leaks into action positions. ts_2n shares the same
+            # value at c_i and a_i (per _build_interleaved); we use ts_2n
+            # directly because the where-select picks content_emb only at
+            # even positions where this contribution is wanted.
+            content_emb = content_emb + self.rating_ts_embed(self._ts_bucket(ts_2n))
         action_emb = self.action_embed(action_ids)             # (B, 2N, D)
         # torch.where picks content_emb at even (is_content=True) positions
         # and action_emb at odd (is_content=False) positions. Broadcast the
@@ -1046,6 +1146,15 @@ class HSTU(nn.Module):
                                    dim=1)
 
         content_emb = self.item_full_embed(new_content)        # (B, 2N+1, D)
+        if self.use_rating_ts:
+            # Eval-time symmetric application: the appended candidate at
+            # position 2N is a CONTENT token whose ts is the eval row's
+            # target_ts (already concatenated into new_ts above). Bucketing
+            # uses the same train-derived constants as training, so the
+            # candidate sees the same ts vocabulary. The candidate's
+            # rating_ts_embed contribution lands in content_emb[:, -1, :]
+            # before torch.where selects it (is_content=True at -1).
+            content_emb = content_emb + self.rating_ts_embed(self._ts_bucket(new_ts))
         action_emb = self.action_embed(new_action)             # (B, 2N+1, D)
         x = torch.where(new_is_content.unsqueeze(-1), content_emb, action_emb)
 
@@ -1476,6 +1585,24 @@ def main():
              f"std_norm avg={float(std_norm.mean()):.3f}  "
              f"frac_engaged avg={float(frac_norm.mean()):.3f}")
 
+    # Bucketed absolute rating-timestamp constants (USE_RATING_TS=1, may03
+    # variant A). TRAIN_TS_MIN is the minimum timestamp in train_df only — val
+    # and test never enter this aggregation (per prepare.load_data's time-based
+    # split, train timestamps strictly precede val/test, so this is a safe
+    # train-only statistic). The HSTU constructor receives train_ts_min and
+    # registers it as a buffer along with SECONDS_PER_MONTH; bucketing happens
+    # in HSTU._ts_bucket on the fly during forward. Computed regardless of the
+    # flag so the constructor signature stays uniform; the embedding is built
+    # only when USE_RATING_TS=1.
+    train_ts_min = int(train_df["timestamp"].min())
+    train_ts_max = int(train_df["timestamp"].max())
+    span_seconds = train_ts_max - train_ts_min
+    span_months = span_seconds / SECONDS_PER_MONTH
+    log.info(f"  rating-ts bucketing: train_ts_min={train_ts_min}  "
+             f"train_ts_max={train_ts_max}  span={span_months:.1f} months  "
+             f"num_buckets={NUM_TS_BUCKETS}  "
+             f"~{span_months / NUM_TS_BUCKETS:.1f} months/bucket")
+
     # Eval history uses train+val with per-sample strict-prior cutoff (mirrors
     # simple_v2's EVAL_DYNAMIC_HIST=1 — the +0.022 win at apr28ad came from val
     # rows seeing their OWN earlier val rows in history, while side="left"
@@ -1495,13 +1622,15 @@ def main():
 
     model = HSTU(stats["num_items"], NUM_RATING_BUCKETS,
                  genome=genome_t, genre=genre_t, year_id=year_id_t,
-                 item_pop=item_pop_t, item_stats=item_stats_t).to(DEVICE)
+                 item_pop=item_pop_t, item_stats=item_stats_t,
+                 train_ts_min=train_ts_min).to(DEVICE)
     n_params = sum(p.numel() for p in model.parameters())
     log.info(f"HSTU: {n_params/1e6:.2f}M params on {DEVICE}  "
              f"(layers={NUM_LAYERS}, heads={NUM_HEADS}, dim={EMBED_DIM}, "
              f"time_buckets={NUM_TIME_BUCKETS}) "
              f"use_genome={model.use_genome} use_genre={model.use_genre} use_year={model.use_year} "
              f"use_pop_prior={model.use_pop_prior} use_item_stats={model.use_item_stats} "
+             f"use_rating_ts={model.use_rating_ts} "
              f"use_mlp_head={model.use_mlp_head} use_interleave={model.use_interleave} "
              f"use_aux_rating={model.use_aux_rating}"
              + (f" aux_w={AUX_RATING_WEIGHT}" if model.use_aux_rating else ""))
