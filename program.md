@@ -14,6 +14,29 @@ Any HSTU cycle is measured against **val 0.8594 / test 0.8455** to be called a w
 
 ## Cycles
 
+### `may03-coldstart` extend-30 — first positive cold_user signal (+0.0012)
+
+`MAX_EPOCHS=30` on operational best (constant LR=1e-3, no other changes).
+
+**Result: val_auc=0.8575 (peak ep 21) vs baseline 0.8567 = +0.0008**.
+
+Strata diff (e30 - baseline):
+
+| Stratum | Δ |
+|---|---|
+| warm | +0.0001 |
+| **cold_user** | **+0.0012** (first positive cold_user result!) |
+| cold_item | -0.0107 (overfit on tiny pop) |
+| cold_both | -0.0077 (overfit) |
+| warm_popular | +0.0020 |
+| warm_tail | -0.0015 |
+
+**Pattern**: extra training helps dominant strata (cold_user 80%, warm_popular) where there's data but overfits tiny populations (cold_item 2%, cold_both 3%). Cold_user lift +0.0012 is the first positive after 4 cold_user-targeted nulls (pop_prior, item_stats, rating_ts, CAWR).
+
+**Below multi-seed bar** (+0.005 single-seed). Sub-noise but directional. May be marginal real lift OR seed noise.
+
+**vs simple_v2 0.8594**: gap −0.0019 (was −0.0027 at baseline).
+
 ### `may03-coldstart` CAWR — sub-noise null (val=0.8563)
 
 User asked about LR schedules that "go up and down." Tested CosineAnnealingWarmRestarts with T_0=4 epochs, T_mult=1, eta_min=20% × peak. 5 equal cycles over 20 epochs.
