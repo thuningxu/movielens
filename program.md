@@ -14,6 +14,24 @@ Any HSTU cycle is measured against **val 0.8594 / test 0.8455** to be called a w
 
 ## Cycles
 
+### `may5` — **InfoNCE auxiliary loss: REGRESSED, removed**
+
+After sliding-window landed, Critic R3+R4 had recommended trying paper-canonical InfoNCE auxiliary loss (sampled softmax over item vocab) on top of BCE. Hypothesis: BCE alone gradient-trains item embeddings only via the score head dot product; an InfoNCE auxiliary signal at each content position with K random negatives would teach item embeddings to be discriminative across the catalog. Critic prior: +0.001 to +0.005 val_auc.
+
+**Implementation**: `INFONCE_WEIGHT` flag (default 0). At each valid content position, computed cross-entropy over [pos_logit, neg_logit_1, ..., neg_logit_K] where positives use existing logit and negatives use h_proj × item_full_embed(random_item). Same h_proj reused (single dropout call) for both pos and neg. ~30 LOC added in `train_one_epoch`. OFF state byte-equivalent.
+
+**SEED=42 ml-25m at sliding-window + INFONCE_WEIGHT=0.2 K=8**:
+| | Sliding baseline | InfoNCE λ=0.2 | Δ |
+|---|---|---|---|
+| val_auc | 0.8629 | 0.8613 | **−0.0016** |
+| test_auc | 0.8652 | 0.8630 | **−0.0022** |
+
+Trajectory consistently below sliding throughout training (ep 4-19), not converging to it. Train_loss (BCE only) was higher than baseline (0.5073 vs 0.4992 at ep 4) — auxiliary was *pulling model away from BCE optimum*, not complementing. Two training instability spikes at ep 8 (train_loss 0.5350, grad_norm 0.64) and ep 16 (0.5285, 0.58) — InfoNCE gradient was disruptive.
+
+**Diagnosis**: at sliding-window baseline, item embeddings are already well-trained (2× more gradient signal per epoch from sliding's training-sample expansion). InfoNCE adds a competing geometry constraint that hurts BCE fit without a generalizing payoff. The mechanism that motivated InfoNCE (item embeddings undertrained by BCE alone) was empirically resolved by sliding window.
+
+**Removed** from train.py. Branch `may5` reset (no commits remain from this experiment). Result documented for posterity; future "should we add sampled softmax" questions can reference this.
+
 ### `may05-speedup` — **Sliding-window follow-ups: extend-30 and stride=50 both null**
 
 After the sliding-window win (next entry below), explored two natural follow-ups:
