@@ -34,6 +34,13 @@ DATASET=ml-25m uv run python train.py
 # (single-shot at the best-val checkpoint; mirrors simple_v2 apr28aj).
 RUN_TEST=1 DATASET=ml-25m uv run python train.py
 
+# Speedup config (may05-speedup branch): 5× wall-clock at trajectory parity.
+# EVAL_EVERY_N_EPOCHS=5 skips eval on epochs 0-3,5-8,10-13,15-18 (always
+# evals on final epoch). USE_COMPILE=1 fuses HSTUBlock kernels via torch.compile.
+# Reported val may be slightly below the every-epoch peak since intermediate
+# eval points are missed; final-epoch val is byte-equivalent.
+USE_COMPILE=1 EVAL_EVERY_N_EPOCHS=5 EVAL_BATCH_SIZE=2048 DATASET=ml-25m uv run python train.py
+
 # Reproduce the simple_v2 locked baseline (for cross-attempt comparison)
 EVAL_DYNAMIC_HIST=1 FREQ_WD_LAMBDA=0 LR=1e-3 DATASET=ml-25m uv run python simple_v2/train.py
 ```

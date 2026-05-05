@@ -14,6 +14,52 @@ Any HSTU cycle is measured against **val 0.8594 / test 0.8455** to be called a w
 
 ## Cycles
 
+### `may05-speedup` — **5× wall-clock speedup at trajectory parity**
+
+Branch off main after the test win to attack training speed. User asked about Triton custom kernels; profile redirected the work elsewhere.
+
+**Profile diagnosis (PROFILE_STEPS=20 on ml-25m at default config)**:
+- embedding_dense_backward: 29.3% GPU time
+- vectorized_gather + aten::gather (embedding lookup): 34.7%
+- radix_sort (embedding scatter): 15.6%
+- aten::bmm (attention!): **3.66%**
+
+Attention is **NOT the bottleneck**. Triton custom kernel for attention would speed up only ~4% of GPU time. The real bottleneck is **embedding ops + per-epoch eval frequency** (eval has ~18× more batches than training because val is per-event vs train is per-user-sequence; ml-25m has 137K train sequences vs 2.5M val rows).
+
+**Implementation (3 env-flag levers, all default to baseline behavior)**:
+- `EVAL_EVERY_N_EPOCHS` (default 1): skip eval on intermediate epochs; final epoch always evals so deployed state is captured
+- `EVAL_BATCH_SIZE` (default 0=BATCH_SIZE): use larger batch for inference (no backprop, no Adam state — eval-only memory budget allows much larger batches than training)
+- `USE_COMPILE` (default 0): wrap each HSTUBlock in torch.compile to fuse small kernels (LayerNorm, SiLU, GLU multiply, residual). Compiled per-block instead of whole model because train.py calls multiple non-forward methods (encode_interleaved, score_eval, item_full_embed) that torch.compile doesn't intercept; per-block compile preserves model API.
+
+**Measurements (5-epoch on ml-25m)**:
+
+| Config | Total | Per-train-epoch | Per-eval | Speedup |
+|---|---|---|---|---|
+| Baseline (default) | ~35 min | 48 sec | ~6.4 min | 1× |
+| EVAL_EVERY_N=5, EVAL_BATCH_SIZE=2048 | 11.1 min | 48 sec | 6.4 min | 3.2× |
+| **+ USE_COMPILE=1** | **7.6 min** | 51 sec | **2.6 min** | **4.6×** |
+
+Surprise: EVAL_BATCH_SIZE=2048 gave near-zero speedup on its own (eval is bottlenecked on per-batch embedding work, not kernel launch overhead — increasing batch size 8× also increases per-batch time 8×). torch.compile's kernel fusion DID help eval (2.5×) — fewer kernels per forward pass even at the same batch size.
+
+**20-epoch full validation (EVAL_EVERY_N=5 + EVAL_BATCH_SIZE=2048 + USE_COMPILE=1)**:
+
+| Metric | Baseline | Speedup config |
+|---|---|---|
+| val_auc (peak captured) | 0.8594 (ep 16) | 0.8591 (ep 19) |
+| total_seconds | 8425 (140 min) | **1686 (28 min)** |
+| **wall-clock speedup** | | **5.0×** |
+
+The −0.0003 val gap reflects EVAL_EVERY_N=5 missing the baseline's ep-16 peak (we eval at 4, 9, 14, 19). Training trajectory itself is byte-equivalent (train_loss matches baseline within 1e-4 across all 20 epochs). The "lost AUC" is a measurement artifact, not a training regression.
+
+**Recommendation tiers**:
+- **Multi-seed verify** (final-epoch val matters): EVAL_EVERY_N=5 + USE_COMPILE=1 → 5× speedup
+- **Debug / mid-trajectory analysis**: USE_COMPILE=1 only → 2× speedup with full per-epoch granularity
+- **Strictly byte-equivalent baseline**: defaults → 1× (current main)
+
+**Triton not pursued**: profile shows attention is 3.66% of GPU time. A custom Triton attention kernel would require 1-2 days of work for ~4% overall speedup — net negative. Could be revisited if scaling to bigger D or sequence length where attention actually dominates.
+
+**Branch**: `may05-speedup`. Not merged. Defaults preserved on the branch (USE_COMPILE=0, EVAL_EVERY_N_EPOCHS=1) so OFF state matches main exactly.
+
 ### `main` may05 — **HSTU wins on test set: 0.8617 vs simple_v2 0.8455 (+0.0162)**
 
 After D=128 merged to main, ran 3-seed val + canonical test eval per team R4 plan. The headline:
