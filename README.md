@@ -36,9 +36,18 @@ uv sync
 # Smoke test (ml-100k, ~seconds)
 DATASET=ml-100k uv run python train.py
 
-# Standard experiment (ml-25m on the current CUDA GPU)
+# Production experiment (ml-25m, every-epoch eval, ~140 min for 20 epochs)
 DATASET=ml-25m uv run python train.py
+
+# Production + held-out test eval at end (single-shot)
+RUN_TEST=1 DATASET=ml-25m uv run python train.py
+
+# Fast-iteration preset (~46 min for 20 epochs, ~3× speedup, eval every 5th epoch)
+USE_COMPILE=1 EVAL_EVERY_N_EPOCHS=5 EVAL_BATCH_SIZE=2048 \
+  DATASET=ml-25m uv run python train.py
 ```
+
+All speedup flags default OFF — see the **Speedup config** subsection in Status for full presets and tradeoffs.
 
 ## Architecture
 

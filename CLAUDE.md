@@ -23,7 +23,7 @@ uv sync
 # Smoke test (ml-100k, ~seconds — crash detection only, NOT for AUC comparison)
 DATASET=ml-100k uv run python train.py
 
-# Standard experiment (ml-25m on the current CUDA GPU)
+# PRODUCTION experiment (ml-25m, every-epoch eval, ~140 min for 20 epochs)
 # Defaults are the may05 best config (val 0.8626 2-seed, test 0.8652):
 # EMBED_DIM=128, NUM_LAYERS=3, INTERLEAVE=1, USE_BF16=1, GRAD_CLIP=1.0,
 # PROJ_INIT_MODE=xavier, MLP_HEAD=1, USE_GENOME=USE_GENRE=USE_YEAR=1,
@@ -34,12 +34,19 @@ DATASET=ml-25m uv run python train.py
 # (single-shot at the best-val checkpoint; mirrors simple_v2 apr28aj).
 RUN_TEST=1 DATASET=ml-25m uv run python train.py
 
-# Speedup config (may05-speedup branch): 5× wall-clock at trajectory parity.
-# EVAL_EVERY_N_EPOCHS=5 skips eval on epochs 0-3,5-8,10-13,15-18 (always
-# evals on final epoch). USE_COMPILE=1 fuses HSTUBlock kernels via torch.compile.
-# Reported val may be slightly below the every-epoch peak since intermediate
-# eval points are missed; final-epoch val is byte-equivalent.
+# FAST-ITERATION preset (~46 min for 20 epochs, ~3× over production):
+# - USE_COMPILE=1: torch.compile per-block fusion (60s upfront, ~1.5× train+eval)
+# - EVAL_EVERY_N_EPOCHS=5: eval at ep 4,9,14,19 + final (saves ~80% of eval time)
+# - EVAL_BATCH_SIZE=2048: marginal but doesn't hurt
+# Reported val_auc tracks final-epoch (peak across captured eval points), so it
+# may be 0.0001-0.0003 below every-epoch peak. Use for sweeps/iteration; use
+# the production command above for headline numbers.
 USE_COMPILE=1 EVAL_EVERY_N_EPOCHS=5 EVAL_BATCH_SIZE=2048 DATASET=ml-25m uv run python train.py
+
+# COMPILE-ONLY preset (~100 min for 20 epochs, ~1.5× over production):
+# Keeps per-epoch eval (production-correct) but speeds up via torch.compile.
+# Use when you want every-epoch trajectory but faster than raw default.
+USE_COMPILE=1 DATASET=ml-25m uv run python train.py
 
 # Reproduce the simple_v2 locked baseline (for cross-attempt comparison)
 EVAL_DYNAMIC_HIST=1 FREQ_WD_LAMBDA=0 LR=1e-3 DATASET=ml-25m uv run python simple_v2/train.py
