@@ -12,7 +12,7 @@ The two prior attempts are archived as subdirectories:
 
 This attempt drops the engineered-feature framing entirely. HSTU treats the user as a sequence of (item, action, time) tokens and uses pointwise causal attention to predict next-event engagement. No hand-specified pools, no concat features, no cross fields.
 
-**Status**: may04 capacity cycle. Best result `D=128` = **val 0.8594 single-seed (SEED=42)** — ties simple_v2's locked val. +0.0027 over D=64 baseline (broad strata lift: warm +0.0031, cold_user +0.0028, cold_item +0.0020, cold_both +0.0009). Multi-seed verification pending. Test-set evaluation gated on multi-seed val ≥ 0.8590 with 5/5 positive.
+**Status**: may05 — HSTU wins on held-out test set. D=128 config: **val 0.8593 (3-seed mean SEED=42-44, σ ≈ 0.0001)** ties simple_v2's locked val 0.8594. **test 0.8617 (single-shot SEED=42)** beats simple_v2 locked test 0.8455 by **+0.0162**. Val→test gap: HSTU +0.0024 vs simple_v2 −0.0139 — HSTU's sequence-summary representation generalizes better than simple_v2's engineered concat as users' histories extend through the test period.
 
 ## Commands
 

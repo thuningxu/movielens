@@ -318,6 +318,16 @@ NUM_YEAR_BUCKETS = 200
 SAVE_PREDS = int(os.environ.get("SAVE_PREDS", "0"))
 SAVE_PREDS_PATH = os.environ.get("SAVE_PREDS_PATH", "/tmp/eval_strata.csv")
 
+# Held-out test set evaluation (single-shot). Default OFF so the off-state is
+# byte-equivalent to prior baselines. When RUN_TEST=1, after training completes
+# the model state at the best-val-auc epoch is restored and a single inference
+# pass is run on the test set with strict-prior history (train+val+test
+# combined, ts_event < ts_sample cutoff applied per row by EvalDataset). Mirrors
+# simple_v2 apr28aj's single-shot test reporting protocol. Test eval is the
+# project's terminal claim — do not iterate on test.
+RUN_TEST = int(os.environ.get("RUN_TEST", "0"))
+TEST_SAVE_PREDS_PATH = os.environ.get("TEST_SAVE_PREDS_PATH", "/tmp/test_preds.csv")
+
 
 # ─── Movie metadata (cold-start content features) ───────────────────
 def load_movie_metadata(movies_df: pd.DataFrame, dataset: str, num_items: int):
@@ -2094,6 +2104,10 @@ def main():
                  f"(eta_min_frac={CAWR_ETA_MIN_FRAC})")
 
     best_val_auc = 0.0
+    # Cheap best-checkpoint tracking: only deepcopy state_dict when val improves
+    # AND RUN_TEST=1. Off-state (RUN_TEST=0) does not allocate or copy anything,
+    # preserving byte-equivalence with prior baselines.
+    best_state_dict = None
     for epoch in range(MAX_EPOCHS):
         train_loss, avg_grad_norm, avg_aux_loss = train_one_epoch(
             model, train_loader, optimizer, scheduler,
@@ -2115,13 +2129,42 @@ def main():
         aux_part = f" aux_loss={avg_aux_loss:.4f}" if avg_aux_loss is not None else ""
         cur_lr = optimizer.param_groups[0]["lr"]
         log.info(f"epoch {epoch}: train_loss={train_loss:.4f} val_auc={val_auc:.4f}{aux_part}{gn_part} lr={cur_lr:.2e}")
-        best_val_auc = max(best_val_auc, val_auc)
+        if val_auc > best_val_auc:
+            best_val_auc = val_auc
+            if RUN_TEST:
+                import copy
+                best_state_dict = copy.deepcopy(model.state_dict())
 
     total = time.time() - t0
     print(f"\nval_auc:          {best_val_auc:.6f}")
     print(f"total_seconds:    {total:.1f}")
     print(f"dataset:          {DATASET}")
     print(f"num_params_M:     {n_params/1e6:.2f}")
+
+    # ─── Held-out test set evaluation (single-shot, RUN_TEST=1) ──────
+    # Mirrors simple_v2 apr28aj's protocol: restore best-val checkpoint, build
+    # test history from train+val+test (per-row strict-prior cutoff in EvalDataset),
+    # run a single inference pass. This is the project's terminal claim — do not
+    # iterate on test.
+    if RUN_TEST:
+        log.info("===== held-out test set evaluation (single-shot) =====")
+        if best_state_dict is not None:
+            model.load_state_dict(best_state_dict)
+            log.info(f"  restored best-val checkpoint (val_auc={best_val_auc:.6f})")
+        else:
+            log.info(f"  using final-epoch state (no improvement tracked)")
+        # Test history combines all real ratings; EvalDataset slices by ts<sample.ts.
+        test_history = build_user_sequences(
+            pd.concat([train_df, val_df, test_df], ignore_index=True)
+        )
+        test_ds = EvalDataset(test_df, test_history, SEQ_LEN)
+        test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False,
+                                 collate_fn=collate_eval)
+        log.info(f"  test_rows={len(test_ds)}  history_users={len(test_history)}")
+        test_save_path = TEST_SAVE_PREDS_PATH if SAVE_PREDS else None
+        test_auc = evaluate_model(model, test_loader, save_preds_path=test_save_path)
+        print(f"test_auc:         {test_auc:.6f}")
+
     print(f"# bar to clear (simple_v2 locked): val 0.8594 / test 0.8455")
 
 

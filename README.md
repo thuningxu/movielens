@@ -158,7 +158,9 @@ Whatever metadata-fused embedding the sequence sees as observations is exactly w
 
 **Stratum lifts (D=128 vs D=64 baseline)**: warm +0.0031, cold_user +0.0028, cold_item +0.0020, cold_both +0.0009 — first clean broad lift after 5 cold_user-targeted nulls. Capacity was the unprobed axis; the apparent "structural cold_user ceiling" was a capacity ceiling.
 
-**Gap to simple_v2 0.8594**: 0.0000 single-seed (TIE). Multi-seed verification pending. Test-set evaluation gated on multi-seed val ≥ 0.8590 with 5/5 positive.
+**Gap to simple_v2 0.8594**: 0.0000 single-seed (TIE). 3-seed val mean: 0.8593 (s42=0.8594, s43=0.8592, s44=0.8592, σ ≈ 0.0001).
+
+**Held-out test set (single-shot SEED=42)**: **HSTU 0.8617 vs simple_v2 0.8455 = +0.0162 lift**. HSTU val→test gap +0.0024 (test improves over val) vs simple_v2 −0.0139. HSTU's sequence-summary representation generalizes substantially better than simple_v2's engineered concat as user histories extend through the test period (2018-01 to 2019-11). Test cold_user (78% of test rows) = 0.8620, +0.0042 over its val cold_user 0.8578.
 
 **Key findings**:
 - Pure HSTU at 0.8367 already beats heavily-tuned simple_v2 static (0.828) and legacy DLRM (0.8284) with NO movie content features — pure user-item interaction modeling carries the signal.

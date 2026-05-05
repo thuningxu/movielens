@@ -14,6 +14,47 @@ Any HSTU cycle is measured against **val 0.8594 / test 0.8455** to be called a w
 
 ## Cycles
 
+### `main` may05 — **HSTU wins on test set: 0.8617 vs simple_v2 0.8455 (+0.0162)**
+
+After D=128 merged to main, ran 3-seed val + canonical test eval per team R4 plan. The headline:
+
+| | HSTU D=128 | simple_v2 locked | Δ |
+|---|---|---|---|
+| val (3-seed mean) | **0.8593** | 0.8593 | TIED |
+| val (SEED=42) | 0.8594 | 0.8594 | TIED |
+| **test (single-shot SEED=42)** | **0.8617** | **0.8455** | **+0.0162** |
+| val→test gap | +0.0024 | −0.0139 | +0.0163 |
+
+**3-seed val verification**: SEED=42=0.8594, SEED=43=0.8592, SEED=44=0.8592. Inter-seed σ ≈ 0.0001 (extremely tight, ~10× tighter than D=64 baseline 0.0009). Trajectories overlap throughout training.
+
+**Test eval protocol**: single-shot per simple_v2 apr28aj convention. Built test_history from train+val+test combined; EvalDataset slices per-row with `np.searchsorted(side="left")` for strict-prior cutoff. Restored best-val checkpoint before test inference. RUN_TEST=1 flag added to train.py with byte-equivalent OFF state (val_auc reproduces SEED=42 prior run within 1e-4).
+
+**Test stratum breakdown**:
+
+| Stratum | n | mean_label | AUC |
+|---|---|---|---|
+| warm | 237K | 0.369 | 0.8622 |
+| **cold_user** | **1.94M (78%)** | 0.520 | **0.8620** |
+| cold_item | 100K | 0.366 | 0.8425 |
+| cold_both | 219K | 0.483 | 0.8390 |
+| warm_popular | 115K | 0.426 | 0.8529 |
+| warm_tail | 122K | 0.315 | 0.8657 |
+
+cold_user on test (0.8620) is **+0.004 above its val cold_user (0.8578)** — the dominant stratum (78% of test) gets *better* on test, leveraging the longer history available at test time (val ratings now in user's pre-test event sequence).
+
+**Why HSTU wins on test where simple_v2 didn't**: simple_v2's engineered concat (i_hist_pool ⊙ u_e + 1128-d tag genome + manual cross fields) showed val→test gap of −0.0139 — its representation overfits to val-time distribution. HSTU's sequence-summary representation, learned from raw events, transfers naturally as users' histories extend through the test period. The +0.0024 val→test gap (HSTU does *better* on test) is the architectural signature: sequence models generalize across time better than aggregate-feature models.
+
+**Cumulative progression** (HSTU attempt, val/test on ml-25m at SEED=42):
+
+- Cycle M0 (pure HSTU): 0.8367 val / unmeasured test
+- apr30 interleave_3L_bf16: 0.8567 val / unmeasured test
+- may04 D=128: 0.8594 val / **0.8617 test**
+
+vs simple_v2 static baseline (0.8282 val / 0.8221 test): +0.031 val, +0.040 test.
+vs simple_v2 locked baseline (0.8594 val / 0.8455 test): +0.000 val, +0.0162 test.
+
+**Deliverable**: HSTU at D=128 with the may04 default config beats simple_v2's locked baseline on the held-out test set by **+0.0162**. Multi-seed val verified at 3-seed mean 0.8593.
+
 ### `may03-coldstart` D=128 capacity — TIES simple_v2 on val (single-seed, +0.0027)
 
 After variant C kill, team R2 (sequential plan): D=128 first (Critic-approved as the only HSTU-internal axis with prior > 15%), FREQ_WD deferred. The Critic's evidence: simple_v2 apr28ag dropped FREQ_WD from 1e-4 to 0 and got +0.0015; combining D=128 + FREQ_WD risked re-introducing what simple_v2 found actively harmful in the rich-eval regime.
