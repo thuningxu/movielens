@@ -79,7 +79,7 @@ Strata vs D=64 baseline (0.8567):
 
 **Diagnostic flip**: the apparent "structural cold_user ceiling" of HSTU was actually a **capacity ceiling** masquerading as architectural. EMBED_DIM=64 was an early-cycle decision (apr28b? apr29 stability work) never revisited. The variant C "parallel user_embed competes with sequence summary" diagnosis remains correct as a *separate* mechanism failure, but the cold_user gap was primarily encoder-capacity-bound, not user-representation-bound.
 
-**vs simple_v2 0.8594**: gap **0.0000 single-seed** (TIE). Multi-seed verification pending (5-seed mean ≥ 0.8590 with 5/5 positive required to declare a sustained tie; multi-seed mean ≥ 0.8590 + test gate would unlock test-set evaluation).
+**vs simple_v2 0.8594**: gap **0.0000 single-seed** (TIE). Multi-seed verification + test eval completed in the may05 cycle above (3-seed val mean 0.8593, test 0.8617 vs simple_v2 0.8455 = **+0.0162**).
 
 **Trajectory**: ep 16-19 plateaus in [0.8590, 0.8594] — at the new capacity ceiling, not still climbing. Suggests limited gain from MAX_EPOCHS extension at D=128, but a follow-up could verify.
 

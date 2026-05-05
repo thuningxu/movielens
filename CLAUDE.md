@@ -24,11 +24,15 @@ uv sync
 DATASET=ml-100k uv run python train.py
 
 # Standard experiment (ml-25m on the current CUDA GPU)
-# Defaults are now the may04 best config (val 0.8594 SEED=42):
+# Defaults are the may04 best config (val 0.8594 SEED=42, test 0.8617):
 # EMBED_DIM=128, NUM_LAYERS=3, INTERLEAVE=1, USE_BF16=1, GRAD_CLIP=1.0,
 # PROJ_INIT_MODE=xavier, MLP_HEAD=1, USE_GENOME=USE_GENRE=USE_YEAR=1,
 # SEQ_LEN=100, MAX_EPOCHS=20, LR=1e-3 constant.
 DATASET=ml-25m uv run python train.py
+
+# Add RUN_TEST=1 to additionally evaluate on the held-out test set
+# (single-shot at the best-val checkpoint; mirrors simple_v2 apr28aj).
+RUN_TEST=1 DATASET=ml-25m uv run python train.py
 
 # Reproduce the simple_v2 locked baseline (for cross-attempt comparison)
 EVAL_DYNAMIC_HIST=1 FREQ_WD_LAMBDA=0 LR=1e-3 DATASET=ml-25m uv run python simple_v2/train.py
@@ -37,7 +41,7 @@ EVAL_DYNAMIC_HIST=1 FREQ_WD_LAMBDA=0 LR=1e-3 DATASET=ml-25m uv run python simple
 ## Layout
 
 - **`prepare.py`** — Shared. `load_data()` returns raw `train`/`val`/`test` DataFrames with columns `userId, movieId, rating, timestamp, label`. `evaluate(labels, scores)` is the AUC ground-truth. **Do not modify the evaluation harness.**
-- **`train.py`** — HSTU model + sequence data pipeline + training loop. Includes content metadata (`USE_GENOME`/`USE_GENRE`/`USE_YEAR`), training stabilization (`GRAD_CLIP`, `PROJ_INIT_MODE`), MLP head (`MLP_HEAD`, `MLP_HEAD_DROPOUT`), interleaved tokens (`INTERLEAVE`), bf16 mixed precision (`USE_BF16`), LR schedule (`LR_SCHEDULE`, `WARMUP_STEPS`, `OPTIMIZER`), aux rating head (`AUX_RATING_WEIGHT`) — all default OFF, byte-equivalent off-state.
+- **`train.py`** — HSTU model + sequence data pipeline + training loop. Includes content metadata (`USE_GENOME`/`USE_GENRE`/`USE_YEAR`), training stabilization (`GRAD_CLIP`, `PROJ_INIT_MODE`), MLP head (`MLP_HEAD`, `MLP_HEAD_DROPOUT`), interleaved tokens (`INTERLEAVE`), bf16 mixed precision (`USE_BF16`), LR schedule (`LR_SCHEDULE`, `WARMUP_STEPS`, `OPTIMIZER`), aux rating head (`AUX_RATING_WEIGHT`), held-out test eval (`RUN_TEST`) — flags default to ON for the operational-best stack and OFF for experimental probes; all OFF-states byte-equivalent.
 - **`program.md`** — Experiment log for this attempt.
 - **`legacy/`**, **`simple_v2/`** — Frozen archives. Each has its own `CLAUDE.md` and `program.md`.
 - **`data/`** — Auto-downloaded; gitignored.
@@ -60,15 +64,15 @@ Per Meta 2024:
 - **HSTU block** (×L): pre-norm + gated linear unit (`SiLU(W1 x) ⊙ (W2 x)`) + relative-position-bias attention + residual. Causal mask.
 - **Output head**: per-position MLP → P(engage at next step | history).
 - **Loss**: BCE on next-event engagement label.
-- **Eval**: at each (user, movie, ts) val sample, score the candidate movie by feeding the user's prior train+val events ending just before `ts` and reading out the head at the appended candidate position.
+- **Eval**: at each (user, movie, ts) val sample, score the candidate movie by feeding the user's prior train+val events ending just before `ts` and reading out the head at the appended candidate position. Test eval (RUN_TEST=1) uses train+val+test events with the same per-row strict-prior cutoff.
 
 ## Discipline (carried over from the prior attempts)
 
 - **Multi-seed verification is mandatory for any keep claim.** Estimate the seed-noise floor before testing candidates; declare a win only when the lift is statistically distinguishable.
 - **Smoke-test on ml-100k for crashes only**, not for AUC.
 - **`prepare.py:evaluate()` is the ground truth.** Do not modify it.
-- **Keep `train.py` simple while it's small.** Split into `model.py` / `data.py` / `train.py` only after the file grows past ~500 lines.
-- **The simple_v2 baseline is the bar.** Any HSTU result must be measured against `val 0.8594` / `test 0.8455` to be a "win." Same eval harness, same split.
+- **`train.py` is now ~2200 lines** — past the 500-line split threshold. Future cycles should consider extracting model/data into separate modules; deferred for now since the operational-best config is locked.
+- **The simple_v2 baseline is the bar.** As of may05, HSTU has cleared it: val tied (0.8593 vs 0.8594), test won (+0.0162: 0.8617 vs 0.8455). Future regressions/lifts continue to be measured against simple_v2's locked numbers AND HSTU's current best on val + test.
 
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence

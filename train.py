@@ -56,9 +56,11 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
 # HSTU hyperparameters (placeholders — tune once the real model lands)
-# may04 defaults are the operational-best config (val 0.8594 single-seed
-# SEED=42 on ml-25m, ties simple_v2 locked baseline). To reproduce earlier
-# byte-equivalent baselines, override the relevant flags — see program.md.
+# may05 operational-best config: val 0.8593 (3-seed mean SEED=42-44,
+# σ ≈ 0.0001) ties simple_v2 0.8594; **test 0.8617 (single-shot SEED=42)
+# beats simple_v2 test 0.8455 by +0.0162** on ml-25m. To reproduce earlier
+# byte-equivalent baselines, override the relevant flags — see program.md
+# cycle history.
 EMBED_DIM = int(os.environ.get("EMBED_DIM", "128"))      # may04 best: 128 lifts +0.0027 vs 64 (broad strata gains)
 NUM_LAYERS = int(os.environ.get("NUM_LAYERS", "3"))     # apr30 best: 3L matches 4L AUC, 27% faster
 NUM_HEADS = int(os.environ.get("NUM_HEADS", "4"))
