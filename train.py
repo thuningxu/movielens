@@ -1740,6 +1740,16 @@ def train_one_epoch(model, loader, optimizer, scheduler=None):
         if (USE_BF16 and DEVICE == "cuda") else nullcontext()
     )
     for batch in loader:
+        # CUDA Graphs (via torch.compile mode='reduce-overhead') reuses static
+        # input/output buffers across calls. Without an explicit step boundary,
+        # tensor outputs from prior steps may be overwritten before downstream
+        # consumers (e.g., the next batch's forward, or eval after train) read
+        # them, causing "accessing tensor output of CUDAGraphs that has been
+        # overwritten" RuntimeError. Marking step boundary forces the graph to
+        # snapshot inputs and produce fresh outputs each iteration. No-op when
+        # CUDA Graphs aren't active (USE_COMPILE=0 or COMPILE_MODE=default).
+        if USE_COMPILE and COMPILE_MODE == "reduce-overhead":
+            torch.compiler.cudagraph_mark_step_begin()
         if INTERLEAVE:
             content_ids = batch["content_ids"].to(DEVICE)        # (B, 2N)
             action_ids = batch["action_ids"].to(DEVICE)          # (B, 2N)
@@ -1889,6 +1899,9 @@ def evaluate_model(model, loader, save_preds_path: str | None = None):
         if (USE_BF16 and DEVICE == "cuda") else nullcontext()
     )
     for batch in loader:
+        # CUDA Graphs step boundary (see train_one_epoch for explanation).
+        if USE_COMPILE and COMPILE_MODE == "reduce-overhead":
+            torch.compiler.cudagraph_mark_step_begin()
         cand = batch["mid"].to(DEVICE)
         label = batch["label"]
         # uids / eval_idx tensors are computed once per batch; only consumed
