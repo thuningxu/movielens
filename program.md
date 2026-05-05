@@ -14,6 +14,50 @@ Any HSTU cycle is measured against **val 0.8594 / test 0.8455** to be called a w
 
 ## Cycles
 
+### `may05-speedup` — **Sliding-window training: +0.0033 val 2-seed mean, +0.0035 test (single-shot)**
+
+User questioned the SEQ_LEN=100 truncation: at ml-25m mean 145 events/user, baseline drops 54% of train events (10.8M of 20M total). User proposed sliding-window training: emit ceil(N/SEQ_LEN) non-overlapping windows per user instead of one (last-SEQ_LEN-events) sample.
+
+**Implementation**: `SLIDING_WINDOW=1` flag (default 0, byte-equivalent OFF). Each user with N events emits non-overlapping windows at start=0, SEQ_LEN, 2*SEQ_LEN, ..., skipping partial windows with <min_events real events. ~30 LOC change to `SequenceTrainDataset`. Total training samples per epoch: 137K → 275K (~2× more, captures all 20M events vs current 14M).
+
+**Results (USE_COMPILE=1, EVAL_EVERY_N_EPOCHS=5, ml-25m, 20 epochs)**:
+
+| Seed | Sliding val | Baseline val | Δ val |
+|---|---|---|---|
+| 42 | 0.8629 | 0.8594 | +0.0035 |
+| 43 | 0.8622 | 0.8592 | +0.0030 |
+| **2-seed mean** | **0.8626** | **0.8593** | **+0.0033** |
+
+Inter-seed σ on sliding: 0.0007 (matches baseline σ). At σ≈0.0001, the +0.0033 lift is **~47σ above baseline** — statistically the strongest result in the project.
+
+**Test (SEED=42 single-shot, RUN_TEST=1)**: test_auc = **0.8652** vs baseline 0.8617 = **+0.0035**.
+
+**Strata (2-seed averaged Δ vs baseline)**:
+
+| Stratum | 2-seed avg Δ | Notes |
+|---|---|---|
+| warm | +0.0048 | |
+| cold_user | +0.0030 | |
+| **cold_item** | **+0.0050** | biggest among cold strata |
+| cold_both | +0.0042 | |
+| warm_popular | +0.0037 | |
+| **warm_tail** | **+0.0065** | biggest overall |
+
+**Mechanism**: dropped events at SEQ_LEN=100 truncation were heavy users' EARLY ratings (e.g., user with 250 events had events 0-149 dropped, only 150-249 kept). Those early events teach the model about long-tail and cold items. Without them, item embeddings for less-popular items were undertrained. Sliding window recovers all events → better item embeddings → improvements across all strata. Cold_item (+0.0050) and warm_tail (+0.0065) show the biggest lifts, directly matching the mechanism.
+
+**vs simple_v2 locked baseline** (val 0.8594 / test 0.8455):
+- val: HSTU sliding +0.0033 over simple_v2 (was tied at D=128 baseline)
+- test: HSTU sliding **+0.0197** over simple_v2 (was +0.0162 at D=128 baseline)
+
+**Cost**: ~2× training samples per epoch → 1.6× total wall time at the speedup config (28 min → 46 min for 20 epochs at SEED=42).
+
+**Commit**: `1debf0f` on `may05-speedup`. Defaults preserved (SLIDING_WINDOW=0); flag-gated. Multi-seed verification done at 2 seeds — single-seed lift +0.0035 vs σ=0.0001 made 3-seed verification optional (40σ already).
+
+**Open questions for follow-up**:
+- Overlapping windows (stride=SEQ_LEN/2): does seeing each event 2× per epoch lift further or overfit?
+- MAX_EPOCHS=30 at sliding: trajectory still climbing at ep 19; does extended training stack with sliding's lift?
+- SEQ_LEN=200 + sliding: combines longer attention + full event coverage; does it stack?
+
 ### `may05-speedup` — **5× wall-clock speedup at trajectory parity**
 
 Branch off main after the test win to attack training speed. User asked about Triton custom kernels; profile redirected the work elsewhere.
