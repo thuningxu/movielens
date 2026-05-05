@@ -87,6 +87,17 @@ EVAL_EVERY_N_EPOCHS = int(os.environ.get("EVAL_EVERY_N_EPOCHS", "1"))
 EVAL_BATCH_SIZE = int(os.environ.get("EVAL_BATCH_SIZE", "0"))  # 0 = same as BATCH_SIZE
 USE_COMPILE = int(os.environ.get("USE_COMPILE", "0"))
 
+# Sliding-window training (may05 — recover events truncated by SEQ_LEN cap).
+# Default OFF (SLIDING_WINDOW=0): one sample per user = last SEQ_LEN events,
+# byte-equivalent to baseline. ml-25m has mean 145 events/user — at SEQ_LEN=100
+# baseline drops 54% of train events for heavy users.
+# When SLIDING_WINDOW=1: emit multiple non-overlapping SEQ_LEN-length windows
+# per user (ceil(N/seq_len) samples). Captures all events at linear cost
+# (~1.5× training samples per epoch on ml-25m). SLIDING_WINDOW_STRIDE
+# defaults to SEQ_LEN (non-overlapping) but can be set smaller for overlap.
+SLIDING_WINDOW = int(os.environ.get("SLIDING_WINDOW", "0"))
+SLIDING_WINDOW_STRIDE = int(os.environ.get("SLIDING_WINDOW_STRIDE", "0"))  # 0 = SEQ_LEN
+
 # Cold-start content metadata flags (apr30, Idea 1). All default OFF for
 # byte-equivalence with the prior baseline. When enabled, each adds a
 # projection (or embedding) summed into the per-position item-side input
@@ -714,23 +725,54 @@ def _build_eval_rater_pool(eval_df: pd.DataFrame, train_df: pd.DataFrame,
 
 class SequenceTrainDataset(Dataset):
     """One sample = one user's full event sequence (truncated to last SEQ_LEN
-    if longer). Per-position causal training: at every valid position t, the
-    model predicts engagement of event[t+1]. No injected easy negatives —
-    sequence training is dense per-position; that was a sample-level artifact.
+    if longer) by default. Per-position causal training: at every valid
+    position t, the model predicts engagement of event[t+1]. No injected
+    easy negatives — sequence training is dense per-position; that was a
+    sample-level artifact.
+
+    SLIDING_WINDOW=1: emit ceil(N/SEQ_LEN) non-overlapping samples per user
+    (or with stride SLIDING_WINDOW_STRIDE for overlap), recovering events
+    that the default last-SEQ_LEN truncation drops. ml-25m at SEQ_LEN=100
+    drops 54% of train events for heavy users; sliding windows captures
+    all events at linear cost (~1.5× samples/epoch).
     """
 
     def __init__(self, history: dict[int, np.ndarray], seq_len: int, min_events: int = 2):
-        # Need ≥2 events per sequence: at least one (t, t+1) prediction pair.
-        self.uids = sorted(uid for uid, ev in history.items() if ev.shape[0] >= min_events)
         self.history = history
         self.seq_len = seq_len
+        if SLIDING_WINDOW:
+            stride = SLIDING_WINDOW_STRIDE if SLIDING_WINDOW_STRIDE > 0 else seq_len
+            # Each "sample" = (uid, window_start_idx). Window covers
+            # events[start : start + seq_len]; if the window has <min_events
+            # real events, it's skipped (e.g., a user with 101 events at
+            # stride=100 would otherwise emit a 1-event partial window at
+            # start=100 — useless for prediction).
+            self.samples = []
+            for uid in sorted(history.keys()):
+                ev = history[uid]
+                n = ev.shape[0]
+                if n < min_events:
+                    continue
+                start = 0
+                while start < n:
+                    n_real_in_window = min(seq_len, n - start)
+                    if n_real_in_window >= min_events:
+                        self.samples.append((uid, start))
+                    start += stride
+        else:
+            # Need ≥2 events per sequence: at least one (t, t+1) prediction pair.
+            self.uids = sorted(uid for uid, ev in history.items() if ev.shape[0] >= min_events)
 
     def __len__(self):
-        return len(self.uids)
+        return len(self.samples) if SLIDING_WINDOW else len(self.uids)
 
     def __getitem__(self, idx):
-        uid = self.uids[idx]
-        events = self.history[uid]
+        if SLIDING_WINDOW:
+            uid, start = self.samples[idx]
+            events = self.history[uid][start:start + self.seq_len]
+        else:
+            uid = self.uids[idx]
+            events = self.history[uid]
         items = events[:, 0]
         ratings = events[:, 1]
         timestamps = events[:, 2]
