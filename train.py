@@ -86,6 +86,12 @@ MAX_EPOCHS = int(os.environ.get("MAX_EPOCHS", "20"))    # apr30 best — earlier
 EVAL_EVERY_N_EPOCHS = int(os.environ.get("EVAL_EVERY_N_EPOCHS", "1"))
 EVAL_BATCH_SIZE = int(os.environ.get("EVAL_BATCH_SIZE", "0"))  # 0 = same as BATCH_SIZE
 USE_COMPILE = int(os.environ.get("USE_COMPILE", "0"))
+COMPILE_MODE = os.environ.get("COMPILE_MODE", "default")  # default | reduce-overhead | max-autotune
+# DataLoader speedup levers (default 0 = byte-equivalent baseline). num_workers>0
+# enables multi-process data prep; pin_memory speeds up CPU→GPU transfers via
+# pinned host memory.
+NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "0"))
+PIN_MEMORY = int(os.environ.get("PIN_MEMORY", "0"))
 
 # Sliding-window training (may05 — recover events truncated by SEQ_LEN cap).
 # Default OFF (SLIDING_WINDOW=0): one sample per user = last SEQ_LEN events,
@@ -2066,14 +2072,21 @@ def main():
     train_ds = SequenceTrainDataset(train_history, SEQ_LEN)
     val_ds = EvalDataset(val_df, eval_history, SEQ_LEN)
     log.info(f"  train_sequences={len(train_ds)}  val_rows={len(val_ds)}")
+    # NUM_WORKERS > 0 enables multi-process DataLoader. PIN_MEMORY=1 uses
+    # pinned host memory for faster CPU→GPU transfers (only meaningful when
+    # num_workers > 0 since num_workers=0 lacks the worker-side prefetch).
+    # OFF state (num_workers=0, pin_memory=False) is byte-equivalent.
+    dl_kwargs = {"num_workers": NUM_WORKERS, "pin_memory": bool(PIN_MEMORY)}
+    if NUM_WORKERS > 0:
+        dl_kwargs["persistent_workers"] = True  # avoid worker re-fork per epoch
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
-                              collate_fn=collate_train)
+                              collate_fn=collate_train, **dl_kwargs)
     # EVAL_BATCH_SIZE=0 → use BATCH_SIZE (byte-equivalent to baseline). Larger
     # eval batch reduces per-batch kernel launch overhead since eval has no
     # backward pass — memory is the only constraint.
     eval_batch_size = EVAL_BATCH_SIZE if EVAL_BATCH_SIZE > 0 else BATCH_SIZE
     val_loader = DataLoader(val_ds, batch_size=eval_batch_size, shuffle=False,
-                            collate_fn=collate_eval)
+                            collate_fn=collate_eval, **dl_kwargs)
 
     # Dynamic rater pool buffers (USE_RATER_POOL=1, may03 variant C). Computed
     # ONLY when the flag is on so OFF-state startup is unchanged. All four
@@ -2153,9 +2166,9 @@ def main():
     # Default OFF for byte-equivalence; ON should produce ~1.2-1.5× speedup
     # on the training step. First forward incurs a ~30-60s trace/codegen cost.
     if USE_COMPILE:
-        log.info("Compiling HSTUBlock modules with torch.compile (initial trace ~30-60s)")
+        log.info(f"Compiling HSTUBlock modules with torch.compile (mode={COMPILE_MODE}, initial trace ~30-60s)")
         for i, blk in enumerate(model.blocks):
-            model.blocks[i] = torch.compile(blk)
+            model.blocks[i] = torch.compile(blk, mode=COMPILE_MODE)
     n_params = sum(p.numel() for p in model.parameters())
     log.info(f"HSTU: {n_params/1e6:.2f}M params on {DEVICE}  "
              f"(layers={NUM_LAYERS}, heads={NUM_HEADS}, dim={EMBED_DIM}, "
@@ -2304,7 +2317,7 @@ def main():
         )
         test_ds = EvalDataset(test_df, test_history, SEQ_LEN)
         test_loader = DataLoader(test_ds, batch_size=eval_batch_size, shuffle=False,
-                                 collate_fn=collate_eval)
+                                 collate_fn=collate_eval, **dl_kwargs)
         log.info(f"  test_rows={len(test_ds)}  history_users={len(test_history)}")
         test_save_path = TEST_SAVE_PREDS_PATH if SAVE_PREDS else None
         test_auc = evaluate_model(model, test_loader, save_preds_path=test_save_path)
