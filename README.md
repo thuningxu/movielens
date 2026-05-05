@@ -23,7 +23,7 @@ HSTU is the cleanest first generative baseline that lets us measure against the 
 
 - **`prepare.py`** — Shared with both prior attempts. Data download + time-based train/val/test splits + `evaluate()` AUC harness. **Do not modify.**
 - **`train.py`** — HSTU model + sequence data pipeline + training loop. Content metadata, MLP head, bf16, interleaving, LR schedules, aux rating head, held-out test eval — all env-flag-gated. Operational-best flags are ON by default; experimental probes (USE_POP_PRIOR, USE_RATING_TS, USE_ITEM_STATS, USE_RATER_POOL, AUX_RATING_WEIGHT, RUN_TEST) default OFF.
-- **`program.md`** — Experiment log for this attempt (may05 result: HSTU val ties simple_v2, test beats by +0.0162).
+- **`program.md`** — Experiment log for this attempt (may05 result: HSTU sliding-window beats simple_v2 by +0.0032 val and +0.0197 test).
 - **`legacy/`** — Frozen archive of the original DLRM project.
 - **`simple_v2/`** — Frozen archive of the apr28 linear-head restart. The locked baseline (`val 0.859384`, `test 0.845497`) lives there for comparison.
 - **`data/`** — Auto-downloaded MovieLens datasets; not in git.
@@ -42,7 +42,7 @@ DATASET=ml-25m uv run python train.py
 
 ## Architecture
 
-The diagram below shows the **default operational config** (may05 best, val 0.8593 3-seed mean / test 0.8617 single-shot — beats simple_v2 0.8455 on test by +0.0162): `EMBED_DIM=128`, `INTERLEAVE=1` (paper-canonical Meta 2024), `NUM_LAYERS=3`, `USE_GENOME=USE_GENRE=USE_YEAR=1`, `MLP_HEAD=1`, `USE_BF16=1`, `GRAD_CLIP=1.0`, `PROJ_INIT_MODE=xavier`, `SEQ_LEN=100` events × 2 = 200 tokens. Set `INTERLEAVE=0` to revert to the fused-token mode (each event = one position, `x_t = item_full_embed(m_t) + rating_embed(r_t)`).
+The diagram below shows the **default operational config** (may05 best, val 0.8626 2-seed mean / test 0.8652 single-shot — beats simple_v2 by +0.0032 val and +0.0197 test): `EMBED_DIM=128`, `INTERLEAVE=1` (paper-canonical Meta 2024), `NUM_LAYERS=3`, `USE_GENOME=USE_GENRE=USE_YEAR=1`, `MLP_HEAD=1`, `USE_BF16=1`, `GRAD_CLIP=1.0`, `PROJ_INIT_MODE=xavier`, `SEQ_LEN=100` events × 2 = 200 tokens, **`SLIDING_WINDOW=1`** (non-overlapping ceil(N/SEQ_LEN) windows per user — recovers events the SEQ_LEN cap would otherwise drop). Set `INTERLEAVE=0` to revert to the fused-token mode; set `SLIDING_WINDOW=0` to revert to the truncate-to-last-SEQ_LEN baseline.
 
 ```mermaid
 graph TD
@@ -137,7 +137,7 @@ Whatever metadata-fused embedding the sequence sees as observations is exactly w
 
 ## Status
 
-`may05` — HSTU wins on held-out test set. Cumulative progression on ml-25m at SEED=42:
+`may05` — HSTU sliding-window beats simple_v2 on both val and test. Cumulative progression on ml-25m at SEED=42:
 
 | stage | val_auc | commit | mechanism |
 |---|---|---|---|
@@ -152,16 +152,20 @@ Whatever metadata-fused embedding the sequence sees as observations is exactly w
 | interleave_3L_bf16 | 0.8567 (s42) / 0.8558 (s43), 2-seed mean 0.8563 | `2bf0713` | paper-canonical interleaved tokens |
 | extend-30 | 0.8575 (s42, unverified) | `9167fb6` | MAX_EPOCHS=30 — first cold_user lift but cold_item overfit |
 | Variant C (rater pool) | killed | `309d5bf` | full simple_v2-style i_hist_pool port — −0.0036 on ml-1m smoke |
-| D=128 (val) | 0.8594 (s42) / 3-seed mean **0.8593** (σ ≈ 0.0001) | `9bf2b96` | **EMBED_DIM 64→128 — broad strata lift, ties simple_v2** |
-| **D=128 (test, single-shot)** | **0.8617 (s42)** | `07a6776` | **+0.0162 over simple_v2 test 0.8455** |
+| D=128 (val) | 0.8594 (s42) / 3-seed mean 0.8593 | `9bf2b96` | EMBED_DIM 64→128 — broad strata lift, ties simple_v2 val |
+| D=128 (test, single-shot) | 0.8617 (s42) | `07a6776` | +0.0162 over simple_v2 test 0.8455 |
+| **Sliding-window (val)** | **0.8629 (s42) / 2-seed mean 0.8626** | `1debf0f` | **Multi-window per user, recovers truncated events** |
+| **Sliding-window (test, single-shot)** | **0.8652 (s42)** | `1debf0f` | **+0.0197 over simple_v2 test 0.8455** |
 
-**Operational best**: D=128 config — `EMBED_DIM=128 INTERLEAVE=1 SEQ_LEN=100 NUM_LAYERS=3 USE_BF16=1 LR=1e-3 GRAD_CLIP=1.0 PROJ_INIT_MODE=xavier USE_GENOME+GENRE+YEAR=1 MLP_HEAD=1 MLP_HEAD_DROPOUT=0.1`. ~140 min/cell on ml-25m (8.05M params).
+**Operational best**: D=128 + sliding-window config — `EMBED_DIM=128 INTERLEAVE=1 SEQ_LEN=100 SLIDING_WINDOW=1 NUM_LAYERS=3 USE_BF16=1 LR=1e-3 GRAD_CLIP=1.0 PROJ_INIT_MODE=xavier USE_GENOME+GENRE+YEAR=1 MLP_HEAD=1 MLP_HEAD_DROPOUT=0.1`. ~46 min/cell on ml-25m at MAX_EPOCHS=20 with USE_COMPILE=1 EVAL_EVERY_N_EPOCHS=5 EVAL_BATCH_SIZE=2048 (8.05M params).
 
-**Stratum lifts (D=128 vs D=64 baseline)**: warm +0.0031, cold_user +0.0028, cold_item +0.0020, cold_both +0.0009 — first clean broad lift after 5 cold_user-targeted nulls. Capacity was the unprobed axis; the apparent "structural cold_user ceiling" was a capacity ceiling.
+**Stratum lifts (sliding-window vs D=128 baseline, 2-seed avg Δ)**: warm +0.0048, cold_user +0.0030, cold_item +0.0050, cold_both +0.0042, warm_popular +0.0037, warm_tail +0.0065. Largest lifts on cold_item and warm_tail — consistent with the mechanism: dropped events at SEQ_LEN truncation were heavy users' early ratings, which teach the model about long-tail and cold items.
 
-**Gap to simple_v2 0.8594**: 0.0000 single-seed (TIE). 3-seed val mean: 0.8593 (s42=0.8594, s43=0.8592, s44=0.8592, σ ≈ 0.0001).
+**Gap to simple_v2 0.8594 (val) / 0.8455 (test)**: HSTU sliding-window beats by **+0.0032 val** and **+0.0197 test** (2-seed mean val, single-shot test SEED=42).
 
-**Held-out test set (single-shot SEED=42)**: **HSTU 0.8617 vs simple_v2 0.8455 = +0.0162 lift**. HSTU val→test gap +0.0024 (test improves over val) vs simple_v2 −0.0139. HSTU's sequence-summary representation generalizes substantially better than simple_v2's engineered concat as user histories extend through the test period (2018-01 to 2019-11). Test cold_user (78% of test rows) = 0.8620, +0.0042 over its val cold_user 0.8578.
+**Held-out test set (single-shot SEED=42)**: HSTU sliding-window **0.8652** vs simple_v2 0.8455 = **+0.0197 lift**. HSTU val→test gap +0.0026 (test improves over val) vs simple_v2 −0.0139. HSTU's sequence-summary representation generalizes substantially better than simple_v2's engineered concat as user histories extend through the test period (2018-01 to 2019-11). Test cold_user (78% of test rows) = 0.8662, +0.0049 over its val cold_user 0.8613.
+
+**Sliding-window mechanism**: at SEQ_LEN=100, ml-25m's mean-145-events/user means baseline drops 54% of train events (10.8M of 20M) for heavy users. SLIDING_WINDOW=1 emits ceil(N/SEQ_LEN) non-overlapping windows per user, recovering all events at ~2× training samples per epoch. Followups all null: extend-30 (model converges by ep 19 at sliding cadence; later epochs slight overfit), stride=50 overlap (train_loss drops 1% but val flat — overfits without lifting). Sliding-window at stride=SEQ_LEN already extracts the available information.
 
 **Key findings**:
 - Pure HSTU at 0.8367 already beats heavily-tuned simple_v2 static (0.828) and legacy DLRM (0.8284) with NO movie content features — pure user-item interaction modeling carries the signal.
@@ -171,8 +175,18 @@ Whatever metadata-fused embedding the sequence sees as observations is exactly w
 - NUM_LAYERS=3 + bf16 is the right operational baseline (27% faster, no AUC cost).
 - Interleaving (paper-canonical Meta 2024 §3) lifts +0.0007 over fused-token (sub-σ but consistent positive).
 - AUX_RATING_WEIGHT=25 (simple_v2 mechanism) does NOT transfer to HSTU — the rating_embed already encodes rating info, making aux MSE redundant.
+- **Capacity (D=64→128) was the diagnostic flip** — first clean broad-strata lift, closed cold_user gap to simple_v2 from −0.0044 to flat.
+- **Sliding-window training was the architectural unlock** — recovers events the SEQ_LEN cap would drop. Gradient signal from heavy users' early ratings teaches the model about long-tail/cold items. +0.0033 2-seed val and +0.0035 test over D=128 baseline.
 
-**Default config = operational best.** `train.py` defaults are set to the may05 operational-best stack (EMBED_DIM=128, INTERLEAVE=1, NUM_LAYERS=3, USE_BF16=1, metadata flags ON, GRAD_CLIP=1.0, PROJ_INIT_MODE=xavier, MLP_HEAD=1, MAX_EPOCHS=20, LR=1e-3 constant). Plain `DATASET=ml-25m uv run python train.py` reproduces val 0.8594. Add `RUN_TEST=1` for the held-out test result 0.8617, which beats simple_v2's locked test 0.8455 by +0.0162. Override individual flags to revert (e.g. `EMBED_DIM=64`) to reproduce earlier baselines (see program.md cycle history).
+**Default config = operational best.** `train.py` defaults are set to the may05 operational-best stack (EMBED_DIM=128, INTERLEAVE=1, NUM_LAYERS=3, USE_BF16=1, metadata flags ON, GRAD_CLIP=1.0, PROJ_INIT_MODE=xavier, MLP_HEAD=1, SLIDING_WINDOW=1, MAX_EPOCHS=20, LR=1e-3 constant). Plain `DATASET=ml-25m uv run python train.py` reproduces val 0.8629 SEED=42. Add `RUN_TEST=1` for the held-out test result 0.8652, which beats simple_v2's locked test 0.8455 by +0.0197. Override individual flags to revert (e.g. `SLIDING_WINDOW=0` reverts to the truncate-to-last-SEQ_LEN baseline at val 0.8594 / test 0.8617; `EMBED_DIM=64` reverts further) — see program.md cycle history.
+
+**Optional speedup flags** (all default OFF, byte-equivalent baseline):
+- `USE_COMPILE=1` (`COMPILE_MODE=default|reduce-overhead`) — torch.compile per-block fusion. Default mode safe; reduce-overhead enables CUDA Graphs but uses more memory and can OOM at large batch.
+- `EVAL_EVERY_N_EPOCHS=N` — skip full eval on intermediate epochs (final epoch always evals).
+- `EVAL_BATCH_SIZE=N` — separate batch size for inference (no backward, larger memory budget).
+- `NUM_WORKERS=N`, `PIN_MEMORY=1` — DataLoader knobs (no measurable effect on this hardware/model size).
+
+The full speedup config (USE_COMPILE=1 + EVAL_EVERY_N_EPOCHS=5 + EVAL_BATCH_SIZE=2048) reduces 20-epoch training from ~140 min → ~46 min at the cost of evaluating only every 5th epoch.
 
 ## What carries over from the prior attempts
 

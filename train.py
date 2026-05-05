@@ -56,12 +56,13 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
 # HSTU hyperparameters (placeholders — tune once the real model lands)
-# may05 operational-best config: val 0.8593 (3-seed mean SEED=42-44,
-# σ ≈ 0.0001) ties simple_v2 0.8594; **test 0.8617 (single-shot SEED=42)
-# beats simple_v2 test 0.8455 by +0.0162** on ml-25m. To reproduce earlier
-# byte-equivalent baselines, override the relevant flags — see program.md
-# cycle history.
-EMBED_DIM = int(os.environ.get("EMBED_DIM", "128"))      # may04 best: 128 lifts +0.0027 vs 64 (broad strata gains)
+# may05 operational-best config: val 0.8626 (2-seed mean, SLIDING_WINDOW=1)
+# beats simple_v2 0.8594 by +0.0032; **test 0.8652 (single-shot SEED=42)
+# beats simple_v2 test 0.8455 by +0.0197** on ml-25m. To reproduce earlier
+# byte-equivalent baselines, override the relevant flags (e.g.
+# SLIDING_WINDOW=0 reverts to the truncate-to-last-SEQ_LEN baseline at
+# val 0.8594 / test 0.8617) — see program.md cycle history.
+EMBED_DIM = int(os.environ.get("EMBED_DIM", "128"))      # may04: 128 lifts +0.0027 vs 64 (broad strata gains; D=192 saturated)
 NUM_LAYERS = int(os.environ.get("NUM_LAYERS", "3"))     # apr30 best: 3L matches 4L AUC, 27% faster
 NUM_HEADS = int(os.environ.get("NUM_HEADS", "4"))
 SEQ_LEN = int(os.environ.get("SEQ_LEN", "100"))         # apr30 best: 100 events (×2 = 200 tokens with INTERLEAVE=1)
@@ -74,6 +75,36 @@ LR = float(os.environ.get("LR", "1e-3"))
 WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "1e-5"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "256"))
 MAX_EPOCHS = int(os.environ.get("MAX_EPOCHS", "20"))    # apr30 best — earlier cycles used 5 or 15
+
+# Speedup levers (may05-speedup branch). All default to current behavior:
+#   EVAL_EVERY_N_EPOCHS=1 → eval after every epoch (current default)
+#   EVAL_BATCH_SIZE=0 → use BATCH_SIZE for eval (current default; no inference batching change)
+#   USE_COMPILE=0 → no torch.compile wrapper (current default)
+# Profile showed eval dominates per-epoch wall time (~6 of 7 min on ml-25m at
+# default config). EVAL_EVERY_N_EPOCHS=3 alone yields ~2.5× wall-clock with
+# zero AUC impact (training trajectory byte-equivalent). Final epoch always
+# evaluates regardless of N so the reported val_auc is the deployed-model state.
+EVAL_EVERY_N_EPOCHS = int(os.environ.get("EVAL_EVERY_N_EPOCHS", "1"))
+EVAL_BATCH_SIZE = int(os.environ.get("EVAL_BATCH_SIZE", "0"))  # 0 = same as BATCH_SIZE
+USE_COMPILE = int(os.environ.get("USE_COMPILE", "0"))
+COMPILE_MODE = os.environ.get("COMPILE_MODE", "default")  # default | reduce-overhead | max-autotune
+# DataLoader speedup levers (default 0 = byte-equivalent baseline). num_workers>0
+# enables multi-process data prep; pin_memory speeds up CPU→GPU transfers via
+# pinned host memory.
+NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "0"))
+PIN_MEMORY = int(os.environ.get("PIN_MEMORY", "0"))
+
+# Sliding-window training (may05 — recover events truncated by SEQ_LEN cap).
+# Default ON: emit ceil(N/SEQ_LEN) non-overlapping windows per user,
+# capturing all events at ~2× training samples per epoch. Lifts val_auc
+# by +0.0033 (2-seed mean) and test_auc by +0.0035 vs the OFF state.
+# Override SLIDING_WINDOW=0 to reproduce the prior baseline (one sample
+# per user = last SEQ_LEN events, drops 54% of train events for heavy
+# users at ml-25m). SLIDING_WINDOW_STRIDE defaults to SEQ_LEN
+# (non-overlapping); stride=SEQ_LEN/2 gives overlap, but stride=50
+# tested null vs stride=100 (overfits without lifting val).
+SLIDING_WINDOW = int(os.environ.get("SLIDING_WINDOW", "1"))
+SLIDING_WINDOW_STRIDE = int(os.environ.get("SLIDING_WINDOW_STRIDE", "0"))  # 0 = SEQ_LEN
 
 # Cold-start content metadata flags (apr30, Idea 1). All default OFF for
 # byte-equivalence with the prior baseline. When enabled, each adds a
@@ -329,6 +360,14 @@ SAVE_PREDS_PATH = os.environ.get("SAVE_PREDS_PATH", "/tmp/eval_strata.csv")
 # project's terminal claim — do not iterate on test.
 RUN_TEST = int(os.environ.get("RUN_TEST", "0"))
 TEST_SAVE_PREDS_PATH = os.environ.get("TEST_SAVE_PREDS_PATH", "/tmp/test_preds.csv")
+
+# Profiling mode (default OFF). When PROFILE_STEPS > 0, run torch.profiler over
+# that many training steps after model setup and exit before the regular train
+# loop. Default schedule: 2 steps wait + 3 warmup + (PROFILE_STEPS-5) active.
+# Saves a chrome trace to PROFILE_TRACE_PATH and prints a kernel summary table.
+# Off-state (PROFILE_STEPS=0) is byte-equivalent to prior baselines.
+PROFILE_STEPS = int(os.environ.get("PROFILE_STEPS", "0"))
+PROFILE_TRACE_PATH = os.environ.get("PROFILE_TRACE_PATH", "/tmp/hstu_profile.json")
 
 
 # ─── Movie metadata (cold-start content features) ───────────────────
@@ -694,23 +733,54 @@ def _build_eval_rater_pool(eval_df: pd.DataFrame, train_df: pd.DataFrame,
 
 class SequenceTrainDataset(Dataset):
     """One sample = one user's full event sequence (truncated to last SEQ_LEN
-    if longer). Per-position causal training: at every valid position t, the
-    model predicts engagement of event[t+1]. No injected easy negatives —
-    sequence training is dense per-position; that was a sample-level artifact.
+    if longer) by default. Per-position causal training: at every valid
+    position t, the model predicts engagement of event[t+1]. No injected
+    easy negatives — sequence training is dense per-position; that was a
+    sample-level artifact.
+
+    SLIDING_WINDOW=1: emit ceil(N/SEQ_LEN) non-overlapping samples per user
+    (or with stride SLIDING_WINDOW_STRIDE for overlap), recovering events
+    that the default last-SEQ_LEN truncation drops. ml-25m at SEQ_LEN=100
+    drops 54% of train events for heavy users; sliding windows captures
+    all events at linear cost (~1.5× samples/epoch).
     """
 
     def __init__(self, history: dict[int, np.ndarray], seq_len: int, min_events: int = 2):
-        # Need ≥2 events per sequence: at least one (t, t+1) prediction pair.
-        self.uids = sorted(uid for uid, ev in history.items() if ev.shape[0] >= min_events)
         self.history = history
         self.seq_len = seq_len
+        if SLIDING_WINDOW:
+            stride = SLIDING_WINDOW_STRIDE if SLIDING_WINDOW_STRIDE > 0 else seq_len
+            # Each "sample" = (uid, window_start_idx). Window covers
+            # events[start : start + seq_len]; if the window has <min_events
+            # real events, it's skipped (e.g., a user with 101 events at
+            # stride=100 would otherwise emit a 1-event partial window at
+            # start=100 — useless for prediction).
+            self.samples = []
+            for uid in sorted(history.keys()):
+                ev = history[uid]
+                n = ev.shape[0]
+                if n < min_events:
+                    continue
+                start = 0
+                while start < n:
+                    n_real_in_window = min(seq_len, n - start)
+                    if n_real_in_window >= min_events:
+                        self.samples.append((uid, start))
+                    start += stride
+        else:
+            # Need ≥2 events per sequence: at least one (t, t+1) prediction pair.
+            self.uids = sorted(uid for uid, ev in history.items() if ev.shape[0] >= min_events)
 
     def __len__(self):
-        return len(self.uids)
+        return len(self.samples) if SLIDING_WINDOW else len(self.uids)
 
     def __getitem__(self, idx):
-        uid = self.uids[idx]
-        events = self.history[uid]
+        if SLIDING_WINDOW:
+            uid, start = self.samples[idx]
+            events = self.history[uid][start:start + self.seq_len]
+        else:
+            uid = self.uids[idx]
+            events = self.history[uid]
         items = events[:, 0]
         ratings = events[:, 1]
         timestamps = events[:, 2]
@@ -1672,6 +1742,16 @@ def train_one_epoch(model, loader, optimizer, scheduler=None):
         if (USE_BF16 and DEVICE == "cuda") else nullcontext()
     )
     for batch in loader:
+        # CUDA Graphs (via torch.compile mode='reduce-overhead') reuses static
+        # input/output buffers across calls. Without an explicit step boundary,
+        # tensor outputs from prior steps may be overwritten before downstream
+        # consumers (e.g., the next batch's forward, or eval after train) read
+        # them, causing "accessing tensor output of CUDAGraphs that has been
+        # overwritten" RuntimeError. Marking step boundary forces the graph to
+        # snapshot inputs and produce fresh outputs each iteration. No-op when
+        # CUDA Graphs aren't active (USE_COMPILE=0 or COMPILE_MODE=default).
+        if USE_COMPILE and COMPILE_MODE == "reduce-overhead":
+            torch.compiler.cudagraph_mark_step_begin()
         if INTERLEAVE:
             content_ids = batch["content_ids"].to(DEVICE)        # (B, 2N)
             action_ids = batch["action_ids"].to(DEVICE)          # (B, 2N)
@@ -1821,6 +1901,9 @@ def evaluate_model(model, loader, save_preds_path: str | None = None):
         if (USE_BF16 and DEVICE == "cuda") else nullcontext()
     )
     for batch in loader:
+        # CUDA Graphs step boundary (see train_one_epoch for explanation).
+        if USE_COMPILE and COMPILE_MODE == "reduce-overhead":
+            torch.compiler.cudagraph_mark_step_begin()
         cand = batch["mid"].to(DEVICE)
         label = batch["label"]
         # uids / eval_idx tensors are computed once per batch; only consumed
@@ -2004,10 +2087,21 @@ def main():
     train_ds = SequenceTrainDataset(train_history, SEQ_LEN)
     val_ds = EvalDataset(val_df, eval_history, SEQ_LEN)
     log.info(f"  train_sequences={len(train_ds)}  val_rows={len(val_ds)}")
+    # NUM_WORKERS > 0 enables multi-process DataLoader. PIN_MEMORY=1 uses
+    # pinned host memory for faster CPU→GPU transfers (only meaningful when
+    # num_workers > 0 since num_workers=0 lacks the worker-side prefetch).
+    # OFF state (num_workers=0, pin_memory=False) is byte-equivalent.
+    dl_kwargs = {"num_workers": NUM_WORKERS, "pin_memory": bool(PIN_MEMORY)}
+    if NUM_WORKERS > 0:
+        dl_kwargs["persistent_workers"] = True  # avoid worker re-fork per epoch
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
-                              collate_fn=collate_train)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
-                            collate_fn=collate_eval)
+                              collate_fn=collate_train, **dl_kwargs)
+    # EVAL_BATCH_SIZE=0 → use BATCH_SIZE (byte-equivalent to baseline). Larger
+    # eval batch reduces per-batch kernel launch overhead since eval has no
+    # backward pass — memory is the only constraint.
+    eval_batch_size = EVAL_BATCH_SIZE if EVAL_BATCH_SIZE > 0 else BATCH_SIZE
+    val_loader = DataLoader(val_ds, batch_size=eval_batch_size, shuffle=False,
+                            collate_fn=collate_eval, **dl_kwargs)
 
     # Dynamic rater pool buffers (USE_RATER_POOL=1, may03 variant C). Computed
     # ONLY when the flag is on so OFF-state startup is unchanged. All four
@@ -2077,6 +2171,19 @@ def main():
                  is_warm_rater=is_warm_t, is_train_user_known=is_known_t,
                  eval_rater_uids=eval_rater_uids_t,
                  eval_rater_rats=eval_rater_rats_t).to(DEVICE)
+    # USE_COMPILE compiles each HSTUBlock individually rather than the whole
+    # model, since training/eval call multiple non-forward entry points on
+    # the model (encode_interleaved, score_eval, item_full_embed, etc.) that
+    # torch.compile would not intercept. The HSTUBlock is the bulk of per-step
+    # compute (Q/K/V proj + attention + GLU + out proj), so compiling each
+    # block fuses small ops (LayerNorm, SiLU, ⊙ U, residual) without changing
+    # the model's external API. State_dict and parameters remain accessible.
+    # Default OFF for byte-equivalence; ON should produce ~1.2-1.5× speedup
+    # on the training step. First forward incurs a ~30-60s trace/codegen cost.
+    if USE_COMPILE:
+        log.info(f"Compiling HSTUBlock modules with torch.compile (mode={COMPILE_MODE}, initial trace ~30-60s)")
+        for i, blk in enumerate(model.blocks):
+            model.blocks[i] = torch.compile(blk, mode=COMPILE_MODE)
     n_params = sum(p.numel() for p in model.parameters())
     log.info(f"HSTU: {n_params/1e6:.2f}M params on {DEVICE}  "
              f"(layers={NUM_LAYERS}, heads={NUM_HEADS}, dim={EMBED_DIM}, "
@@ -2105,6 +2212,69 @@ def main():
                  f"T_mult={CAWR_T_MULT}  eta_min={LR * CAWR_ETA_MIN_FRAC:.2e} "
                  f"(eta_min_frac={CAWR_ETA_MIN_FRAC})")
 
+    # ─── Profiling mode (PROFILE_STEPS > 0) ──────────────────────────
+    # Runs torch.profiler over a small number of training steps and exits
+    # before the regular train loop. Used to identify kernel bottlenecks
+    # without burning a 140-min full run. Off-state (PROFILE_STEPS=0) skips
+    # this block entirely.
+    if PROFILE_STEPS > 0:
+        import sys as _sys
+        from torch.profiler import profile, ProfilerActivity, schedule
+        n_warmup, n_wait = 3, 2
+        n_active = max(PROFILE_STEPS - n_warmup - n_wait, 5)
+        log.info(f"===== profiling: wait={n_wait} warmup={n_warmup} active={n_active} steps =====")
+        sched = schedule(wait=n_wait, warmup=n_warmup, active=n_active, repeat=1)
+        bce = nn.BCEWithLogitsLoss(reduction="none")
+        autocast_ctx = (
+            torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+            if (USE_BF16 and DEVICE == "cuda") else nullcontext()
+        )
+        model.train()
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=sched,
+            record_shapes=False,
+            with_stack=False,
+        ) as prof:
+            steps_done = 0
+            for batch in train_loader:
+                if steps_done >= n_wait + n_warmup + n_active:
+                    break
+                # Mirror train_one_epoch's interleaved path (the operational-best stack)
+                content_ids = batch["content_ids"].to(DEVICE)
+                action_ids = batch["action_ids"].to(DEVICE)
+                ts_2n = batch["ts_2n"].to(DEVICE)
+                mask_2n = batch["mask_2n"].to(DEVICE)
+                is_content = batch["is_content"].to(DEVICE)
+                content_rb = batch["content_rating_bucket"].to(DEVICE)
+                with autocast_ctx:
+                    h = model.encode_interleaved(content_ids, action_ids,
+                                                 ts_2n, mask_2n, is_content)
+                    h_proj = model._project_head(h)
+                    targets = (content_rb >= ENGAGED_BUCKET_THRESHOLD).float()
+                    cand_e = model.item_full_embed(content_ids)
+                    logits = (h_proj * cand_e).sum(dim=-1)
+                    loss_mask = is_content.float() * mask_2n
+                    per_pos = bce(logits, targets) * loss_mask
+                    loss = per_pos.sum() / loss_mask.sum().clamp(min=1.0)
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                if GRAD_CLIP > 0:
+                    nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+                optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
+                prof.step()
+                steps_done += 1
+        log.info(f"===== profile complete ({steps_done} steps) =====")
+        print("\n=== Top 25 GPU kernels by self CUDA time ===")
+        print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=25))
+        print("\n=== Top 15 ops by total CPU time (kernel launch overhead) ===")
+        print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=15))
+        prof.export_chrome_trace(PROFILE_TRACE_PATH)
+        log.info(f"chrome trace saved to {PROFILE_TRACE_PATH}")
+        _sys.exit(0)
+
     best_val_auc = 0.0
     # Cheap best-checkpoint tracking: only deepcopy state_dict when val improves
     # AND RUN_TEST=1. Off-state (RUN_TEST=0) does not allocate or copy anything,
@@ -2114,28 +2284,29 @@ def main():
         train_loss, avg_grad_norm, avg_aux_loss = train_one_epoch(
             model, train_loader, optimizer, scheduler,
         )
+        # EVAL_EVERY_N_EPOCHS controls eval frequency. Default 1 = every epoch
+        # (byte-equivalent to baseline). Always eval on the final epoch so the
+        # reported val_auc reflects the deployed-model state.
+        is_final = (epoch == MAX_EPOCHS - 1)
+        is_eval_epoch = is_final or ((epoch + 1) % EVAL_EVERY_N_EPOCHS == 0)
         # Only request the per-row prediction dump on the FINAL epoch's eval,
         # both to keep prior epochs byte-equivalent to the off path AND to
         # reflect the deployed model state. SAVE_PREDS=0 → save_path stays None
         # for every call, so off-state is byte-equivalent.
-        save_path = (
-            SAVE_PREDS_PATH
-            if (SAVE_PREDS and epoch == MAX_EPOCHS - 1)
-            else None
-        )
-        val_auc = evaluate_model(model, val_loader, save_preds_path=save_path)
-        # Only append grad_norm when GRAD_CLIP fired (avg_grad_norm not None);
-        # only append aux_loss when AUX_RATING_WEIGHT > 0 (avg_aux_loss not None).
-        # OFF-state log line is unchanged from the prior baseline.
+        save_path = SAVE_PREDS_PATH if (SAVE_PREDS and is_final) else None
         gn_part = f" grad_norm={avg_grad_norm:.2f}" if avg_grad_norm is not None else ""
         aux_part = f" aux_loss={avg_aux_loss:.4f}" if avg_aux_loss is not None else ""
         cur_lr = optimizer.param_groups[0]["lr"]
-        log.info(f"epoch {epoch}: train_loss={train_loss:.4f} val_auc={val_auc:.4f}{aux_part}{gn_part} lr={cur_lr:.2e}")
-        if val_auc > best_val_auc:
-            best_val_auc = val_auc
-            if RUN_TEST:
-                import copy
-                best_state_dict = copy.deepcopy(model.state_dict())
+        if is_eval_epoch:
+            val_auc = evaluate_model(model, val_loader, save_preds_path=save_path)
+            log.info(f"epoch {epoch}: train_loss={train_loss:.4f} val_auc={val_auc:.4f}{aux_part}{gn_part} lr={cur_lr:.2e}")
+            if val_auc > best_val_auc:
+                best_val_auc = val_auc
+                if RUN_TEST:
+                    import copy
+                    best_state_dict = copy.deepcopy(model.state_dict())
+        else:
+            log.info(f"epoch {epoch}: train_loss={train_loss:.4f} val_auc=skip{aux_part}{gn_part} lr={cur_lr:.2e}")
 
     total = time.time() - t0
     print(f"\nval_auc:          {best_val_auc:.6f}")
@@ -2160,8 +2331,8 @@ def main():
             pd.concat([train_df, val_df, test_df], ignore_index=True)
         )
         test_ds = EvalDataset(test_df, test_history, SEQ_LEN)
-        test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False,
-                                 collate_fn=collate_eval)
+        test_loader = DataLoader(test_ds, batch_size=eval_batch_size, shuffle=False,
+                                 collate_fn=collate_eval, **dl_kwargs)
         log.info(f"  test_rows={len(test_ds)}  history_users={len(test_history)}")
         test_save_path = TEST_SAVE_PREDS_PATH if SAVE_PREDS else None
         test_auc = evaluate_model(model, test_loader, save_preds_path=test_save_path)

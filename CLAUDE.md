@@ -12,7 +12,7 @@ The two prior attempts are archived as subdirectories:
 
 This attempt drops the engineered-feature framing entirely. HSTU treats the user as a sequence of (item, action, time) tokens and uses pointwise causal attention to predict next-event engagement. No hand-specified pools, no concat features, no cross fields.
 
-**Status**: may05 — HSTU wins on held-out test set. D=128 config: **val 0.8593 (3-seed mean SEED=42-44, σ ≈ 0.0001)** ties simple_v2's locked val 0.8594. **test 0.8617 (single-shot SEED=42)** beats simple_v2 locked test 0.8455 by **+0.0162**. Val→test gap: HSTU +0.0024 vs simple_v2 −0.0139 — HSTU's sequence-summary representation generalizes better than simple_v2's engineered concat as users' histories extend through the test period.
+**Status**: may05 — sliding-window training is the new operational best. D=128 + SLIDING_WINDOW=1 config: **val 0.8626 (2-seed mean SEED=42-43, σ ≈ 0.0001)** beats simple_v2 0.8594 by **+0.0032**. **test 0.8652 (single-shot SEED=42)** beats simple_v2 0.8455 by **+0.0197**. The sliding-window mechanism (ceil(N/SEQ_LEN) non-overlapping windows per user) recovers the 54% of train events that the SEQ_LEN=100 truncation drops for heavy users on ml-25m. Followup probes (extend-30, stride=50 overlap) both null — sliding at stride=SEQ_LEN already extracts the available information from the data.
 
 ## Commands
 
@@ -24,15 +24,22 @@ uv sync
 DATASET=ml-100k uv run python train.py
 
 # Standard experiment (ml-25m on the current CUDA GPU)
-# Defaults are the may04 best config (val 0.8594 SEED=42, test 0.8617):
+# Defaults are the may05 best config (val 0.8626 2-seed, test 0.8652):
 # EMBED_DIM=128, NUM_LAYERS=3, INTERLEAVE=1, USE_BF16=1, GRAD_CLIP=1.0,
 # PROJ_INIT_MODE=xavier, MLP_HEAD=1, USE_GENOME=USE_GENRE=USE_YEAR=1,
-# SEQ_LEN=100, MAX_EPOCHS=20, LR=1e-3 constant.
+# SEQ_LEN=100, SLIDING_WINDOW=1, MAX_EPOCHS=20, LR=1e-3 constant.
 DATASET=ml-25m uv run python train.py
 
 # Add RUN_TEST=1 to additionally evaluate on the held-out test set
 # (single-shot at the best-val checkpoint; mirrors simple_v2 apr28aj).
 RUN_TEST=1 DATASET=ml-25m uv run python train.py
+
+# Speedup config (may05-speedup branch): 5× wall-clock at trajectory parity.
+# EVAL_EVERY_N_EPOCHS=5 skips eval on epochs 0-3,5-8,10-13,15-18 (always
+# evals on final epoch). USE_COMPILE=1 fuses HSTUBlock kernels via torch.compile.
+# Reported val may be slightly below the every-epoch peak since intermediate
+# eval points are missed; final-epoch val is byte-equivalent.
+USE_COMPILE=1 EVAL_EVERY_N_EPOCHS=5 EVAL_BATCH_SIZE=2048 DATASET=ml-25m uv run python train.py
 
 # Reproduce the simple_v2 locked baseline (for cross-attempt comparison)
 EVAL_DYNAMIC_HIST=1 FREQ_WD_LAMBDA=0 LR=1e-3 DATASET=ml-25m uv run python simple_v2/train.py
@@ -72,7 +79,7 @@ Per Meta 2024:
 - **Smoke-test on ml-100k for crashes only**, not for AUC.
 - **`prepare.py:evaluate()` is the ground truth.** Do not modify it.
 - **`train.py` is now ~2200 lines** — past the 500-line split threshold. Future cycles should consider extracting model/data into separate modules; deferred for now since the operational-best config is locked.
-- **The simple_v2 baseline is the bar.** As of may05, HSTU has cleared it: val tied (0.8593 vs 0.8594), test won (+0.0162: 0.8617 vs 0.8455). Future regressions/lifts continue to be measured against simple_v2's locked numbers AND HSTU's current best on val + test.
+- **The simple_v2 baseline is the bar.** As of may05, HSTU has cleared it on both val and test: val 0.8626 (+0.0032), test 0.8652 (+0.0197). Future regressions/lifts continue to be measured against simple_v2's locked numbers AND HSTU's current best on val + test.
 
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence

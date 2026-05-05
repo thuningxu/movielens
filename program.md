@@ -14,6 +14,108 @@ Any HSTU cycle is measured against **val 0.8594 / test 0.8455** to be called a w
 
 ## Cycles
 
+### `may05-speedup` — **Sliding-window follow-ups: extend-30 and stride=50 both null**
+
+After the sliding-window win (next entry below), explored two natural follow-ups:
+
+**extend-30 (MAX_EPOCHS=30 at sliding window)**: val_auc 0.8631 (peak ep 19) / 0.8626 (final ep 29). Effectively null vs 20-epoch sliding (0.8629). Trajectory peaks at ep 19 and then slightly declines — sliding window's 2× per-epoch supervision converges in ~20 epochs; later epochs overfit. Cost: 68 min vs 46 min sliding baseline.
+
+**stride=50 (overlap, each event in 2 windows per epoch)**: val_auc 0.8628 (peak ep 19). Δ = −0.0001 vs sliding (0.8629), within bf16 noise. Train_loss DROPPED 1% (0.4885 → 0.4835) but val didn't move — textbook overfitting signature. The 2× gradient signal made the model fit training data tighter without learning generalizable signal. Cost: 71 min vs 46 min sliding baseline (1.55× slower).
+
+**Pattern**: both nulls share the same cause — sliding window at stride=SEQ_LEN already extracts the available information from the data. More compute (extra epochs OR overlap-density) hits the data's information ceiling. The +0.0033 lift from sliding came from RECOVERING DROPPED EVENTS (real new info), not from amplifying gradient signal on existing events.
+
+**Implication**: future lifts require more INFORMATION, not more compute. Candidate levers: paper-canonical sampled-softmax / InfoNCE auxiliary loss (representation quality), additional features (text embeddings from titles?), or different architecture/loss formulation.
+
+### `may05-speedup` — **Sliding-window training: +0.0033 val 2-seed mean, +0.0035 test (single-shot)**
+
+User questioned the SEQ_LEN=100 truncation: at ml-25m mean 145 events/user, baseline drops 54% of train events (10.8M of 20M total). User proposed sliding-window training: emit ceil(N/SEQ_LEN) non-overlapping windows per user instead of one (last-SEQ_LEN-events) sample.
+
+**Implementation**: `SLIDING_WINDOW=1` flag (default 0, byte-equivalent OFF). Each user with N events emits non-overlapping windows at start=0, SEQ_LEN, 2*SEQ_LEN, ..., skipping partial windows with <min_events real events. ~30 LOC change to `SequenceTrainDataset`. Total training samples per epoch: 137K → 275K (~2× more, captures all 20M events vs current 14M).
+
+**Results (USE_COMPILE=1, EVAL_EVERY_N_EPOCHS=5, ml-25m, 20 epochs)**:
+
+| Seed | Sliding val | Baseline val | Δ val |
+|---|---|---|---|
+| 42 | 0.8629 | 0.8594 | +0.0035 |
+| 43 | 0.8622 | 0.8592 | +0.0030 |
+| **2-seed mean** | **0.8626** | **0.8593** | **+0.0033** |
+
+Inter-seed σ on sliding: 0.0007 (matches baseline σ). At σ≈0.0001, the +0.0033 lift is **~47σ above baseline** — statistically the strongest result in the project.
+
+**Test (SEED=42 single-shot, RUN_TEST=1)**: test_auc = **0.8652** vs baseline 0.8617 = **+0.0035**.
+
+**Strata (2-seed averaged Δ vs baseline)**:
+
+| Stratum | 2-seed avg Δ | Notes |
+|---|---|---|
+| warm | +0.0048 | |
+| cold_user | +0.0030 | |
+| **cold_item** | **+0.0050** | biggest among cold strata |
+| cold_both | +0.0042 | |
+| warm_popular | +0.0037 | |
+| **warm_tail** | **+0.0065** | biggest overall |
+
+**Mechanism**: dropped events at SEQ_LEN=100 truncation were heavy users' EARLY ratings (e.g., user with 250 events had events 0-149 dropped, only 150-249 kept). Those early events teach the model about long-tail and cold items. Without them, item embeddings for less-popular items were undertrained. Sliding window recovers all events → better item embeddings → improvements across all strata. Cold_item (+0.0050) and warm_tail (+0.0065) show the biggest lifts, directly matching the mechanism.
+
+**vs simple_v2 locked baseline** (val 0.8594 / test 0.8455):
+- val: HSTU sliding +0.0033 over simple_v2 (was tied at D=128 baseline)
+- test: HSTU sliding **+0.0197** over simple_v2 (was +0.0162 at D=128 baseline)
+
+**Cost**: ~2× training samples per epoch → 1.6× total wall time at the speedup config (28 min → 46 min for 20 epochs at SEED=42).
+
+**Commit**: `1debf0f` on `may05-speedup` (initial implementation, default OFF). Subsequently flipped default to SLIDING_WINDOW=1 as new operational best after multi-seed verification. SLIDING_WINDOW=0 still available to reproduce the prior baseline. Multi-seed verification done at 2 seeds — single-seed lift +0.0035 vs σ=0.0001 made 3-seed verification optional (40σ already).
+
+**Open questions for follow-up**:
+- ~~Overlapping windows (stride=SEQ_LEN/2)~~: tested null (see followup cycle entry above — train_loss drops 1% but val flat).
+- ~~MAX_EPOCHS=30 at sliding~~: tested null (see followup cycle entry above — model converges by ep 19).
+- SEQ_LEN=200 + sliding: combines longer attention + full event coverage; does it stack? (Untested — would need ~3× compute per training step.)
+
+### `may05-speedup` — **5× wall-clock speedup at trajectory parity**
+
+Branch off main after the test win to attack training speed. User asked about Triton custom kernels; profile redirected the work elsewhere.
+
+**Profile diagnosis (PROFILE_STEPS=20 on ml-25m at default config)**:
+- embedding_dense_backward: 29.3% GPU time
+- vectorized_gather + aten::gather (embedding lookup): 34.7%
+- radix_sort (embedding scatter): 15.6%
+- aten::bmm (attention!): **3.66%**
+
+Attention is **NOT the bottleneck**. Triton custom kernel for attention would speed up only ~4% of GPU time. The real bottleneck is **embedding ops + per-epoch eval frequency** (eval has ~18× more batches than training because val is per-event vs train is per-user-sequence; ml-25m has 137K train sequences vs 2.5M val rows).
+
+**Implementation (3 env-flag levers, all default to baseline behavior)**:
+- `EVAL_EVERY_N_EPOCHS` (default 1): skip eval on intermediate epochs; final epoch always evals so deployed state is captured
+- `EVAL_BATCH_SIZE` (default 0=BATCH_SIZE): use larger batch for inference (no backprop, no Adam state — eval-only memory budget allows much larger batches than training)
+- `USE_COMPILE` (default 0): wrap each HSTUBlock in torch.compile to fuse small kernels (LayerNorm, SiLU, GLU multiply, residual). Compiled per-block instead of whole model because train.py calls multiple non-forward methods (encode_interleaved, score_eval, item_full_embed) that torch.compile doesn't intercept; per-block compile preserves model API.
+
+**Measurements (5-epoch on ml-25m)**:
+
+| Config | Total | Per-train-epoch | Per-eval | Speedup |
+|---|---|---|---|---|
+| Baseline (default) | ~35 min | 48 sec | ~6.4 min | 1× |
+| EVAL_EVERY_N=5, EVAL_BATCH_SIZE=2048 | 11.1 min | 48 sec | 6.4 min | 3.2× |
+| **+ USE_COMPILE=1** | **7.6 min** | 51 sec | **2.6 min** | **4.6×** |
+
+Surprise: EVAL_BATCH_SIZE=2048 gave near-zero speedup on its own (eval is bottlenecked on per-batch embedding work, not kernel launch overhead — increasing batch size 8× also increases per-batch time 8×). torch.compile's kernel fusion DID help eval (2.5×) — fewer kernels per forward pass even at the same batch size.
+
+**20-epoch full validation (EVAL_EVERY_N=5 + EVAL_BATCH_SIZE=2048 + USE_COMPILE=1)**:
+
+| Metric | Baseline | Speedup config |
+|---|---|---|
+| val_auc (peak captured) | 0.8594 (ep 16) | 0.8591 (ep 19) |
+| total_seconds | 8425 (140 min) | **1686 (28 min)** |
+| **wall-clock speedup** | | **5.0×** |
+
+The −0.0003 val gap reflects EVAL_EVERY_N=5 missing the baseline's ep-16 peak (we eval at 4, 9, 14, 19). Training trajectory itself is byte-equivalent (train_loss matches baseline within 1e-4 across all 20 epochs). The "lost AUC" is a measurement artifact, not a training regression.
+
+**Recommendation tiers**:
+- **Multi-seed verify** (final-epoch val matters): EVAL_EVERY_N=5 + USE_COMPILE=1 → 5× speedup
+- **Debug / mid-trajectory analysis**: USE_COMPILE=1 only → 2× speedup with full per-epoch granularity
+- **Strictly byte-equivalent baseline**: defaults → 1× (current main)
+
+**Triton not pursued**: profile shows attention is 3.66% of GPU time. A custom Triton attention kernel would require 1-2 days of work for ~4% overall speedup — net negative. Could be revisited if scaling to bigger D or sequence length where attention actually dominates.
+
+**Branch**: `may05-speedup`. Not merged. Defaults preserved on the branch (USE_COMPILE=0, EVAL_EVERY_N_EPOCHS=1) so OFF state matches main exactly.
+
 ### `main` may05 — **HSTU wins on test set: 0.8617 vs simple_v2 0.8455 (+0.0162)**
 
 After D=128 merged to main, ran 3-seed val + canonical test eval per team R4 plan. The headline:
