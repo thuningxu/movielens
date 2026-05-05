@@ -56,12 +56,13 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
 # HSTU hyperparameters (placeholders — tune once the real model lands)
-# may05 operational-best config: val 0.8593 (3-seed mean SEED=42-44,
-# σ ≈ 0.0001) ties simple_v2 0.8594; **test 0.8617 (single-shot SEED=42)
-# beats simple_v2 test 0.8455 by +0.0162** on ml-25m. To reproduce earlier
-# byte-equivalent baselines, override the relevant flags — see program.md
-# cycle history.
-EMBED_DIM = int(os.environ.get("EMBED_DIM", "128"))      # may04 best: 128 lifts +0.0027 vs 64 (broad strata gains)
+# may05 operational-best config: val 0.8626 (2-seed mean, SLIDING_WINDOW=1)
+# beats simple_v2 0.8594 by +0.0032; **test 0.8652 (single-shot SEED=42)
+# beats simple_v2 test 0.8455 by +0.0197** on ml-25m. To reproduce earlier
+# byte-equivalent baselines, override the relevant flags (e.g.
+# SLIDING_WINDOW=0 reverts to the truncate-to-last-SEQ_LEN baseline at
+# val 0.8594 / test 0.8617) — see program.md cycle history.
+EMBED_DIM = int(os.environ.get("EMBED_DIM", "128"))      # may04: 128 lifts +0.0027 vs 64 (broad strata gains; D=192 saturated)
 NUM_LAYERS = int(os.environ.get("NUM_LAYERS", "3"))     # apr30 best: 3L matches 4L AUC, 27% faster
 NUM_HEADS = int(os.environ.get("NUM_HEADS", "4"))
 SEQ_LEN = int(os.environ.get("SEQ_LEN", "100"))         # apr30 best: 100 events (×2 = 200 tokens with INTERLEAVE=1)
@@ -94,14 +95,15 @@ NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "0"))
 PIN_MEMORY = int(os.environ.get("PIN_MEMORY", "0"))
 
 # Sliding-window training (may05 — recover events truncated by SEQ_LEN cap).
-# Default OFF (SLIDING_WINDOW=0): one sample per user = last SEQ_LEN events,
-# byte-equivalent to baseline. ml-25m has mean 145 events/user — at SEQ_LEN=100
-# baseline drops 54% of train events for heavy users.
-# When SLIDING_WINDOW=1: emit multiple non-overlapping SEQ_LEN-length windows
-# per user (ceil(N/seq_len) samples). Captures all events at linear cost
-# (~1.5× training samples per epoch on ml-25m). SLIDING_WINDOW_STRIDE
-# defaults to SEQ_LEN (non-overlapping) but can be set smaller for overlap.
-SLIDING_WINDOW = int(os.environ.get("SLIDING_WINDOW", "0"))
+# Default ON: emit ceil(N/SEQ_LEN) non-overlapping windows per user,
+# capturing all events at ~2× training samples per epoch. Lifts val_auc
+# by +0.0033 (2-seed mean) and test_auc by +0.0035 vs the OFF state.
+# Override SLIDING_WINDOW=0 to reproduce the prior baseline (one sample
+# per user = last SEQ_LEN events, drops 54% of train events for heavy
+# users at ml-25m). SLIDING_WINDOW_STRIDE defaults to SEQ_LEN
+# (non-overlapping); stride=SEQ_LEN/2 gives overlap, but stride=50
+# tested null vs stride=100 (overfits without lifting val).
+SLIDING_WINDOW = int(os.environ.get("SLIDING_WINDOW", "1"))
 SLIDING_WINDOW_STRIDE = int(os.environ.get("SLIDING_WINDOW_STRIDE", "0"))  # 0 = SEQ_LEN
 
 # Cold-start content metadata flags (apr30, Idea 1). All default OFF for

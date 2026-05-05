@@ -14,6 +14,18 @@ Any HSTU cycle is measured against **val 0.8594 / test 0.8455** to be called a w
 
 ## Cycles
 
+### `may05-speedup` — **Sliding-window follow-ups: extend-30 and stride=50 both null**
+
+After the sliding-window win (next entry below), explored two natural follow-ups:
+
+**extend-30 (MAX_EPOCHS=30 at sliding window)**: val_auc 0.8631 (peak ep 19) / 0.8626 (final ep 29). Effectively null vs 20-epoch sliding (0.8629). Trajectory peaks at ep 19 and then slightly declines — sliding window's 2× per-epoch supervision converges in ~20 epochs; later epochs overfit. Cost: 68 min vs 46 min sliding baseline.
+
+**stride=50 (overlap, each event in 2 windows per epoch)**: val_auc 0.8628 (peak ep 19). Δ = −0.0001 vs sliding (0.8629), within bf16 noise. Train_loss DROPPED 1% (0.4885 → 0.4835) but val didn't move — textbook overfitting signature. The 2× gradient signal made the model fit training data tighter without learning generalizable signal. Cost: 71 min vs 46 min sliding baseline (1.55× slower).
+
+**Pattern**: both nulls share the same cause — sliding window at stride=SEQ_LEN already extracts the available information from the data. More compute (extra epochs OR overlap-density) hits the data's information ceiling. The +0.0033 lift from sliding came from RECOVERING DROPPED EVENTS (real new info), not from amplifying gradient signal on existing events.
+
+**Implication**: future lifts require more INFORMATION, not more compute. Candidate levers: paper-canonical sampled-softmax / InfoNCE auxiliary loss (representation quality), additional features (text embeddings from titles?), or different architecture/loss formulation.
+
 ### `may05-speedup` — **Sliding-window training: +0.0033 val 2-seed mean, +0.0035 test (single-shot)**
 
 User questioned the SEQ_LEN=100 truncation: at ml-25m mean 145 events/user, baseline drops 54% of train events (10.8M of 20M total). User proposed sliding-window training: emit ceil(N/SEQ_LEN) non-overlapping windows per user instead of one (last-SEQ_LEN-events) sample.
@@ -51,12 +63,12 @@ Inter-seed σ on sliding: 0.0007 (matches baseline σ). At σ≈0.0001, the +0.0
 
 **Cost**: ~2× training samples per epoch → 1.6× total wall time at the speedup config (28 min → 46 min for 20 epochs at SEED=42).
 
-**Commit**: `1debf0f` on `may05-speedup`. Defaults preserved (SLIDING_WINDOW=0); flag-gated. Multi-seed verification done at 2 seeds — single-seed lift +0.0035 vs σ=0.0001 made 3-seed verification optional (40σ already).
+**Commit**: `1debf0f` on `may05-speedup` (initial implementation, default OFF). Subsequently flipped default to SLIDING_WINDOW=1 as new operational best after multi-seed verification. SLIDING_WINDOW=0 still available to reproduce the prior baseline. Multi-seed verification done at 2 seeds — single-seed lift +0.0035 vs σ=0.0001 made 3-seed verification optional (40σ already).
 
 **Open questions for follow-up**:
-- Overlapping windows (stride=SEQ_LEN/2): does seeing each event 2× per epoch lift further or overfit?
-- MAX_EPOCHS=30 at sliding: trajectory still climbing at ep 19; does extended training stack with sliding's lift?
-- SEQ_LEN=200 + sliding: combines longer attention + full event coverage; does it stack?
+- ~~Overlapping windows (stride=SEQ_LEN/2)~~: tested null (see followup cycle entry above — train_loss drops 1% but val flat).
+- ~~MAX_EPOCHS=30 at sliding~~: tested null (see followup cycle entry above — model converges by ep 19).
+- SEQ_LEN=200 + sliding: combines longer attention + full event coverage; does it stack? (Untested — would need ~3× compute per training step.)
 
 ### `may05-speedup` — **5× wall-clock speedup at trajectory parity**
 
