@@ -14,6 +14,36 @@ Any HSTU cycle is measured against **val 0.8594 / test 0.8455** to be called a w
 
 ## Cycles
 
+### `may5` — **L=4 D=128 sliding: REJECTED (lift sub-noise, σ inflated 4×)**
+
+After the sliding-window win, tested whether more depth helps now that 2× more training data is exposed per epoch. Hypothesis: additional layers can use the recovered events to learn richer interaction patterns.
+
+**Single-seed sweep first (SEED=42, MAX_EPOCHS=20, all other flags at sliding-best defaults):**
+- L=4 ep20: val 0.8637, test 0.8662 (+0.0008 val / +0.0010 test vs L=3 sliding 0.8629/0.8652)
+- L=4 ep30 (resumed via new CHECKPOINT_DIR/RESUME infrastructure): val 0.8640, test 0.8662 — trajectory plateaued at ep24, validating Critic's prediction that the "still-rising" signal at ep19 was tail-of-convergence not under-fitting
+- Same wall-clock per epoch as L=3 (compile+sliding mix); +1.6M params (8.13M vs 6.5M)
+
+**Multi-seed verification (SEED=43+44, MAX_EPOCHS=20):**
+
+| Seed | val | test |
+|---|---|---|
+| 42 | 0.8637 | 0.8662 |
+| 43 | 0.8632 | 0.8657 |
+| 44 | 0.8629 | 0.8654 |
+| **3-seed mean** | **0.86327** | **0.86573** |
+| L=3 sliding (CLAUDE.md) | 0.8626 (n=2) | 0.8652 (n=1) |
+| **Δ vs L=3** | **+0.00067** | **+0.00053** |
+
+L=4 inter-seed std: 0.0004 (vs L=3 sliding's 0.0001 from n=2). t-stat for val ≈ 2.8 (nominally p≈0.02).
+
+**Decision: REJECT.** Two reframes from the team:
+- Researcher: pre-registered keep threshold was 2σ ≥ 0.0014; observed +0.00067 is < half. Even at "statistically positive" the absolute lift is tiny.
+- Critic: σ_L3=0.0001 from n=2 is essentially one bit of information; the load-bearing finding is that **σ_L4 is 4× larger**. L=3 is the better search substrate — every future probe at L=4 inherits both the param tax and the variance tax (more seeds needed to verify any future lift).
+
+**Implication**: depth axis is saturated at the sliding regime for ml-25m. Capacity scaling gives diminishing returns once the data is fully exposed. Future levers should target information (additional features, different loss formulation), not more layers.
+
+**Defer not delete**: L=4 logged as candidate for final stack-up (apply once at end after L=3 search saturates), with proper 5-seed verification at that point. Checkpoints retained at `./checkpoints/L4_d128*/` for that future revisit.
+
 ### `may5` — **InfoNCE auxiliary loss: REGRESSED, removed**
 
 After sliding-window landed, Critic R3+R4 had recommended trying paper-canonical InfoNCE auxiliary loss (sampled softmax over item vocab) on top of BCE. Hypothesis: BCE alone gradient-trains item embeddings only via the score head dot product; an InfoNCE auxiliary signal at each content position with K random negatives would teach item embeddings to be discriminative across the catalog. Critic prior: +0.001 to +0.005 val_auc.

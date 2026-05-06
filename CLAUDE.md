@@ -50,12 +50,23 @@ USE_COMPILE=1 DATASET=ml-25m uv run python train.py
 
 # Reproduce the simple_v2 locked baseline (for cross-attempt comparison)
 EVAL_DYNAMIC_HIST=1 FREQ_WD_LAMBDA=0 LR=1e-3 DATASET=ml-25m uv run python simple_v2/train.py
+
+# CHECKPOINTING: save/resume/test-only flags. All default empty (byte-equivalent OFF).
+# - CHECKPOINT_DIR=path: save model+optimizer+scheduler+best+RNG+config to path/last.pt
+#   at every eval epoch. Use ./checkpoints/<run_name>/ — NOT /tmp (gets wiped on reboot).
+# - RESUME=path/last.pt: load checkpoint and continue training from saved epoch+1.
+#   Strict-checks EMBED_DIM/NUM_LAYERS/NUM_HEADS/SEQ_LEN/INTERLEAVE match.
+# - TEST_FROM=path/last.pt: load checkpoint and run RUN_TEST eval ONLY (skip training).
+#   Saves ~3 hr per re-evaluation on ml-25m vs full retraining.
+CHECKPOINT_DIR=./checkpoints/myrun DATASET=ml-25m uv run python train.py
+RESUME=./checkpoints/myrun/last.pt MAX_EPOCHS=30 DATASET=ml-25m uv run python train.py
+TEST_FROM=./checkpoints/myrun/last.pt RUN_TEST=1 DATASET=ml-25m uv run python train.py
 ```
 
 ## Layout
 
 - **`prepare.py`** — Shared. `load_data()` returns raw `train`/`val`/`test` DataFrames with columns `userId, movieId, rating, timestamp, label`. `evaluate(labels, scores)` is the AUC ground-truth. **Do not modify the evaluation harness.**
-- **`train.py`** — HSTU model + sequence data pipeline + training loop. Includes content metadata (`USE_GENOME`/`USE_GENRE`/`USE_YEAR`), training stabilization (`GRAD_CLIP`, `PROJ_INIT_MODE`), MLP head (`MLP_HEAD`, `MLP_HEAD_DROPOUT`), interleaved tokens (`INTERLEAVE`), bf16 mixed precision (`USE_BF16`), LR schedule (`LR_SCHEDULE`, `WARMUP_STEPS`, `OPTIMIZER`), aux rating head (`AUX_RATING_WEIGHT`), held-out test eval (`RUN_TEST`) — flags default to ON for the operational-best stack and OFF for experimental probes; all OFF-states byte-equivalent.
+- **`train.py`** — HSTU model + sequence data pipeline + training loop. Includes content metadata (`USE_GENOME`/`USE_GENRE`/`USE_YEAR`), training stabilization (`GRAD_CLIP`, `PROJ_INIT_MODE`), MLP head (`MLP_HEAD`, `MLP_HEAD_DROPOUT`), interleaved tokens (`INTERLEAVE`), bf16 mixed precision (`USE_BF16`), LR schedule (`LR_SCHEDULE`, `WARMUP_STEPS`, `OPTIMIZER`), aux rating head (`AUX_RATING_WEIGHT`), held-out test eval (`RUN_TEST`), checkpointing (`CHECKPOINT_DIR`/`RESUME`/`TEST_FROM`) — flags default to ON for the operational-best stack and OFF for experimental probes; all OFF-states byte-equivalent.
 - **`program.md`** — Experiment log for this attempt.
 - **`legacy/`**, **`simple_v2/`** — Frozen archives. Each has its own `CLAUDE.md` and `program.md`.
 - **`data/`** — Auto-downloaded; gitignored.
