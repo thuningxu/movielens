@@ -14,6 +14,33 @@ Any HSTU cycle is measured against **val 0.8594 / test 0.8455** to be called a w
 
 ## Cycles
 
+### `may6` — **4-probe convergence sweep: HSTU ceiling declared at val 0.8626 / test 0.8652**
+
+After PinRec paper review (arxiv 2504.10507; outcome conditioning + multi-token loss don't transfer to ml-25m's single-action setting), the team queued four cheap orthogonal probes with a pre-registered convergence rule: **stop after 4 consecutive nulls/regressions on cheap clean axes**.
+
+All four ran single-seed at SEED=42, MAX_EPOCHS=20, USE_COMPILE=1, EVAL_EVERY_N_EPOCHS=5 against L=3 D=128 sliding baseline (val 0.8626 / test 0.8652):
+
+| Probe | Config | val | test | Δ val | Δ test | Verdict |
+|---|---|---|---|---|---|---|
+| 1 | SINUSOIDAL_TIME=1 (continuous time bias) | 0.8618 | 0.8640 | -0.0008 | -0.0012 | REGRESS |
+| 2 | NUM_LAYERS=2 (depth-down) | 0.8607 | 0.8630 | -0.0019 | -0.0022 | KILL |
+| 3 | NUM_HEADS=8 (16 dim/head vs 32) | 0.8627 | 0.8650 | +0.0001 | -0.0002 | TIE (null) |
+| 4 | MLP_HEAD=0 (head-down) | 0.8600 | 0.8624 | -0.0026 | -0.0028 | REGRESS+spikes |
+
+**Probe 1 (sinusoidal time)**: replaced HSTU's discrete log-bucket bias (`Embedding(32, H)`) with continuous sinusoidal projection of log2(Δt+1) features. Trajectory ran 5 epochs behind baseline throughout (zero-init Linear projection slow to learn). Initial impl OOM'd at eval batch=2048 due to (B,L,L,2F) feature materialization; required refactoring to loop over frequencies internally. Loop adds ~3× eval cost (eval went from ~5 min to ~14 min). Code not merged — null result and added complexity not worth keeping; re-implement if revisited (e.g., with non-zero init or longer training horizon).
+
+**Probe 2 (L=2)**: depth-down companion to may5's L=4 null. Confirms L=3 is the sweet spot — L=2 < L=3 ≈ L=4. Depth axis is saturated; no cheaper substrate available.
+
+**Probe 3 (heads=8)**: Critic predicted "heads-vs-dim flat at this scale" — confirmed. 16-dim/head with H=8 trains slower (small inner dim less efficient on tensor cores, ~3 min/epoch vs ~1 min) but lands at baseline by ep19. Tied result, not a win.
+
+**Probe 4 (MLP_HEAD=0)**: capacity-reduction sanity check. Regressed by -0.0026 val with training instability (grad_norm spikes at ep11=1.73, ep16=0.51 — much larger than baseline's 0.08). Confirms the MLP head IS load-bearing, not vestigial.
+
+**Cycle takeaway**: sliding-window was the one structural fix that addressed a measurable data-coverage gap (54% of train events truncated). Every subsequent probe — features (InfoNCE, kitchen-sink), capacity (D=256, L=4, L=2, heads=8, MLP off), position bias (sinusoidal), training (extend-30, stride=50) — has been null or worse. The pattern indicates HSTU on ml-25m at the operational-best config has hit its representation ceiling for this dataset+architecture class.
+
+**Operational best (declared ceiling)**: L=3 D=128 sliding, INTERLEAVE=1, GRAD_CLIP=1.0, PROJ_INIT_MODE=xavier, MLP_HEAD=1, USE_GENOME=USE_GENRE=USE_YEAR=1, SEQ_LEN=100, MAX_EPOCHS=20, LR=1e-3 constant. **val 0.8626 (2-seed mean SEED=42-43, σ ≈ 0.0001) / test 0.8652 (single-shot SEED=42)**.
+
+**Banked ~3.7 hr of remaining GPU budget**: future structural ideas (negative sampling, multi-task, pre-train, cross-dataset transfer) get a fresh start rather than burning compute on incremental probes with null priors.
+
 ### `may5` — **L=4 D=128 sliding: REJECTED (lift sub-noise, σ inflated 4×)**
 
 After the sliding-window win, tested whether more depth helps now that 2× more training data is exposed per epoch. Hypothesis: additional layers can use the recovered events to learn richer interaction patterns.
