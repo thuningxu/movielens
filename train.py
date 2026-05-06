@@ -94,6 +94,19 @@ COMPILE_MODE = os.environ.get("COMPILE_MODE", "default")  # default | reduce-ove
 NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "0"))
 PIN_MEMORY = int(os.environ.get("PIN_MEMORY", "0"))
 
+# Checkpointing (may5 — resumable training + offline test eval).
+# CHECKPOINT_DIR: directory to save checkpoints. Empty = no save (default).
+#   Saved at every eval epoch (epoch where is_eval_epoch=True), plus final.
+#   Each checkpoint: model + optimizer + scheduler + best_val_auc + best_state_dict
+#   (the in-memory deepcopy used for RUN_TEST) + RNG state + config sanity check.
+# RESUME: path to checkpoint file to load and resume training. Empty = train from
+#   scratch (default). Resumes at saved epoch + 1 with restored optimizer/RNG.
+# TEST_FROM: path to checkpoint file to load and run ONLY test eval (skip
+#   training). Empty = full training (default). Mutually exclusive with RESUME.
+CHECKPOINT_DIR = os.environ.get("CHECKPOINT_DIR", "")
+RESUME = os.environ.get("RESUME", "")
+TEST_FROM = os.environ.get("TEST_FROM", "")
+
 # Sliding-window training (may05 — recover events truncated by SEQ_LEN cap).
 # Default ON: emit ceil(N/SEQ_LEN) non-overlapping windows per user,
 # capturing all events at ~2× training samples per epoch. Lifts val_auc
@@ -1978,6 +1991,110 @@ def evaluate_model(model, loader, save_preds_path: str | None = None):
     return evaluate(labels, scores)["auc"]
 
 
+def _strip_compile_prefix(state_dict):
+    """torch.compile wraps modules and prefixes their state_dict keys with
+    `_orig_mod.`. Strip that to make checkpoints portable between compiled
+    and uncompiled instances of the same model."""
+    return {k.replace("._orig_mod.", "."): v for k, v in state_dict.items()}
+
+
+def _checkpoint_config_snapshot():
+    """Capture key config knobs at save time for sanity-check on load.
+    A mismatch on EMBED_DIM/NUM_LAYERS/SEQ_LEN would mean the loaded
+    weights can't fit the current model — fail fast rather than silently."""
+    return {
+        "EMBED_DIM": EMBED_DIM,
+        "NUM_LAYERS": NUM_LAYERS,
+        "NUM_HEADS": NUM_HEADS,
+        "SEQ_LEN": SEQ_LEN,
+        "SLIDING_WINDOW": SLIDING_WINDOW,
+        "INTERLEAVE": INTERLEAVE,
+        "MAX_EPOCHS": MAX_EPOCHS,
+    }
+
+
+def save_checkpoint(path, model, optimizer, scheduler, epoch,
+                    best_val_auc, best_state_dict):
+    """Save full training state to `path`. Captures model + optimizer +
+    scheduler + best-checkpoint + RNG state + config snapshot."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    ckpt = {
+        "model": _strip_compile_prefix(model.state_dict()),
+        "optimizer": optimizer.state_dict(),
+        "epoch": epoch,
+        "best_val_auc": best_val_auc,
+        "best_state_dict": (
+            _strip_compile_prefix(best_state_dict) if best_state_dict is not None else None
+        ),
+        "torch_rng": torch.get_rng_state(),
+        "cuda_rng": (
+            torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+        ),
+        "config": _checkpoint_config_snapshot(),
+    }
+    if scheduler is not None:
+        ckpt["scheduler"] = scheduler.state_dict()
+    torch.save(ckpt, path)
+    log.info(f"  saved checkpoint to {path} (epoch {epoch}, best_val_auc={best_val_auc:.6f})")
+
+
+def _align_state_dict_keys(saved_state, current_state):
+    """Saved checkpoints have unprefixed keys (we strip _orig_mod. at save).
+    If current model has compiled blocks, its state_dict keys are prefixed
+    (e.g., 'blocks.0._orig_mod.norm_in.weight'). Build a {stripped: current}
+    map so saved keys land on the right slots regardless of compile state."""
+    prefix_map = {k.replace("._orig_mod.", "."): k for k in current_state.keys()}
+    aligned = {}
+    for k, v in saved_state.items():
+        target = prefix_map.get(k, k)
+        aligned[target] = v
+    return aligned
+
+
+def load_checkpoint(path, model, optimizer=None, scheduler=None,
+                    strict_config=True):
+    """Load checkpoint from `path` into `model` (and optionally optimizer/
+    scheduler). Returns (epoch, best_val_auc, best_state_dict).
+
+    Handles torch.compile prefix transparently: saved keys are unprefixed;
+    aligned to current model's keys (compiled or not) at load time.
+
+    If `strict_config=True`, raises if the saved config's structural knobs
+    (EMBED_DIM, NUM_LAYERS, SEQ_LEN, INTERLEAVE) don't match current.
+    """
+    log.info(f"Loading checkpoint from {path}")
+    ckpt = torch.load(path, map_location=DEVICE, weights_only=False)
+    if strict_config:
+        cfg = ckpt.get("config", {})
+        for k in ("EMBED_DIM", "NUM_LAYERS", "NUM_HEADS", "SEQ_LEN", "INTERLEAVE"):
+            cur = globals().get(k)
+            saved = cfg.get(k)
+            if saved is not None and saved != cur:
+                raise ValueError(
+                    f"Checkpoint config mismatch: {k}={saved} (saved) != {cur} (current). "
+                    f"Override the env flag to match, or use strict_config=False."
+                )
+    aligned = _align_state_dict_keys(ckpt["model"], model.state_dict())
+    model.load_state_dict(aligned)
+    if optimizer is not None and "optimizer" in ckpt:
+        optimizer.load_state_dict(ckpt["optimizer"])
+    if scheduler is not None and "scheduler" in ckpt:
+        scheduler.load_state_dict(ckpt["scheduler"])
+    if "torch_rng" in ckpt:
+        torch.set_rng_state(ckpt["torch_rng"])
+    if torch.cuda.is_available() and ckpt.get("cuda_rng") is not None:
+        torch.cuda.set_rng_state(ckpt["cuda_rng"])
+    log.info(
+        f"  loaded epoch {ckpt['epoch']}, best_val_auc={ckpt['best_val_auc']:.6f}"
+    )
+    # Re-key best_state_dict to match the current model too, so callers can
+    # directly model.load_state_dict(best_state_dict) without further alignment.
+    best = ckpt.get("best_state_dict")
+    if best is not None:
+        best = _align_state_dict_keys(best, model.state_dict())
+    return ckpt["epoch"], ckpt["best_val_auc"], best
+
+
 def main():
     t0 = time.time()
     log.info(f"Loading {DATASET} (raw rating events; no feature engineering)")
@@ -2275,12 +2392,60 @@ def main():
         log.info(f"chrome trace saved to {PROFILE_TRACE_PATH}")
         _sys.exit(0)
 
+    # ─── TEST_FROM: load a saved checkpoint and run only test eval ──
+    # Skips training entirely. Useful for re-running test-set eval on a
+    # previously trained model without retraining (~3 hours saved on ml-25m).
+    if TEST_FROM:
+        log.info(f"===== TEST_FROM={TEST_FROM} — skipping training, running test eval only =====")
+        ckpt_epoch, ckpt_best_val, ckpt_best_state = load_checkpoint(
+            TEST_FROM, model, optimizer=None, scheduler=None, strict_config=True
+        )
+        # Prefer best_state_dict (the in-memory deepcopy of best-val) over the
+        # final-epoch model state, mirroring the training-end test-eval path.
+        if ckpt_best_state is not None:
+            model.load_state_dict(ckpt_best_state)
+            log.info(f"  using best_state_dict (val_auc={ckpt_best_val:.6f})")
+        else:
+            log.info(f"  using final-epoch state (no best_state_dict in checkpoint)")
+        # Build test_history + test_loader (mirrors the RUN_TEST block below)
+        log.info("===== held-out test set evaluation (single-shot) =====")
+        test_history = build_user_sequences(
+            pd.concat([train_df, val_df, test_df], ignore_index=True)
+        )
+        test_ds = EvalDataset(test_df, test_history, SEQ_LEN)
+        test_loader = DataLoader(test_ds, batch_size=eval_batch_size, shuffle=False,
+                                 collate_fn=collate_eval, **dl_kwargs)
+        log.info(f"  test_rows={len(test_ds)}  history_users={len(test_history)}")
+        test_save_path = TEST_SAVE_PREDS_PATH if SAVE_PREDS else None
+        test_auc = evaluate_model(model, test_loader, save_preds_path=test_save_path)
+        print(f"\nval_auc:          {ckpt_best_val:.6f}  (from checkpoint, not re-evaluated)")
+        print(f"test_auc:         {test_auc:.6f}")
+        print(f"dataset:          {DATASET}")
+        print(f"checkpoint:       {TEST_FROM}")
+        print(f"# bar to clear (simple_v2 locked): val 0.8594 / test 0.8455")
+        return
+
     best_val_auc = 0.0
     # Cheap best-checkpoint tracking: only deepcopy state_dict when val improves
     # AND RUN_TEST=1. Off-state (RUN_TEST=0) does not allocate or copy anything,
     # preserving byte-equivalence with prior baselines.
     best_state_dict = None
-    for epoch in range(MAX_EPOCHS):
+    start_epoch = 0
+    # ─── RESUME: load checkpoint and continue training from saved epoch ──
+    if RESUME:
+        log.info(f"===== RESUME={RESUME} — loading checkpoint and continuing =====")
+        last_epoch, best_val_auc, best_state_dict = load_checkpoint(
+            RESUME, model, optimizer=optimizer, scheduler=scheduler, strict_config=True
+        )
+        start_epoch = last_epoch + 1
+        if start_epoch >= MAX_EPOCHS:
+            log.warning(
+                f"  start_epoch={start_epoch} >= MAX_EPOCHS={MAX_EPOCHS}. "
+                f"Nothing to train. Increase MAX_EPOCHS or use TEST_FROM."
+            )
+        else:
+            log.info(f"  resuming at epoch {start_epoch} (will train to epoch {MAX_EPOCHS - 1})")
+    for epoch in range(start_epoch, MAX_EPOCHS):
         train_loss, avg_grad_norm, avg_aux_loss = train_one_epoch(
             model, train_loader, optimizer, scheduler,
         )
@@ -2302,9 +2467,18 @@ def main():
             log.info(f"epoch {epoch}: train_loss={train_loss:.4f} val_auc={val_auc:.4f}{aux_part}{gn_part} lr={cur_lr:.2e}")
             if val_auc > best_val_auc:
                 best_val_auc = val_auc
-                if RUN_TEST:
+                if RUN_TEST or CHECKPOINT_DIR:
                     import copy
+                    # Keep prefixed keys in-memory (matches current model for
+                    # direct load_state_dict at end-of-training test eval).
+                    # save_checkpoint strips the prefix at disk write.
                     best_state_dict = copy.deepcopy(model.state_dict())
+            # Save checkpoint at every eval epoch when CHECKPOINT_DIR is set.
+            # Keeps last + best so the user can resume or run TEST_FROM later.
+            if CHECKPOINT_DIR:
+                last_path = os.path.join(CHECKPOINT_DIR, "last.pt")
+                save_checkpoint(last_path, model, optimizer, scheduler,
+                                epoch, best_val_auc, best_state_dict)
         else:
             log.info(f"epoch {epoch}: train_loss={train_loss:.4f} val_auc=skip{aux_part}{gn_part} lr={cur_lr:.2e}")
 
