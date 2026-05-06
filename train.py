@@ -2080,10 +2080,17 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None,
         optimizer.load_state_dict(ckpt["optimizer"])
     if scheduler is not None and "scheduler" in ckpt:
         scheduler.load_state_dict(ckpt["scheduler"])
+    # RNG state ByteTensors must live on CPU; map_location may have moved them.
     if "torch_rng" in ckpt:
-        torch.set_rng_state(ckpt["torch_rng"])
+        rng = ckpt["torch_rng"]
+        if hasattr(rng, "device") and rng.device.type != "cpu":
+            rng = rng.cpu()
+        torch.set_rng_state(rng)
     if torch.cuda.is_available() and ckpt.get("cuda_rng") is not None:
-        torch.cuda.set_rng_state(ckpt["cuda_rng"])
+        cuda_rng = ckpt["cuda_rng"]
+        if hasattr(cuda_rng, "device") and cuda_rng.device.type != "cpu":
+            cuda_rng = cuda_rng.cpu()
+        torch.cuda.set_rng_state(cuda_rng)
     log.info(
         f"  loaded epoch {ckpt['epoch']}, best_val_auc={ckpt['best_val_auc']:.6f}"
     )
