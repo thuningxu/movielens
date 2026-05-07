@@ -41,6 +41,10 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
+# prepare.py lives at the project root (one level up from hstu/). Mirror the
+# simple_v2/train.py pattern so this module is runnable as `python hstu/train.py`
+# from the project root regardless of CWD.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from prepare import load_data, evaluate
 
 # ─── Logging ────────────────────────────────────────────────────────

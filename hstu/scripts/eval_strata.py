@@ -30,8 +30,9 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score
 
-# Make `prepare` importable when this script is run from the repo root.
-REPO_ROOT = Path(__file__).resolve().parent.parent
+# Make `prepare` importable. Script lives at hstu/scripts/eval_strata.py;
+# project root is two levels up.
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from prepare import load_data  # noqa: E402
