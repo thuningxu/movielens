@@ -137,6 +137,47 @@ Not currently integrated into `hstu/train.py` (the kernel is forward-only;
 training would need a backward implemented). The branch is a research
 artifact — kernel + validation scripts, no `train.py` modifications.
 
+## Integration attempt — tried and rejected
+
+Did a real eval-only integration into `hstu/train.py` to see if the bench's
+1.49x prediction holds up during actual training:
+
+  - `USE_TRITON_ATTN=0` env flag (default OFF, byte-equivalent)
+  - Conditional import of the kernel only when the flag is set
+  - `HSTUBlock.forward` branches on `(USE_TRITON_ATTN and not self.training)`
+    — Triton path only at eval, never during `loss.backward()`
+  - Moved `triton_hstu_attn.py` from `hstu/scripts/` to `hstu/` so train.py
+    could import it without scripts-dir path tricks
+
+A/B on ml-25m, 5 epochs, eval at final epoch only, USE_COMPILE=1, SEED=42:
+  PyTorch (USE_TRITON_ATTN=0): val_auc 0.857730, total 720.5 s
+  Triton  (USE_TRITON_ATTN=1): val_auc 0.857796, total 712.8 s
+  AUC delta: 6.6e-5 (within bf16 noise — kernel correctness confirmed)
+  Wall-clock saving: 7.7 s (~1.1%) — single eval saved ~9 s, not the ~70 s
+                                     bench_eval_triton.py predicted.
+
+Likely cause of the bench-vs-real gap: dynamo specializes the compiled HSTU
+on `self.training` value. First training calls trace with `training=True`;
+the train→eval transition either triggers a recompile or takes a slower
+graph path through the conditional. The bench used two SEPARATE compiled
+models (one PyTorch, one Triton), so each had a clean dynamo cache and got
+the full speedup.
+
+Rejected because:
+  - Real saving (~9 s/eval, ~3 min over a 20-epoch training run) is much
+    smaller than projected, and well below the threshold worth adding
+    a flag + conditional path + scripts-vs-package import dance for
+  - Reproducibility cost: enabling shifts val_auc by ~5e-5; locked numbers
+    on main were measured at USE_TRITON_ATTN=0
+  - Maintenance cost on a frozen 2400-line train.py: every future model
+    experiment now has to think about the flag + the dynamo-specialization
+    interaction, even if they never enable it
+
+The kernel + benches stay on this branch as a self-contained research
+artifact. If anyone wants the raw eval speedup later, run
+`bench_eval_triton.py` directly (separately compiled, no integration mess).
+The integration attempt is preserved here as a note rather than as code.
+
 ## How to verify the numbers in this file
 
 ```bash
