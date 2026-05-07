@@ -417,7 +417,13 @@ def load_movie_metadata(movies_df: pd.DataFrame, dataset: str, num_items: int):
     careful to skip the genome path entirely when GENOME_DIM == 0 — that way
     USE_GENOME=1 on ml-100k is a benign no-op rather than a crash.
     """
-    data_root = Path(__file__).resolve().parent / "data"
+    # Data lives at the project root's data/ dir (shared with legacy/ and
+    # simple_v2/, populated by prepare.py). After the may6 restructure
+    # train.py moved to hstu/train.py, so we go one level up to find data/.
+    # Without this, ml-25m's genome-scores.csv silently fails to load and
+    # USE_GENOME=1 becomes a no-op — meaning the operational best
+    # (val 0.8626 / test 0.8652) can't actually be reproduced from main.
+    data_root = Path(__file__).resolve().parent.parent / "data"
 
     # Genre multi-hot from movies_df["genres"] (pipe-separated, e.g. "Action|Comedy").
     # movies_df is the prepare.load_data() output: movieIds already mapped to
