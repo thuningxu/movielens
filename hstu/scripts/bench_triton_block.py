@@ -36,7 +36,7 @@ sys.argv = orig_argv
 HSTUBlock = mod.HSTUBlock
 time_delta_buckets = mod.time_delta_buckets
 
-from triton_hstu_attn import hstu_attn_fwd  # noqa: E402
+from triton_hstu_attn import hstu_attn_fwd, hstu_split_uvqk  # noqa: E402
 
 
 class TritonHSTUBlock(nn.Module):
@@ -63,8 +63,15 @@ class TritonHSTUBlock(nn.Module):
         H, Dh = self.num_heads, self.head_dim
 
         h = self.norm_in(x)
+        # NOTE: kept as plain SiLU + chunk + transpose (not the hstu_split_uvqk
+        # custom op) because in torch.compile mode, inductor's epilogue fusion
+        # of these pointwise ops with the cuBLAS Linear is faster than a
+        # single hand-written Triton kernel (138 µs inductor vs 183 µs Triton
+        # with autotune — the custom-op boundary disrupts inductor's fusion).
+        # In pure-eager mode the hstu_split_uvqk kernel does help; see the
+        # split kernel's docstring in triton_hstu_attn.py.
         u, v, q, k = torch.chunk(F.silu(self.uvqk(h)), 4, dim=-1)
-        q = q.view(B, L, H, Dh).transpose(1, 2).contiguous()        # (B, H, L, Dh)
+        q = q.view(B, L, H, Dh).transpose(1, 2).contiguous()
         k = k.view(B, L, H, Dh).transpose(1, 2).contiguous()
         v = v.view(B, L, H, Dh).transpose(1, 2).contiguous()
 
@@ -126,6 +133,12 @@ def main():
     base_block.eval()
     triton_block = TritonHSTUBlock(base_block)
     triton_block.eval()
+    # Inference benchmark — disable param autograd so torch.compile doesn't try
+    # to set up a backward graph through the (forward-only) Triton custom op.
+    for p in base_block.parameters():
+        p.requires_grad_(False)
+    for p in triton_block.parameters():
+        p.requires_grad_(False)
 
     x, valid_mask, causal_bool, time_buckets = make_inputs(B, L, D, H, args.num_buckets, device, dtype)
 
